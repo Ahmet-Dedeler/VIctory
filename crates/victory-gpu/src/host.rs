@@ -978,7 +978,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
-fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+pub(crate) fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;

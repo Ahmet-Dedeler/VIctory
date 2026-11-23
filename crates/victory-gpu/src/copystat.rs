@@ -37,8 +37,13 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Of texture refreshes, microseconds asking whether the memory is
+    /// committed, hashing it and detiling it.
+    TexQueryUs,
+    TexHashUs,
+    TexDetileUs,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = 25;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -126,6 +131,12 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+    );
+    tracing::info!(
+        "texture refreshes per frame: {:.2} ms asking for committed memory, {:.2} ms hashing, {:.2} ms detiling",
+        ms(c[C::TexQueryUs as usize]),
+        ms(c[C::TexHashUs as usize]),
+        ms(c[C::TexDetileUs as usize]),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

@@ -187,16 +187,6 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
-        if !committed(self.memory, size) {
-            #[cfg(feature = "diagnostics")]
-            tracing::debug!(
-                memory = ?self.memory,
-                size,
-                desc = ?self.layout.desc,
-                "a sampled texture's memory is not committed"
-            );
-            return 0;
-        }
         if !crate::watch::tracking() {
             let now = std::time::Instant::now();
             if last
@@ -206,9 +196,55 @@ impl Staging {
                 return 0;
             }
             last.looked = Some(now);
+            // One guarded read of the whole texture instead of asking
+            // region by region whether it is committed: under Wine every
+            // such question waits for the lock the title's page mappings
+            // hold while it loads (hundreds of milliseconds a texture).
+            static SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+            let mut scratch = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+            if scratch.len() < size {
+                scratch.resize(size, 0);
+            }
+            #[cfg(feature = "diagnostics")]
+            let asked = std::time::Instant::now();
+            let mapped = crate::host::read(self.memory, scratch.as_mut_ptr(), size);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::TexQueryUs,
+                asked.elapsed().as_micros() as u64,
+            );
+            if !mapped {
+                return 0;
+            }
+            return self.take(last, &scratch[..size]);
+        }
+        #[cfg(feature = "diagnostics")]
+        let asked = std::time::Instant::now();
+        let mapped = committed(self.memory, size);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::TexQueryUs,
+            asked.elapsed().as_micros() as u64,
+        );
+        if !mapped {
+            #[cfg(feature = "diagnostics")]
+            tracing::debug!(
+                memory = ?self.memory,
+                size,
+                desc = ?self.layout.desc,
+                "a sampled texture's memory is not committed"
+            );
+            return 0;
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        self.take(last, tiled)
+    }
+
+    /// Detiles `tiled`, the texture's memory as it is now (not watched), if
+    /// it is not what was detiled last. Returns the bytes looked at.
+    fn take(&self, last: &mut Last, tiled: &[u8]) -> usize {
+        let size = tiled.len();
         if last.changed >= ALWAYS_CHANGING && last.unhashed + 1 < HASH_EVERY {
             // Hashing would only confirm it: the hash costs more than the
             // detiling it could save.
@@ -218,10 +254,16 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
             return size;
         }
+        #[cfg(feature = "diagnostics")]
+        let hashing = std::time::Instant::now();
         let hash = blake3::hash(tiled);
         last.unhashed = 0;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        {
+            use crate::copystat::{C, add};
+            add(C::TexHashed, size as u64);
+            add(C::TexHashUs, hashing.elapsed().as_micros() as u64);
+        }
         if last.hash == Some(hash) {
             last.changed = 0;
             return size;
@@ -236,6 +278,17 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        self.detile_now(tiled);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::TexDetileUs,
+            started.elapsed().as_micros() as u64,
+        );
+    }
+
+    fn detile_now(&self, tiled: &[u8]) {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
