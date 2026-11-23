@@ -411,6 +411,22 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // Debugging aid: `VICTORY_SUBMIT_ONE_BY_ONE=1` runs each list as a
+        // submission of its own, so a submission the host never finishes
+        // names one list (its pipelines and last commands).
+        #[cfg(feature = "diagnostics")]
+        {
+            static ONE_BY_ONE: OnceLock<bool> = OnceLock::new();
+            if runs.len() > 1
+                && *ONE_BY_ONE
+                    .get_or_init(|| std::env::var_os("VICTORY_SUBMIT_ONE_BY_ONE").is_some())
+            {
+                for run in runs {
+                    self.execute(std::slice::from_ref(run));
+                }
+                return;
+            }
+        }
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -1459,12 +1475,14 @@ impl Host {
 /// commands each list of the failed submission noted (diagnostics, with
 /// `VICTORY_D3D12_DRED`).
 fn last_notes(runs: &[&HostList]) -> String {
+    // Of a lone list (`VICTORY_SUBMIT_ONE_BY_ONE`), all it noted.
+    let last = if runs.len() == 1 { 256 } else { 6 };
     #[cfg(feature = "diagnostics")]
     {
         let mut text = String::new();
         for (i, r) in runs.iter().enumerate() {
             let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
-            for n in notes.iter().rev().take(6).rev() {
+            for n in notes.iter().rev().take(last).rev() {
                 text.push_str(&format!("; list {i} of {}, of its {}: {n}", runs.len(), notes.len()));
             }
         }
@@ -1472,7 +1490,7 @@ fn last_notes(runs: &[&HostList]) -> String {
     }
     #[cfg(not(feature = "diagnostics"))]
     {
-        let _ = runs;
+        let _ = (runs, last);
         String::new()
     }
 }
