@@ -39,12 +39,33 @@ fn mute_all(devices: &IMMDeviceEnumerator) -> windows::core::Result<u32> {
             let Ok(sessions) = manager.GetSessionEnumerator() else {
                 continue;
             };
-            for k in 0..sessions.GetCount()? {
-                let volume: ISimpleAudioVolume = sessions.GetSession(k)?.cast()?;
-                if !volume.GetMute()?.as_bool() {
-                    volume.SetMute(true, std::ptr::null())?;
-                    muted += 1;
+            let count = sessions.GetCount().unwrap_or(0);
+            let mut unreachable = 0;
+            for k in 0..count {
+                // Wine's session controls do not give out their volume.
+                let volume = sessions
+                    .GetSession(k)
+                    .and_then(|s| s.cast::<ISimpleAudioVolume>());
+                match volume {
+                    Ok(volume) => {
+                        if !volume.GetMute()?.as_bool() {
+                            volume.SetMute(true, std::ptr::null())?;
+                            muted += 1;
+                        }
+                    }
+                    Err(_) => unreachable += 1,
                 }
+            }
+            // More than the default session, and no way to mute the rest:
+            // say so, once per count.
+            static SEEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+            if unreachable > 1
+                && SEEN.fetch_max(unreachable, std::sync::atomic::Ordering::Relaxed) < unreachable
+            {
+                tracing::warn!(
+                    sessions = unreachable,
+                    "background run: audio sessions besides the default one cannot be muted here"
+                );
             }
         }
     }

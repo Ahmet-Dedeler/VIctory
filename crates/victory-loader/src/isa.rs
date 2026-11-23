@@ -716,6 +716,83 @@ mod host {
         EXCEPTION_CONTINUE_EXECUTION
     }
 
+    /// How a faulting thread goes on: added to its instruction pointer,
+    /// and a register to copy first (hardware numbers: destination, source).
+    pub type Resume = (isize, Option<(u8, u8)>);
+    /// Given the bytes before a faulting instruction and from it on,
+    /// decides whether and how the thread goes on.
+    pub type NullWriteHook = fn(before: &[u8], at: &[u8]) -> Option<Resume>;
+
+    static NULL_WRITE: std::sync::OnceLock<(NullWriteHook, usize, usize)> =
+        std::sync::OnceLock::new();
+
+    /// Lets `hook` decide about every write to address 0 (a title's
+    /// deliberate crash it knows by its bytes): it gets `before` bytes
+    /// ahead of the faulting instruction and `at` bytes from it on.
+    pub fn resume_null_writes(hook: NullWriteHook, before: usize, at: usize) {
+        if NULL_WRITE.set((hook, before, at)).is_ok() {
+            // SAFETY: the handler only reads code and changes the faulting
+            // thread's registers.
+            unsafe { AddVectoredExceptionHandler(1, Some(on_null_write)) };
+        }
+    }
+
+    unsafe extern "system" fn on_null_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_IMAGE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        };
+        // SAFETY: the system passes the exception being dispatched.
+        let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+        let Some(&(hook, before, at)) = NULL_WRITE.get() else {
+            return EXCEPTION_CONTINUE_SEARCH;
+        };
+        if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
+            || record.NumberParameters < 2
+            || record.ExceptionInformation[0] != 1
+            || record.ExceptionInformation[1] != 0
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let rip = context.Rip as usize;
+        // The code must be mapped image code on both sides of `rip`.
+        let image = |address: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery(address as *const _, &mut m, size_of_val(&m)) };
+            n != 0 && m.State == MEM_COMMIT && m.Type == MEM_IMAGE
+        };
+        if rip < before || !image(rip - before) || !image(rip + at) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // SAFETY: committed image memory, checked above.
+        let (b, a) = unsafe {
+            (
+                std::slice::from_raw_parts((rip - before) as *const u8, before),
+                std::slice::from_raw_parts(rip as *const u8, at),
+            )
+        };
+        let Some((delta, copy)) = hook(b, a) else {
+            return EXCEPTION_CONTINUE_SEARCH;
+        };
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let n = SEEN.fetch_add(1, Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            eprintln!(
+                "VIctory: the title's deliberate crash at {} is skipped (#{n})",
+                crate::locate(rip)
+            );
+        }
+        let mut cpu = load(context);
+        if let Some((to, from)) = copy {
+            cpu.gpr[usize::from(to & 15)] = cpu.gpr[usize::from(from & 15)];
+        }
+        cpu.rip = cpu.rip.wrapping_add_signed(delta as i64);
+        store(&cpu, context);
+        EXCEPTION_CONTINUE_EXECUTION
+    }
+
     /// Installs the handler, ahead of every handler installed before it.
     pub fn install() {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -728,7 +805,7 @@ mod host {
 }
 
 #[cfg(windows)]
-pub use host::install;
+pub use host::{install, resume_null_writes};
 
 #[cfg(test)]
 mod tests {
