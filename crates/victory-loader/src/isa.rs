@@ -705,6 +705,10 @@ mod host {
         }
         // SAFETY: the instructions that led here, in the same function.
         let before = unsafe { std::slice::from_raw_parts((at - 8) as *const u8, 8) };
+        if let super::Op::Clwb(_) = op {
+            // SAFETY: the instruction just decoded, in mapped code.
+            unsafe { retire_clwb(at, &code[..len]) };
+        }
         let mut cpu = load(context);
         // SAFETY: the title's own instruction, with its own operands.
         let outcome = unsafe { exec(&mut cpu, op, len, code, before, &HOST) };
@@ -714,6 +718,45 @@ mod host {
             unsafe { SwitchToThread() };
         }
         EXCEPTION_CONTINUE_EXECUTION
+    }
+
+    /// Turns the CLWB at `at` (its bytes `code`) into a no-operation of the
+    /// same length, so it traps only this once: a title flushes every
+    /// buffer it hands to the GPU, hundreds of thousands of times while it
+    /// loads, and each trap costs a translator's exception round trip.
+    /// `0F AE /6` becomes `0F 1F /0` (NOP r/m) with the same prefixes and
+    /// operand bytes: two neighbouring bytes change, and other threads see
+    /// the old instruction or the new one. `VICTORY_ISA_PATCH=0` leaves
+    /// the code alone.
+    ///
+    /// # Safety
+    /// `at` is the address of a decoded CLWB in mapped image code.
+    unsafe fn retire_clwb(at: usize, code: &[u8]) {
+        use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+        use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("VICTORY_ISA_PATCH").as_deref() != Ok("0")) {
+            return;
+        }
+        let Some(opcode) = code.windows(2).position(|w| w == [0x0F, 0xAE]) else {
+            return;
+        };
+        let Some(&modrm) = code.get(opcode + 2) else {
+            return;
+        };
+        let target = (at + opcode + 1) as *mut [u8; 2];
+        let mut old = 0;
+        // SAFETY: two bytes of the instruction; the page's protection is
+        // put back, and the processor told its code changed.
+        unsafe {
+            if VirtualProtect(target.cast(), 2, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+                return;
+            }
+            target.write_unaligned([0x1F, modrm & 0xC7]);
+            VirtualProtect(target.cast(), 2, old, &mut old);
+            FlushInstructionCache(GetCurrentProcess(), target.cast(), 2);
+        }
     }
 
     /// How a faulting thread goes on: added to its instruction pointer,
