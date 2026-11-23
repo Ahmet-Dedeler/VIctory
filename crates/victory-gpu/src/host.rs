@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -372,6 +372,43 @@ impl Host {
         }
     }
 
+    /// Waits for the submission just signalled on the fence. A host that
+    /// neither finishes nor removes the device (Apple's D3DMetal with work
+    /// its GPU never completes; Windows resets the driver after 2 s) is
+    /// reported after [`STILL_RUNNING`] and fails the run after [`HUNG`]:
+    /// the console has no such state, and the title would only wait.
+    fn wait(&self, runs: &[&HostList]) {
+        const WAIT_TIMEOUT: u32 = 258;
+        /// When a submission still running is first reported.
+        const STILL_RUNNING: u32 = 5_000;
+        /// When it is given up.
+        const HUNG: u32 = 20_000;
+        // SAFETY: our event, set when the fence reaches the submission.
+        if unsafe { WaitForSingleObject(self.event, STILL_RUNNING) }.0 != WAIT_TIMEOUT {
+            return;
+        }
+        let pipelines: std::collections::BTreeSet<String> = runs
+            .iter()
+            .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .collect();
+        tracing::warn!(
+            lists = runs.len(),
+            ?pipelines,
+            "host submission still running after 5 s{}",
+            last_notes(runs)
+        );
+        // SAFETY: as above.
+        if unsafe { WaitForSingleObject(self.event, HUNG - STILL_RUNNING) }.0 != WAIT_TIMEOUT {
+            return;
+        }
+        fail(format_args!(
+            "the host GPU did not finish a submission of {} lists in {} s; its pipelines: {pipelines:?}{}",
+            runs.len(),
+            HUNG / 1000,
+            last_notes(runs)
+        ));
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         let started = std::time::Instant::now();
@@ -398,9 +435,7 @@ impl Host {
                 .Signal(&self.fence, *submitted)
                 .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
             match waited {
-                Ok(()) => {
-                    WaitForSingleObject(self.event, INFINITE);
-                }
+                Ok(()) => self.wait(runs),
                 Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
             }
         }

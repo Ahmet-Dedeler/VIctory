@@ -762,9 +762,14 @@ mod host {
     /// How a faulting thread goes on: added to its instruction pointer,
     /// and a register to copy first (hardware numbers: destination, source).
     pub type Resume = (isize, Option<(u8, u8)>);
-    /// Given the bytes before a faulting instruction and from it on,
-    /// decides whether and how the thread goes on.
-    pub type NullWriteHook = fn(before: &[u8], at: &[u8]) -> Option<Resume>;
+    /// Given the bytes before a faulting instruction, from it on, and at
+    /// each code address near the top of the thread's stack (as many
+    /// bytes as from the instruction on), decides whether and how the
+    /// thread goes on.
+    pub type NullWriteHook = fn(before: &[u8], at: &[u8], callers: &[&[u8]]) -> Option<Resume>;
+
+    /// Stack slots looked at for code addresses.
+    const STACK_SLOTS: usize = 32;
 
     static NULL_WRITE: std::sync::OnceLock<(NullWriteHook, usize, usize)> =
         std::sync::OnceLock::new();
@@ -816,7 +821,29 @@ mod host {
                 std::slice::from_raw_parts(rip as *const u8, at),
             )
         };
-        let Some((delta, copy)) = hook(b, a) else {
+        // What the stack's top holds that points into image code: the
+        // thread's return addresses are among it.
+        let mut callers: [&[u8]; STACK_SLOTS] = [&[]; STACK_SLOTS];
+        let mut found = 0;
+        let (mut low, mut high) = (0, 0);
+        // SAFETY: writes the current thread's stack bounds.
+        unsafe {
+            windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high)
+        };
+        let rsp = context.Rsp as usize;
+        for slot in (rsp..rsp + 8 * STACK_SLOTS).step_by(8) {
+            if slot < low || slot + 8 > high {
+                break;
+            }
+            // SAFETY: inside the faulting thread's stack, which is ours.
+            let target = unsafe { (slot as *const usize).read() };
+            if target > 0x1_0000 && image(target) && image(target + at) {
+                // SAFETY: committed image memory, checked just now.
+                callers[found] = unsafe { std::slice::from_raw_parts(target as *const u8, at) };
+                found += 1;
+            }
+        }
+        let Some((delta, copy)) = hook(b, a, &callers[..found]) else {
             return EXCEPTION_CONTINUE_SEARCH;
         };
         static SEEN: AtomicU64 = AtomicU64::new(0);
