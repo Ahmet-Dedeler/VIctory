@@ -56,7 +56,16 @@ struct Last {
     changed: u32,
     /// Refreshes since the memory was last hashed.
     unhashed: u32,
+    /// When the memory was last looked at (memory not watched).
+    looked: Option<std::time::Instant>,
 }
+
+/// Memory whose writes are not tracked at all ([`crate::watch::tracking`])
+/// is looked at this often at most: every list of a frame that samples a
+/// texture asks, and hashing megabytes each time took most of a frame
+/// (loading screens: 35-60 ms). Shorter than a frame at 30 fps, so a
+/// video still gets every frame.
+const LOOK_EVERY: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// A texture that changed this many times in a row (a video plane) is
 /// taken to change every time: detiled without being hashed first.
@@ -187,6 +196,16 @@ impl Staging {
                 "a sampled texture's memory is not committed"
             );
             return 0;
+        }
+        if !crate::watch::tracking() {
+            let now = std::time::Instant::now();
+            if last
+                .looked
+                .is_some_and(|at| now.duration_since(at) < LOOK_EVERY)
+            {
+                return 0;
+            }
+            last.looked = Some(now);
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };

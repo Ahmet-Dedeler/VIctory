@@ -1234,7 +1234,8 @@ mod host {
     /// Debugging aid: `VICTORY_KEYS_FILE=<file>` presses keys as a run goes
     /// (by whoever watches it): the file holds `<number>:<key>`, and each
     /// time the number is higher than the last one seen, the key is held
-    /// for 0.2 s. Read at most every 50 ms.
+    /// for 0.5 s (a title at a few frames a second still sees it). Read at
+    /// most every 50 ms.
     #[cfg(feature = "diagnostics")]
     fn from_file(key: fn(&str) -> Option<u8>) -> Option<u8> {
         struct Watch {
@@ -1266,7 +1267,7 @@ mod host {
             }
         }
         w.held
-            .filter(|&(since, _)| now.duration_since(since) < Duration::from_millis(200))
+            .filter(|&(since, _)| now.duration_since(since) < Duration::from_millis(500))
             .map(|(_, vk)| vk)
     }
 

@@ -641,22 +641,28 @@ impl Layout {
             return Err(Error::TooSmall);
         }
         let band = height.div_ceil(threads);
-        std::thread::scope(|scope| {
-            let bands: Vec<_> = linear
-                .chunks_mut(band * row_pitch)
-                .enumerate()
-                .filter(|(i, _)| i * band < height)
-                .map(|(i, part)| {
-                    let rows = (i * band) as u32..((i + 1) * band).min(height) as u32;
-                    scope.spawn(move || {
-                        self.detile_rows(tiled, mip, slice, part, row_pitch, depth_pitch, Some(rows))
-                    })
-                })
-                .collect();
-            bands
-                .into_iter()
-                .try_for_each(|band| band.join().unwrap_or(Err(Error::Invalid)))
-        })
+        let failed = std::sync::Mutex::new(None);
+        let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = linear
+            .chunks_mut(band * row_pitch)
+            .enumerate()
+            .filter(|(i, _)| i * band < height)
+            .map(|(i, part)| {
+                let rows = (i * band) as u32..((i + 1) * band).min(height) as u32;
+                let failed = &failed;
+                Box::new(move || {
+                    let done =
+                        self.detile_rows(tiled, mip, slice, part, row_pitch, depth_pitch, Some(rows));
+                    if let Err(e) = done {
+                        *failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                    }
+                }) as Box<dyn FnOnce() + Send + '_>
+            })
+            .collect();
+        pool::run(jobs);
+        match failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -750,6 +756,93 @@ impl Layout {
             }
         }
         Ok(())
+    }
+}
+
+/// Threads kept for [`Layout::detile_parallel`]: starting threads for every
+/// texture costs more than the detiling where threads are dear (under Wine
+/// and a CPU translator, about a millisecond each).
+mod pool {
+    use std::sync::mpsc::{Sender, channel};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+    type Job = Box<dyn FnOnce() + Send + 'static>;
+
+    /// Workers in the pool; the caller of [`run`] works too.
+    const WORKERS: usize = 7;
+
+    fn queue() -> &'static Mutex<Sender<Job>> {
+        static QUEUE: OnceLock<Mutex<Sender<Job>>> = OnceLock::new();
+        QUEUE.get_or_init(|| {
+            let (sender, receiver) = channel::<Job>();
+            let receiver = Arc::new(Mutex::new(receiver));
+            for i in 0..WORKERS {
+                let receiver = receiver.clone();
+                let _ = std::thread::Builder::new()
+                    .name(format!("victory-detile {i}"))
+                    .spawn(move || {
+                        loop {
+                            let job = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            match job {
+                                Ok(job) => job(),
+                                Err(_) => return,
+                            }
+                        }
+                    });
+            }
+            Mutex::new(sender)
+        })
+    }
+
+    /// Counts jobs still running; a job leaves by dropping its guard, also
+    /// when it panics.
+    struct Running(Mutex<usize>, Condvar);
+
+    struct Leave(Arc<Running>);
+
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+            self.0.1.notify_all();
+        }
+    }
+
+    /// Runs every job, the last on the calling thread and the others on
+    /// the pool, and returns when all are done.
+    pub(super) fn run<'a>(mut jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
+        let Some(mine) = jobs.pop() else { return };
+        let running = Arc::new(Running(Mutex::new(jobs.len()), Condvar::new()));
+        for job in jobs {
+            let leave = Leave(running.clone());
+            // SAFETY: only the lifetime changes. What the job borrows
+            // outlives it: this function returns only once every job has
+            // run or been dropped (each drops its `Leave` either way), as
+            // the wait below sees.
+            let job: Job = unsafe {
+                std::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Job>(Box::new(move || {
+                    let _leave = leave;
+                    // A panicking job must not take the worker with it.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }))
+            };
+            let sent = queue().lock().unwrap_or_else(|e| e.into_inner()).send(job);
+            if let Err(unsent) = sent {
+                // No workers (they could not be started): run it here.
+                (unsent.0)();
+            }
+        }
+        // Waits for the others even if our own job panics.
+        struct Wait(Arc<Running>);
+        impl Drop for Wait {
+            fn drop(&mut self) {
+                let mut left = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+                while *left > 0 {
+                    left = self.0.1.wait(left).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        }
+        let _wait = Wait(running);
+        mine();
     }
 }
 
