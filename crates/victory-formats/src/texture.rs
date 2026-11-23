@@ -587,11 +587,75 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
+        self.detile_rows(tiled, mip, slice, linear, row_pitch, depth_pitch, None)
+    }
+
+    /// [`Layout::detile`] for rows `rows` only (all with `None`), `linear`
+    /// starting at the first of them.
+    #[allow(clippy::too_many_arguments)]
+    fn detile_rows(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+        rows: Option<std::ops::Range<u32>>,
+    ) -> Result<(), Error> {
         let n = self.desc.element_bytes as usize;
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, count| {
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, rows, |t, l, count| {
             for (i, len) in runs(t, count, n) {
                 linear[l + i * n..][..len].copy_from_slice(&tiled[t[i] as usize..][..len]);
             }
+        })
+    }
+
+    /// [`Layout::detile`] on up to `threads` threads, each taking a band of
+    /// rows: for the big subresources that change every frame (a 4K video
+    /// plane is 8 MB, element by element). Small or 3D subresources are
+    /// done on the calling thread.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detile_parallel(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+        threads: usize,
+    ) -> Result<(), Error> {
+        /// Bytes from which the threads pay off.
+        const PARALLEL_FROM: usize = 1 << 20;
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let (height, bytes) = (
+            m.height as usize,
+            m.width as usize * self.desc.element_bytes as usize,
+        );
+        let threads = threads.min(height / 16);
+        if threads < 2 || m.depth != 1 || height * bytes < PARALLEL_FROM || row_pitch < bytes {
+            return self.detile(tiled, mip, slice, linear, row_pitch, depth_pitch);
+        }
+        if linear.len() < (height - 1) * row_pitch + bytes {
+            return Err(Error::TooSmall);
+        }
+        let band = height.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let bands: Vec<_> = linear
+                .chunks_mut(band * row_pitch)
+                .enumerate()
+                .filter(|(i, _)| i * band < height)
+                .map(|(i, part)| {
+                    let rows = (i * band) as u32..((i + 1) * band).min(height) as u32;
+                    scope.spawn(move || {
+                        self.detile_rows(tiled, mip, slice, part, row_pitch, depth_pitch, Some(rows))
+                    })
+                })
+                .collect();
+            bands
+                .into_iter()
+                .try_for_each(|band| band.join().unwrap_or(Err(Error::Invalid)))
         })
     }
 
@@ -606,7 +670,7 @@ impl Layout {
         depth_pitch: usize,
     ) -> Result<(), Error> {
         let n = self.desc.element_bytes as usize;
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, count| {
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, None, |t, l, count| {
             for (i, len) in runs(t, count, n) {
                 tiled[t[i] as usize..][..len].copy_from_slice(&linear[l + i * n..][..len]);
             }
@@ -614,7 +678,9 @@ impl Layout {
     }
 
     /// Calls `row(tiled offsets, linear offset, elements)` for each row of a
-    /// subresource, after checking both buffers are large enough.
+    /// subresource, after checking both buffers are large enough. With
+    /// `rows`, only for those rows of a subresource one slice deep, the
+    /// linear buffer starting at the first of them.
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
@@ -624,6 +690,7 @@ impl Layout {
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
+        rows: Option<std::ops::Range<u32>>,
         mut row: impl FnMut(&[u64], usize, usize),
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
@@ -644,7 +711,14 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
-        let need = (depth as usize - 1) * depth_pitch + (m.height as usize - 1) * row_pitch + bytes;
+        let rows = match rows {
+            Some(rows) if depth != 1 || rows.end > m.height || rows.is_empty() => {
+                return Err(Error::Invalid);
+            }
+            Some(rows) => rows,
+            None => 0..m.height,
+        };
+        let need = (depth as usize - 1) * depth_pitch + (rows.len() - 1) * row_pitch + bytes;
         if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
@@ -662,7 +736,7 @@ impl Layout {
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
+            for y in rows.clone() {
                 let start = if linear {
                     base + u64::from(y) * u64::from(m.pitch) * n as u64
                 } else {
@@ -671,7 +745,8 @@ impl Layout {
                 for (o, c) in offsets.iter_mut().zip(&columns) {
                     *o = start + c;
                 }
-                row(&offsets, z as usize * depth_pitch + y as usize * row_pitch, m.width as usize);
+                let at = z as usize * depth_pitch + (y - rows.start) as usize * row_pitch;
+                row(&offsets, at, m.width as usize);
             }
         }
         Ok(())
@@ -913,6 +988,37 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Bands of rows detiled on several threads give what one thread gives,
+    /// with padded rows and a last row that ends short of its pitch.
+    #[test]
+    fn parallel_detile_matches() {
+        for d in [
+            desc(1280, 720, 1, 1, Swizzle::SW_64KB_S),
+            desc(1024, 1000, 1, 4, Swizzle::SW_64KB_D),
+            desc(2048, 600, 1, 1, Swizzle::LINEAR),
+        ] {
+            let l = Layout::new(&d).unwrap();
+            let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 31 + i / 251) as u8).collect();
+            let m = l.mips[0];
+            let bytes = m.width as usize * d.element_bytes as usize;
+            let pitch = bytes + 48;
+            let len = (m.height as usize - 1) * pitch + bytes;
+            let mut one = vec![0xAAu8; len];
+            l.detile(&tiled, 0, 0, &mut one, pitch, len).unwrap();
+            for threads in [2, 5, 8, 4096] {
+                let mut many = vec![0xAAu8; len];
+                l.detile_parallel(&tiled, 0, 0, &mut many, pitch, len, threads)
+                    .unwrap();
+                assert!(many == one, "{d:?} on {threads} threads");
+            }
+            let mut short = vec![0u8; len - 1];
+            assert_eq!(
+                l.detile_parallel(&tiled, 0, 0, &mut short, pitch, len, 4),
+                Err(Error::TooSmall)
+            );
         }
     }
 

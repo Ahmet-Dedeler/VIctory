@@ -52,7 +52,17 @@ struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
     read: Vec<u8>,
+    /// Hashed refreshes in a row that found other contents.
+    changed: u32,
+    /// Refreshes since the memory was last hashed.
+    unhashed: u32,
 }
+
+/// A texture that changed this many times in a row (a video plane) is
+/// taken to change every time: detiled without being hashed first.
+const ALWAYS_CHANGING: u32 = 4;
+/// ...and hashed only every so many refreshes, to notice when it stops.
+const HASH_EVERY: u32 = 8;
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -180,13 +190,25 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        if last.changed >= ALWAYS_CHANGING && last.unhashed + 1 < HASH_EVERY {
+            // Hashing would only confirm it: the hash costs more than the
+            // detiling it could save.
+            last.unhashed += 1;
+            self.detile(tiled);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            return size;
+        }
         let hash = blake3::hash(tiled);
+        last.unhashed = 0;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            last.changed = 0;
             return size;
         }
         last.hash = Some(hash);
+        last.changed += 1;
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -212,10 +234,17 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            // Up to eight threads: more gain little on memory this size.
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+            if let Err(e) = self.layout.detile_parallel(
+                tiled,
+                mip,
+                slice,
+                linear,
+                pitch,
+                pitch * rows as usize,
+                threads,
+            ) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
