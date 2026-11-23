@@ -81,6 +81,11 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
             at as usize + layout::TLS64_ADDRESS_OF_CALLBACKS,
             0,
         )?;
+        // The field has a base relocation: a loader that moves the image
+        // would turn the null into the distance moved and call "callbacks"
+        // read from there (Wine's does, and faults).
+        let field = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
+        drop_relocation(&mut bytes, &info, field)?;
     }
 
     Ok(PreparedImage {
@@ -88,6 +93,50 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         bytes,
         original_hash: blake3::hash(original),
     })
+}
+
+/// Turns the base relocation of the pointer at `rva`, if it has one, into
+/// padding (type 0, which loaders skip), so the pointer keeps its value
+/// wherever the image is mapped.
+fn drop_relocation(bytes: &mut [u8], info: &ImageInfo, rva: u32) -> Result<(), PrepareError> {
+    let Some(directory) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
+        return Ok(());
+    };
+    let (Some(table), Some(size)) = (
+        layout::read_u32(bytes, directory),
+        layout::read_u32(bytes, directory + 4),
+    ) else {
+        return Ok(());
+    };
+    let Some(start) = info.rva_to_file_offset(table) else {
+        return Ok(());
+    };
+    let (mut at, end) = (start as usize, start as usize + size as usize);
+    // Blocks of `{ page rva, block size, entries: [type:4 | offset:12] }`.
+    while at + 8 <= end {
+        let (Some(page), Some(block)) =
+            (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
+        else {
+            break;
+        };
+        let block = block as usize;
+        if block < 8 {
+            break;
+        }
+        if page == rva & !0xfff {
+            for entry in (at + 8..(at + block).min(end)).step_by(2) {
+                let Some(&[low, high]) = bytes.get(entry..entry + 2) else {
+                    break;
+                };
+                let value = u16::from_le_bytes([low, high]);
+                if value >> 12 != 0 && u32::from(value & 0xfff) == rva & 0xfff {
+                    write_u16(bytes, entry, 0)?;
+                }
+            }
+        }
+        at += block;
+    }
+    Ok(())
 }
 
 fn write_u16(bytes: &mut [u8], at: usize, v: u16) -> Result<(), PrepareError> {
@@ -126,9 +175,36 @@ mod tests {
         if let Some(tls) = &patched.tls {
             assert_eq!(tls.callbacks_va, 0);
         }
+        // The cleared callback pointer is no longer relocated.
+        if let Some(tls) = &prepared.info.tls {
+            let field = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
+            assert_eq!(relocations_of(&original, &prepared.info, field), 1);
+            assert_eq!(relocations_of(&prepared.bytes, &prepared.info, field), 0);
+        }
         // Nothing else moved: same sections, same size.
         assert_eq!(patched.sections.len(), prepared.info.sections.len());
         assert_eq!(prepared.bytes.len(), original.len());
+    }
+
+    /// How many base relocations `bytes` has for the pointer at `rva`.
+    fn relocations_of(bytes: &[u8], info: &ImageInfo, rva: u32) -> usize {
+        let directory = layout::data_directory_offset(bytes, dir::BASERELOC).unwrap();
+        let table = layout::read_u32(bytes, directory).unwrap();
+        let size = layout::read_u32(bytes, directory + 4).unwrap() as usize;
+        let mut at = info.rva_to_file_offset(table).unwrap() as usize;
+        let (end, mut found) = (at + size, 0);
+        while at + 8 <= end {
+            let page = layout::read_u32(bytes, at).unwrap();
+            let block = layout::read_u32(bytes, at + 4).unwrap() as usize;
+            for entry in (at + 8..at + block).step_by(2) {
+                let value = u16::from_le_bytes([bytes[entry], bytes[entry + 1]]);
+                if value >> 12 != 0 && page + u32::from(value & 0xfff) == rva {
+                    found += 1;
+                }
+            }
+            at += block.max(8);
+        }
+        found
     }
 
     #[test]

@@ -101,8 +101,11 @@ pub fn run(
         return Ok(());
     }
     victory_loader::report_crashes();
+    // After the reporter, so ahead of it: what we emulate is no crash.
+    victory_loader::isa::install();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    victory_hle::modules::audio::mute::start();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {

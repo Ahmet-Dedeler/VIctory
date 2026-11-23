@@ -52,5 +52,14 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+
+/// `VICTORY_BACKGROUND=1`: a run nobody sits at (someone works in other
+/// programs meanwhile). Windows open without taking the focus, the real
+/// keyboard is not read (scripted keys still are), the text entry dialog
+/// is dismissed and the title's sound is muted.
+pub fn background() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BACKGROUND").is_ok_and(|v| v.trim() == "1"))
+}
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use watch::{title_memory_remapped, tracking as write_tracking, writing as kernel_will_write};
