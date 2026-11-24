@@ -484,12 +484,16 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            #[cfg(feature = "diagnostics")]
+            self.account(format_args!("dispatch {x}x{y}x{z}"), true, false);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        self.account(format_args!("dispatch {x}x{y}x{z}"), true, true);
         self.bind(list, p, true);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
@@ -535,6 +539,46 @@ impl State {
         text
     }
 
+    /// Diagnostics: the line of a draw or dispatch in the account of a
+    /// listed frame (see [`crate::capture::note_frame_op`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn account(&self, kind: std::fmt::Arguments<'_>, compute: bool, ran: bool) {
+        crate::capture::note_frame_op(|| {
+            use std::fmt::Write;
+            let mut text = format!(
+                "{kind} {} {}",
+                if ran { "ran" } else { "DROPPED" },
+                crate::pipeline::describe(self.pipeline as This)
+            );
+            if !compute {
+                let _ = write!(text, " targets {:x?} depth {:#x}", self.targets, self.depth);
+            }
+            let mut writes: Vec<String> = Vec::new();
+            for u in crate::pipeline::used(self.pipeline as This) {
+                if u.kind != ResourceType::Uav || u.root != RootType::Table {
+                    continue;
+                }
+                let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let what = match crate::descriptor::view(handle) {
+                    Some(View::Unordered(resource, _, _)) => format!("{resource:#x}"),
+                    Some(view) => match crate::descriptor::host::buffer_range(&view) {
+                        Some((address, len)) => format!("buffer {address:#x}+{len:#x}"),
+                        None => "other".into(),
+                    },
+                    None => "unset".into(),
+                };
+                if !writes.contains(&what) {
+                    writes.push(what);
+                }
+            }
+            let _ = write!(text, " writes {writes:?}");
+            text
+        });
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
@@ -556,6 +600,8 @@ impl State {
         if !ran {
             dropped();
         }
+        #[cfg(feature = "diagnostics")]
+        self.account(format_args!("mesh {x}"), false, ran);
         #[cfg(not(feature = "diagnostics"))]
         let _ = ran;
     }
@@ -789,6 +835,8 @@ impl State {
         if !ran {
             dropped();
         }
+        #[cfg(feature = "diagnostics")]
+        self.account(format_args!("draw {vertices}x{instances}"), false, ran);
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -875,6 +923,8 @@ impl State {
         if !ran {
             dropped();
         }
+        #[cfg(feature = "diagnostics")]
+        self.account(format_args!("indexed {indices}x{instances}"), false, ran);
     }
 }
 

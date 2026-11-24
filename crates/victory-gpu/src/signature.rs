@@ -65,6 +65,18 @@ pub(crate) extern "system" fn create(
     object::hand_out(COMMAND_SIGNATURE, signature, iid, &SIGNATURE_IIDS, out)
 }
 
+/// Diagnostics: the argument types of a command signature (2 a draw, 3 an
+/// indexed draw, 4 a dispatch on PC).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn argument_types(this: This) -> Vec<u32> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: the title passes one of our signatures.
+    let s = unsafe { &*this.cast::<Signature>() };
+    s.arguments.iter().map(|a| a[0]).collect()
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &SIGNATURE_IIDS).then_some(this);
     object::answer(COMMAND_SIGNATURE, iid, found, out)

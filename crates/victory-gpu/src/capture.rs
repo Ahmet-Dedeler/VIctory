@@ -247,6 +247,36 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
+/// With `VICTORY_DUMP_TARGETS` set: the draws and dispatches the title
+/// records for the frames listed in `VICTORY_CAPTURE_FRAMES`, one line each
+/// in recording order (what it runs, whether it reached the host, the
+/// targets it draws to and the resources it writes), saved at that frame's
+/// present as `frame-<n>-ops.txt` beside the targets' pictures: the two
+/// together say which pass left a target empty.
+static OPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes a draw or dispatch of a listed frame.
+pub(crate) fn note_frame_op(line: impl FnOnce() -> String) {
+    if !dump_on() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    let line = line();
+    OPS.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+}
+
+/// At the present of frame `frame`: saves the noted draws and dispatches.
+pub(crate) fn save_frame_ops(frame: u64) {
+    let ops = std::mem::take(&mut *OPS.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(folder) = folder() else { return };
+    if ops.is_empty() {
+        return;
+    }
+    let path = folder.join(format!("frame-{frame}-ops.txt"));
+    if let Err(e) = std::fs::write(&path, ops.join("\n") + "\n") {
+        tracing::warn!(error = %e, path = %path.display(), "frame operations not saved");
+    }
+}
+
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));

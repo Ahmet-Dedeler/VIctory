@@ -1057,6 +1057,8 @@ mod state {
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            #[cfg(feature = "diagnostics")]
+            with_state(this, |_, s| s.account(format_args!("mesh-indirect {x}"), false, false));
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1110,8 +1112,26 @@ fn count_draw() {
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
 /// dispatches, counted per frame for the log.
 /// shortcut: dropped until their shaders translate (decision 0007).
+#[cfg_attr(windows, allow(dead_code))]
 extern "system" fn draw(_: This) {
     count_draw();
+}
+/// `ExecuteIndirect(signature, maximum count, arguments, offset, count
+/// buffer, count offset)`: not run on the host yet; the account of a listed
+/// frame names its signature's arguments and count.
+extern "system" fn indirect(this: This, signature: This, max_count: u32, _arguments: This, _offset: u64, count: This) {
+    count_draw();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    with_state(this, |_, s| {
+        let kinds = crate::signature::argument_types(signature);
+        s.account(
+            format_args!("indirect max {max_count} kinds {kinds:?} count-buffer {}", !count.is_null()),
+            false,
+            false,
+        )
+    });
+    #[cfg(not(all(windows, feature = "diagnostics")))]
+    let _ = (this, signature, max_count, count);
 }
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1231,7 +1251,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
-    (59, draw as *const ()),                      // 0x1d8 indirect
+    (59, indirect as *const ()),                  // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, ignored_state as *const ()),             // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228

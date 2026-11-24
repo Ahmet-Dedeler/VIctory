@@ -228,6 +228,43 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         .as_ref()
 }
 
+/// Diagnostics: a title pipeline in a few words, for the account of a
+/// frame's draws: each shader (`!` after one that does not translate) and
+/// whether the host has a pipeline for them.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn describe(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline".into();
+    }
+    let p = pipeline(this);
+    let mut text = String::new();
+    for s in &p.shaders {
+        let mark = if s.translated().is_some() { "" } else { "!" };
+        text.push_str(&format!("{} {}{mark} ", s.stage, s.hash));
+    }
+    text.push_str(if host_pipeline(this).is_some() { "host" } else { "NO-HOST-PIPELINE" });
+    text
+}
+
+/// Diagnostics: the resources a title pipeline's shaders use, whether or
+/// not they translate.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn used(this: This) -> Vec<victory_shader::UsedResource> {
+    use victory_shader::{Container, FourCC};
+    if this.is_null() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for s in &pipeline(this).shaders {
+        let Ok(c) = Container::parse(&s.container) else { continue };
+        let Some(part) = c.part(FourCC::DXIL) else { continue };
+        for p in victory_shader::native_programs(part.data).unwrap_or_default() {
+            out.extend(p.used);
+        }
+    }
+    out
+}
+
 /// The stage's container, if it has one.
 fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     if code.code.is_null() || code.size == 0 {
