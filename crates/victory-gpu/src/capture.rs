@@ -411,6 +411,17 @@ fn dump_one(
     list.close();
     host.execute(&[&list]);
     let Some((buffer, footprint)) = read else { return };
+    let name = format!(
+        "frame-{frame}-{i:03}-{resource:?}-{}x{}-f{}",
+        d.Width, d.Height, d.Format.0
+    );
+    tracing::info!(frame, i, ?resource, width = d.Width, height = d.Height, format = d.Format.0, "target dumped");
+    save_read(&buffer, &footprint, &name);
+}
+
+/// Saves a texture read back into `buffer` as `name`.png (thinned if
+/// large), logging its values.
+fn save_read(buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, name: &str) {
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished; the mapping spans the footprint's rows.
@@ -420,13 +431,7 @@ fn dump_one(
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
-        // Ahead of the line `to_rgba` logs with the target's values.
-        tracing::info!(frame, i, ?resource, width = d.Width, height = d.Height, format = d.Format.0, "target dumped");
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            let name = format!(
-                "frame-{frame}-{i:03}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
-            );
             // Every `step`-th pixel of a large target: a world frame has
             // a hundred of them, 33 MB each at 3840x2160.
             let (w, h) = (f.Width as usize, f.Height as usize);
@@ -438,11 +443,77 @@ fn dump_one(
                     small.extend_from_slice(&rgba[(y * w + x) * 4..][..4]);
                 }
             }
-            save_as(&name, sw as u32, sh as u32, sw * 4, false, &small);
+            save_as(name, sw as u32, sh as u32, sw * 4, false, &small);
         } else {
-            tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
+            tracing::info!(format = f.Format.0, name, "target not dumped: format");
         }
         buffer.Unmap(0, None);
+    }
+}
+
+/// Snapshots taken while the frame was recorded ([`snapshot`]): the label,
+/// the read-back buffer and its footprint.
+static SNAPS: std::sync::Mutex<Vec<(String, ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// With `VICTORY_SNAP=<shader hash>,...` in a listed frame: whether the
+/// first draw of the frame with a shader of this hash is still to come (it
+/// then is not any more). A target's dump shows it as the frame left it,
+/// which is after the next frame's first passes where the title records
+/// ahead; a snapshot shows it just before one pass.
+pub(crate) fn snap_wanted(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    static DONE: std::sync::Mutex<Vec<(u64, String)>> = std::sync::Mutex::new(Vec::new());
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_SNAP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    let frame = crate::queue::presented() + 1;
+    if list.is_empty() || !list.iter().any(|h| h == hash) || !dump_on() || !listed(frame) {
+        return false;
+    }
+    let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+    if done.iter().any(|(f, h)| *f == frame && h == hash) {
+        return false;
+    }
+    done.push((frame, hash.to_owned()));
+    true
+}
+
+/// Records a read-back of title texture `resource` (in host state
+/// `state`, to which it returns) into `list`, saved at the frame's present
+/// as `frame-<n>-snap-<label>-...png`.
+pub(crate) fn snapshot(list: &crate::host::HostList, resource: crate::object::This, state: u32, label: &str) {
+    const COPY_SOURCE: u32 = 0x800;
+    let (Some(texture), Some(host)) = (crate::resource::host_resource(resource), crate::host::host())
+    else {
+        return;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        return;
+    }
+    crate::list::ensure_state(list, resource, COPY_SOURCE);
+    // SAFETY: an open list and a live texture in the copy source state.
+    let read = unsafe { read_back(&host.device, &list.list, texture) };
+    crate::list::ensure_state(list, resource, state);
+    if let Some((buffer, footprint)) = read {
+        let label = format!("{label}-{resource:?}-{}x{}-f{}", d.Width, d.Height, d.Format.0);
+        SNAPS.lock().unwrap_or_else(|e| e.into_inner()).push((label, buffer, footprint));
+    }
+}
+
+/// At the present of frame `frame`: saves the snapshots taken in it.
+pub(crate) fn save_snapshots(frame: u64) {
+    let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
+    for (k, (label, buffer, footprint)) in snaps.iter().enumerate() {
+        tracing::info!(frame, k, label, "snapshot");
+        save_read(buffer, footprint, &format!("frame-{frame}-snap-{k:02}-{label}"));
     }
 }
 

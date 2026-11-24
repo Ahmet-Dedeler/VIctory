@@ -535,6 +535,20 @@ impl State {
     /// descriptors its tables hold.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         list.next_op();
+        // Diagnostics: the draw's first target as it is just before the
+        // first draw of a listed frame with a shader named in VICTORY_SNAP.
+        #[cfg(feature = "diagnostics")]
+        if !compute {
+            for stage in &p.stages {
+                let hash = stage.shader.hash.to_string();
+                if crate::capture::snap_wanted(&hash)
+                    && let Some(&target) = self.targets.iter().find(|&&t| t != 0)
+                {
+                    const RENDER_TARGET: u32 = 0x4;
+                    crate::capture::snapshot(list, target as This, RENDER_TARGET, &hash);
+                }
+            }
+        }
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.

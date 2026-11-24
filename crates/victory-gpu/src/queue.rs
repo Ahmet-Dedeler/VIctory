@@ -286,6 +286,7 @@ extern "system" fn present(
         if crate::capture::listed(frame) {
             crate::capture::save_frame_ops(frame);
             crate::capture::dump_targets(frame);
+            crate::capture::save_snapshots(frame);
             // Every plane the title presents (the first one is shown): its
             // resources as the target dumps name them, with their sizes.
             // A plane description is 0x48 bytes
