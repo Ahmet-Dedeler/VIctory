@@ -72,8 +72,17 @@ pub(crate) enum C {
     HostCallUs,
     HostWaitUs,
     WritingSubmissions,
+    /// Of copy-back: microseconds comparing the copy with its bytes before
+    /// the submission, reading title memory where they differ, merging,
+    /// and writing title memory; the 64 KiB pieces read and written.
+    BackCompareUs,
+    BackReadUs,
+    BackMergeUs,
+    BackWriteUs,
+    BackReads,
+    BackWrites,
 }
-const COUNTERS: usize = 39;
+const COUNTERS: usize = 45;
 
 /// `VICTORY_COPY_DIFF=1`: refreshes of host copies compare before they
 /// copy (twice the memory traffic), to count what changed.
@@ -252,8 +261,15 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "after submissions, per frame: {:.0} ranges declared as written by shaders, gone through \
-         once per host copy",
+         once per host copy: {:.1} ms comparing, {:.1} ms reading title memory ({:.0} pieces), \
+         {:.1} ms merging, {:.1} ms writing title memory ({:.0} pieces)",
         c[C::BackDeclared as usize],
+        ms(c[C::BackCompareUs as usize]),
+        ms(c[C::BackReadUs as usize]),
+        c[C::BackReads as usize],
+        ms(c[C::BackMergeUs as usize]),
+        ms(c[C::BackWriteUs as usize]),
+        c[C::BackWrites as usize],
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

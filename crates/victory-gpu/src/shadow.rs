@@ -414,6 +414,11 @@ impl Shadow {
             // tenth of that); the pieces are then gone through in order.
             // (Only where that much is still to compare: a submission's
             // later ranges mostly lie in pages its first ones went through.)
+            #[cfg(feature = "diagnostics")]
+            let (clock, mut reading, mut merging, mut writing) =
+                (std::time::Instant::now(), 0u64, 0u64, 0u64);
+            #[cfg(feature = "diagnostics")]
+            let since = |t: std::time::Instant| t.elapsed().as_micros() as u64;
             let ahead = (unchanged.unknown(start + from, start + to) >= crate::host::PARALLEL_FROM).then(|| {
                 // SAFETY: inside the mapping, which only this thread writes.
                 let host = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
@@ -432,12 +437,24 @@ impl Shadow {
                     None => unchanged.differs(start + at, host, old),
                 };
                 piece += 1;
+                #[cfg(feature = "diagnostics")]
+                let t0 = std::time::Instant::now();
                 if differs
                     && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
-                    && crate::host::read_into((start + at) as *const u8, title)
+                    && {
+                        let read = crate::host::read_into((start + at) as *const u8, title);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            reading += since(t0);
+                            crate::copystat::add(crate::copystat::C::BackReads, 1);
+                        }
+                        read
+                    }
                 {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
+                    #[cfg(feature = "diagnostics")]
+                    let t1 = std::time::Instant::now();
                     let mut changed = false;
                     for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
                         if *h != *o && *t != *h {
@@ -446,14 +463,33 @@ impl Shadow {
                         }
                         *h = *t;
                     }
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        merging += since(t1);
+                    }
                     if changed {
+                        #[cfg(feature = "diagnostics")]
+                        let t2 = std::time::Instant::now();
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            writing += since(t2);
+                            crate::copystat::add(crate::copystat::C::BackWrites, 1);
+                        }
                     }
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::BackCompareUs, since(clock).saturating_sub(reading + merging + writing));
+                add(C::BackReadUs, reading);
+                add(C::BackMergeUs, merging);
+                add(C::BackWriteUs, writing);
             }
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
