@@ -201,8 +201,9 @@ const FATAL: [i32; 6] = [
 
 /// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
 /// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
-/// line at `rax`; `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so
-/// a spin loop around them works with mwaitx as a yield.
+/// line at `rax` (and its site becomes a call of code that does, see
+/// [`crate::redirect`]); `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait
+/// hints, so a spin loop around them works with mwaitx as a yield.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes inside its page are readable, as the CPU just fetched them.
@@ -221,13 +222,16 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
         let slice = &bytes[..n];
 
-        if let Some(&[0x0f, 0x01, op @ (0xfa..=0xfc)]) = slice.get(..3) {
-            count_trap(usize::from(op != 0xfc), context.Rip);
-            match op {
-                0xfc => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
-                0xfa => {}
-                0xfb => std::thread::yield_now(),
-                _ => unreachable!(),
+        // `clzero`, or a site that was one and is a call by now (another
+        // thread wrote it while this exception was on its way).
+        if crate::redirect::clzero(context, slice) {
+            count_trap(0, code as u64);
+            return true;
+        }
+        if let Some(&[0x0f, 0x01, op @ (0xfa | 0xfb)]) = slice.get(..3) {
+            count_trap(1, context.Rip);
+            if op == 0xfb {
+                std::thread::yield_now();
             }
             context.Rip += 3;
             return true;

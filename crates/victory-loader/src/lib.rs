@@ -26,6 +26,8 @@ mod crash;
 #[cfg(windows)]
 mod hooks;
 pub mod prepare;
+#[cfg(windows)]
+mod redirect;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;

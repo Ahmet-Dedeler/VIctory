@@ -56,7 +56,11 @@ pub fn profile_on_request() {
                     let line: Vec<String> = (0..now.len())
                         .map(|i| format!("{} {:.0}", TRAP_NAMES[i], (now[i] - last[i]) as f64 / secs))
                         .collect();
-                    eprintln!("VIctory: exceptions per second: {}", line.join(", "));
+                    eprintln!(
+                        "VIctory: exceptions per second: {}; {} clzero sites are calls",
+                        line.join(", "),
+                        crate::redirect::WRITTEN.load(Relaxed)
+                    );
                     (last, said) = (now, Instant::now());
                 }
                 if file.exists() {
