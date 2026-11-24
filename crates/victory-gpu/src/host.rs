@@ -3326,6 +3326,8 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
         let background = crate::background();
+        // A background run's window is off the visible desktop.
+        let place = crate::background_window(rect.right - rect.left, rect.bottom - rect.top);
         let hwnd = CreateWindowExW(
             if background {
                 WS_EX_NOACTIVATE
@@ -3339,10 +3341,10 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             } else {
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE
             },
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            place.map_or(CW_USEDEFAULT, |p| p.0),
+            place.map_or(CW_USEDEFAULT, |p| p.1),
+            place.map_or(rect.right - rect.left, |p| p.2),
+            place.map_or(rect.bottom - rect.top, |p| p.3),
             None,
             None,
             Some(instance.into()),
@@ -3351,6 +3353,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         if background {
             // Shown behind what is in front, never the active window.
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            crate::background_behind(hwnd.0);
         }
         Ok(hwnd)
     }

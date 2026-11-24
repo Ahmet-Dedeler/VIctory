@@ -85,6 +85,7 @@ pub extern "system" fn CreateWindowExW(
     if show {
         ShowWindow(hwnd, wm::SW_SHOW);
     }
+    placed(hwnd, parent);
     hwnd
 }
 
@@ -115,7 +116,27 @@ pub extern "system" fn CreateWindowExA(
     if show {
         ShowWindow(hwnd, wm::SW_SHOW);
     }
+    placed(hwnd, parent);
     hwnd
+}
+
+/// Says where a background run's top-level window is once made and shown
+/// (the host may have moved it from where we asked).
+fn placed(hwnd: HWND, parent: HWND) {
+    if hwnd.is_null() || !parent.is_null() || !victory_gpu::background() {
+        return;
+    }
+    let mut at = RECT::default();
+    // SAFETY: a window this thread just made; `at` receives its rectangle.
+    unsafe { wm::GetWindowRect(hwnd, &mut at) };
+    tracing::info!(
+        left = at.left,
+        top = at.top,
+        width = at.right - at.left,
+        height = at.bottom - at.top,
+        out_of_the_way = victory_gpu::background_window(at.right - at.left, at.bottom - at.top).is_some(),
+        "background run: title window placed"
+    );
 }
 
 /// In a background run (`victory_gpu::background`) a title window never
@@ -142,7 +163,11 @@ pub extern "system" fn ShowWindow(hwnd: HWND, command: i32) -> i32 {
         _ => command,
     };
     // SAFETY: the title's own call, forwarded.
-    unsafe { wm::ShowWindow(hwnd, command) }
+    let shown = unsafe { wm::ShowWindow(hwnd, command) };
+    if command == wm::SW_SHOWNOACTIVATE {
+        victory_gpu::background_behind(hwnd);
+    }
+    shown
 }
 
 /// A console title sizes its window to its render target (Grand Theft
@@ -156,14 +181,22 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     let known =
         unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
     let fitted = fit_into(&area, width, height);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
-        return (x, y, width, height);
+    let (x, y, width, height) = if !parent.is_null() || known == 0 || fitted == (width, height) {
+        (x, y, width, height)
+    } else {
+        tracing::info!(width, height, to = ?fitted, "title window fitted to the screen");
+        let (w, h) = fitted;
+        let left = area.left + (area.right - area.left - w) / 2;
+        let top = area.top + (area.bottom - area.top - h) / 2;
+        (left, top, w, h)
+    };
+    // A background run's windows are off the visible desktop.
+    if parent.is_null()
+        && let Some(small) = victory_gpu::background_window(width, height)
+    {
+        return small;
     }
-    tracing::info!(width, height, to = ?fitted, "title window fitted to the screen");
-    let (w, h) = fitted;
-    let left = area.left + (area.right - area.left - w) / 2;
-    let top = area.top + (area.bottom - area.top - h) / 2;
-    (left, top, w, h)
+    (x, y, width, height)
 }
 
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits
