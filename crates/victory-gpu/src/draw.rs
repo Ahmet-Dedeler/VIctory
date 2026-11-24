@@ -1258,8 +1258,11 @@ impl State {
         let rects = self.topology == RECTANGLES;
         // Rectangles made from the vertex id have nothing to expand: their
         // pipeline's geometry-shader variant draws the fourth corner.
+        // Corners made from the vertex id go through the geometry shader
+        // variant; vertices in buffers are expanded here.
         let by_id = rects
-            && crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects.is_some());
+            && crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_some_and(|p| p.rects.is_some() && p.inputs.iter().all(|e| e.per_instance));
         let ran = if by_id {
             self.prepare_rects(list, false)
         } else {
@@ -1384,10 +1387,17 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        if self.topology == RECTANGLES {
-            once!("indexed rectangles not drawn");
-        }
-        let ran = self.topology != RECTANGLES && self.prepare(list, true);
+        // Indexed rectangles: the geometry shader variant, the title's
+        // own index counts.
+        let ran = if self.topology == RECTANGLES {
+            let ran = self.prepare_rects(list, true);
+            if !ran {
+                once!("indexed rectangles not drawn (no geometry shader variant)");
+            }
+            ran
+        } else {
+            self.prepare(list, true)
+        };
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -1530,7 +1540,7 @@ impl State {
                 // Told apart from the rest: rectangles are what post
                 // processing and UI draw.
                 Some(_) if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES => {
-                    why("a rectangle list with vertex buffers or more than a position, which indirect execution does not draw")
+                    why("a rectangle list whose pipeline has no geometry shader variant, which indirect execution does not draw")
                 }
                 Some(p) => why(&format!(
                     "prepare failed (compute {}, mesh {})",

@@ -658,16 +658,17 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
-        // Rectangles from the vertex id (no vertex inputs, a position and
-        // nothing else out): the variant that draws their fourth corner.
-        let rects = (g.topology.0 == RECTANGLES
-            && g.inputs.is_empty()
-            && stages
-                .first()
-                .and_then(|(vs, _)| vs.translated())
-                .is_some_and(|t| crate::rects::position_only(&t.host.dxil)))
-        .then(crate::rects::geometry_shader)
-        .flatten()
+        // Rectangle lists: the variant whose geometry shader draws their
+        // fourth corner (`crate::rects`), for the draws the CPU cannot
+        // expand.
+        let rects = (g.topology.0 == RECTANGLES)
+            .then(|| {
+                stages
+                    .first()
+                    .and_then(|(vs, _)| vs.translated())
+                    .and_then(|t| crate::rects::geometry_shader(&t.host.dxil))
+            })
+            .flatten()
         .and_then(|gs| {
             // SAFETY: a second description of the same borrowed pointers
             // (neither releases them).
@@ -688,7 +689,7 @@ impl HostPipeline {
             // SAFETY: the description points at live data.
             match unsafe { host.device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) } {
                 Ok(pso) => {
-                    tracing::info!(?shaders, "host pipeline for rectangles from the vertex id");
+                    tracing::info!(?shaders, inputs = g.inputs.len(), "host pipeline for rectangles");
                     crate::host::name(&pso, || format!("{shaders:?} rectangles"));
                     Some(pso)
                 }
