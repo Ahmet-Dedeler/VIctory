@@ -226,20 +226,39 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
     })
 }
 
+/// The console's 16-bit depth with 8-bit stencil, which has no PC format.
+pub(crate) const DEPTH16_STENCIL: u32 = 118;
+
 /// A format as the host has it. The console's 16-bit depth with stencil
-/// (and its typeless views) has no PC format: the 24-bit ones stand in.
-/// Nor have its 10-bit float colors (7e3 and 6e4 with 2-bit alpha): half
-/// floats hold them. (A host must never be handed a console-only number:
-/// Windows refuses it, Apple's D3DMetal aborts the process.)
+/// (and the view formats of its two planes) has no PC format. Plain 16-bit
+/// depth stands in for it: the title keeps a material number per pixel in
+/// such a target's depth plane (written by compute shaders) and draws its
+/// tiled lighting with the depth test "equal", which holds only where the
+/// host rounds depth to the same 16 bits; 24-bit depth with stencil rounds
+/// otherwise. The stencil plane, which compute shaders write and read
+/// too, is a texture of its own beside the host copy
+/// (`HostTexture::stencil`).
+/// Nor have the console's 10-bit float colors (7e3 and 6e4 with 2-bit
+/// alpha) a PC format: half floats hold them. (A host must never be handed
+/// a console-only number: Windows refuses it, Apple's D3DMetal aborts the
+/// process.)
 ///
-/// shortcut: only right for textures the host GPU fills (render targets);
-/// contents the title writes in a 10-bit float format would need
+/// shortcut: draws do not test or write the stencil of a 16-bit depth
+/// target with stencil (`VICTORY_DEPTH16_STENCIL=24` brings the 24-bit
+/// stand-in back, diagnostics).
+/// shortcut: 10-bit float is only right for textures the host GPU fills
+/// (render targets); contents the title writes in one would need
 /// converting on upload.
 pub(crate) fn pc_format(format: u32) -> u32 {
+    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let wide = *WIDE
+        .get_or_init(|| std::env::var("VICTORY_DEPTH16_STENCIL").as_deref() == Ok("24"));
     match format {
         116 | 117 => 10,
-        118 => 45,
-        119 => 46,
+        DEPTH16_STENCIL if wide => 45,
+        119 if wide => 46,
+        DEPTH16_STENCIL => 55,
+        119 => 56,
         120 => 47,
         other => other,
     }
@@ -770,10 +789,34 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
-    /// A depth target's twin for unordered access ([`host_twin`]), which
-    /// its unordered access views name; lists keep the two coherent
-    /// (`HostList::transition`).
+    /// A depth target's twin for unordered access to its depth plane
+    /// ([`host_twin`]), which its unordered access views name; lists keep
+    /// the two coherent (`HostList::transition`).
     pub(crate) twin: Option<std::sync::Arc<HostTexture>>,
+    /// The same for the stencil plane of a depth target that has one (the
+    /// title writes its material masks into one from compute shaders).
+    pub(crate) stencil: Option<std::sync::Arc<HostTexture>>,
+    /// On a twin: how it and its depth target's plane are copied.
+    pub(crate) link: Option<Link>,
+}
+
+/// How a twin and the plane of the depth target it stands for are copied
+/// into each other.
+#[cfg(windows)]
+pub(crate) struct Link {
+    /// The depth target's plane: 0 depth, 1 stencil.
+    pub(crate) plane: u32,
+    /// Both textures have one plane and the same subresources: copied
+    /// whole. Else the twin's only subresource is the depth target's
+    /// `plane` (mip 0 of its only slice).
+    pub(crate) whole: bool,
+    pub(crate) how: TwinCopy,
+    /// For [`TwinCopy::Buffer`]: the buffer the twin's subresources pass
+    /// through, with their places in it.
+    pub(crate) staging: Option<(
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        Vec<windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    )>,
 }
 
 #[cfg(windows)]
@@ -806,12 +849,21 @@ pub(crate) fn host_resource<'a>(
     resource(this).host.as_deref().map(|h| &h.texture)
 }
 
-/// The host texture unordered access views of a title texture name: the
-/// twin of a depth target that has one, with the format such a view takes
-/// when the title's names none or a depth format; else the host copy.
+/// A title texture's own format and flags (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn title_format_flags(this: This) -> (u32, u32) {
+    let d = &resource(this).desc;
+    (d.format, d.flags)
+}
+
+/// The host texture an unordered access view of plane `plane` of a title
+/// texture names: the twin of a depth target that has one for that plane,
+/// with the format such a view takes when the title's names none or a
+/// depth format; else the host copy.
 #[cfg(windows)]
 pub(crate) fn host_unordered<'a>(
     this: This,
+    plane: u32,
 ) -> Option<(
     &'a windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     Option<u32>,
@@ -820,7 +872,8 @@ pub(crate) fn host_unordered<'a>(
         return None;
     }
     let host = resource(this).host.as_deref()?;
-    let Some(twin) = &host.twin else {
+    let twin = if plane == 1 { &host.stencil } else { &host.twin };
+    let Some(twin) = twin else {
         return Some((&host.texture, None));
     };
     // SAFETY: a live resource.
@@ -919,42 +972,351 @@ fn host_texture(
     texture
 }
 
-/// Depth families that have unordered access formats (16-bit and 32-bit
-/// depth; the stencil ones have none), and the format with the depth
-/// format's bits: R16_UNORM for D16_UNORM, R32_FLOAT for D32_FLOAT.
+/// The typeless formats twins have, and the format a view of one takes
+/// when the title's names none or a depth format: R16_UNORM for 16-bit
+/// depth, R32_FLOAT for 32-bit depth, R8_UINT for stencil.
 #[cfg(windows)]
-const TWIN_FORMATS: [(u32, u32); 2] = [(53, 56), (39, 41)];
+pub(crate) const TWIN_FORMATS: [(u32, u32); 3] = [(53, 56), (39, 41), (60, 62)];
 
-/// A twin for the unordered access of host depth target `depth`: its
-/// description with unordered access instead of depth use, in the
-/// typeless format of its family, so that views of the twin take any
-/// format of the family (the title's own). Copies between the two keep
-/// the bits (CopyResource takes depth resources and formats of one type
-/// group). `None` without such a family (stencil), multisampled, or not
-/// 2D.
+/// The twin's typeless format for plane `plane` of a depth target of
+/// typeless family `family`, and whether the two are copied whole (one
+/// plane each): 16-bit and 32-bit depth; of the families with stencil,
+/// the 32-bit depth and the stencil. 24-bit depth has no unordered access
+/// format.
 #[cfg(windows)]
-fn host_twin(
+fn twin_format(family: u32, plane: u32) -> Option<(u32, bool)> {
+    match (family, plane) {
+        (53, 0) => Some((53, true)),
+        (39, 0) => Some((39, true)),
+        (19, 0) => Some((39, false)),
+        (19 | 44, 1) => Some((60, false)),
+        _ => None,
+    }
+}
+
+/// How the host copies between a depth target's plane and its twin.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TwinCopy {
+    /// Texture to texture.
+    Direct,
+    /// Through a buffer: the texture into it, it into the other texture.
+    Buffer,
+    /// Neither arrives: the twin stays apart from its depth target.
+    Neither,
+}
+
+/// How this host copies between plane `plane` of a depth target of
+/// typeless family `family` and its twin: measured once per kind, by
+/// copying a pattern from a color texture into a depth texture both ways
+/// and reading the plane back ([`probe_twin_copy`]). D3D12 allows the
+/// direct copy between formats of one type group; a stencil plane and an
+/// 8-bit texture are not one, and D3DMetal's blits want one pixel format
+/// on both sides, so the answer is measured, not assumed.
+/// `VICTORY_TWIN_COPY=direct|buffer` overrides it (diagnostics).
+#[cfg(windows)]
+fn twin_copy(family: u32, plane: u32) -> TwinCopy {
+    static HOW: std::sync::Mutex<Vec<((u32, u32), TwinCopy)>> = std::sync::Mutex::new(Vec::new());
+    let mut known = HOW.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, how)) = known.iter().find(|(k, _)| *k == (family, plane)) {
+        return how;
+    }
+    let how = match std::env::var("VICTORY_TWIN_COPY").as_deref() {
+        Ok("direct") => TwinCopy::Direct,
+        Ok("buffer") => TwinCopy::Buffer,
+        _ => probe_twin_copy(family, plane).unwrap_or(TwinCopy::Direct),
+    };
+    tracing::info!(family, plane, ?how, "copies between depth targets and their unordered access twins");
+    known.push(((family, plane), how));
+    how
+}
+
+/// [`twin_copy`]'s measurement; `None` if the host made no test objects.
+#[cfg(windows)]
+fn probe_twin_copy(family: u32, plane: u32) -> Option<TwinCopy> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+    const SIDE: usize = 8;
+    let host = crate::host::host()?;
+    let (color_format, whole) = twin_format(family, plane)?;
+    // Bytes per texel of the twin (and of the plane in a buffer).
+    let bytes: usize = match color_format {
+        53 => 2,
+        39 => 4,
+        _ => 1,
+    };
+    let texture = |format: u32, flags, state| {
+        let d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: SIDE as u64,
+            Height: SIDE as u32,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(format as i32),
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: flags,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; the out pointer is ours.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, state, None, &mut made)
+                .ok()?;
+        }
+        made.map(|t| (t, d))
+    };
+    let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+    let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    let (color, color_desc) = texture(color_format, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, dest)?;
+    let (depth, depth_desc) = texture(family, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, dest)?;
+    let footprint = |d: &D3D12_RESOURCE_DESC, sub: u32| {
+        let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: outputs for one subresource.
+        unsafe {
+            host.device
+                .GetCopyableFootprints(d, sub, 1, 0, Some(&mut f), None, None, Some(&mut total));
+        }
+        (f, total)
+    };
+    let (color_place, color_total) = footprint(&color_desc, 0);
+    let (depth_place, depth_total) = footprint(&depth_desc, plane);
+    let total = color_total.max(depth_total).max(1);
+    let buffer = |kind, state| {
+        let d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: total,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; the out pointer is ours.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, state, None, &mut made)
+                .ok()?;
+        }
+        made
+    };
+    // The pattern's texel at (x, y): a 32-bit float in 0..1, or integers.
+    let value = |x: usize, y: usize, salt: u32| -> u32 {
+        let i = (y * SIDE + x) as u32;
+        match bytes {
+            4 => ((i + salt % 7 + 1) as f32 / 128.0).to_bits(),
+            2 => (salt + i * 0x101) & 0xffff,
+            _ => (salt + i * 3) & 0xff,
+        }
+    };
+    // An upload buffer holding the pattern in rows of `pitch` bytes.
+    let pattern = |salt: u32, pitch: usize| {
+        let upload = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a mapped upload buffer of at least the footprint's bytes.
+        unsafe {
+            upload.Map(0, None, Some(&mut data)).ok()?;
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    let v = value(x, y, salt).to_le_bytes();
+                    std::ptr::copy_nonoverlapping(
+                        v.as_ptr(),
+                        data.cast::<u8>().add(y * pitch + x * bytes),
+                        bytes,
+                    );
+                }
+            }
+            upload.Unmap(0, None);
+        }
+        Some(upload)
+    };
+    let placed = |b: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed interface pointer, not released.
+        pResource: unsafe { std::mem::transmute_copy(b) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+    };
+    let part = |t: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed interface pointer, not released.
+        pResource: unsafe { std::mem::transmute_copy(t) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
+    };
+    // Runs `record` in a list of its own, then reads the depth texture's
+    // plane (left as a copy source) back: whether it holds the pattern.
+    let holds = |salt: u32, record: &dyn Fn(&ID3D12GraphicsCommandList)| -> Option<bool> {
+        let back = buffer(D3D12_HEAP_TYPE_READBACK, dest)?;
+        let list = host.new_list().ok()?;
+        // SAFETY: an open list of ours and live resources in the states
+        // the copies need.
+        unsafe {
+            record(&list.list);
+            list.list
+                .CopyTextureRegion(&placed(&back, depth_place), 0, 0, 0, &part(&depth, plane), None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let pitch = depth_place.Footprint.RowPitch as usize;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy finished; the mapping spans the footprint.
+        unsafe {
+            back.Map(0, None, Some(&mut data)).ok()?;
+            let ok = (0..SIDE).all(|y| {
+                (0..SIDE).all(|x| {
+                    let mut v = [0u8; 4];
+                    std::ptr::copy_nonoverlapping(
+                        data.cast::<u8>().add(y * pitch + x * bytes),
+                        v.as_mut_ptr(),
+                        bytes,
+                    );
+                    u32::from_le_bytes(v) == value(x, y, salt)
+                })
+            });
+            back.Unmap(0, None);
+            Some(ok)
+        }
+    };
+    let first = pattern(0x1234, color_place.Footprint.RowPitch as usize)?;
+    let direct = holds(0x1234, &|l| {
+        // SAFETY: as `holds` says.
+        unsafe {
+            l.CopyTextureRegion(&part(&color, 0), 0, 0, 0, &placed(&first, color_place), None);
+            l.ResourceBarrier(&[crate::host::transition(&color, dest, source)]);
+            if whole {
+                l.CopyResource(&depth, &color);
+            } else {
+                l.CopyTextureRegion(&part(&depth, plane), 0, 0, 0, &part(&color, 0), None);
+            }
+            l.ResourceBarrier(&[crate::host::transition(&depth, dest, source)]);
+        }
+    })?;
+    let second = pattern(0x4321, depth_place.Footprint.RowPitch as usize)?;
+    let through = holds(0x4321, &|l| {
+        // SAFETY: as `holds` says.
+        unsafe {
+            l.ResourceBarrier(&[crate::host::transition(&depth, source, dest)]);
+            l.CopyTextureRegion(&part(&depth, plane), 0, 0, 0, &placed(&second, depth_place), None);
+            l.ResourceBarrier(&[crate::host::transition(&depth, dest, source)]);
+        }
+    })?;
+    tracing::info!(
+        family,
+        plane,
+        direct,
+        through,
+        plane_format = depth_place.Footprint.Format.0,
+        plane_pitch = depth_place.Footprint.RowPitch,
+        "host copies into a depth texture's plane (from a color texture, from a buffer)"
+    );
+    Some(match (direct, through) {
+        (true, _) => TwinCopy::Direct,
+        (false, true) => TwinCopy::Buffer,
+        (false, false) => TwinCopy::Neither,
+    })
+}
+
+/// The stencil plane of a 16-bit depth target with stencil, whose host
+/// copy has none ([`pc_format`]): an 8-bit texture of the target's size
+/// that unordered access and shader views of the plane name. Nothing is
+/// copied between it and the host copy.
+#[cfg(windows)]
+fn stencil_plane(
     depth: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     let host = crate::host::host()?;
     // SAFETY: a live resource.
     let mut d = unsafe { depth.GetDesc() };
-    let typeless = family(d.Format.0 as u32);
-    if d.SampleDesc.Count > 1
-        || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-        || !TWIN_FORMATS.iter().any(|&(f, _)| f == typeless)
-    {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(
-                format = d.Format.0,
-                samples = d.SampleDesc.Count,
-                "no unordered access twin for this depth target: its UAV writes are dropped"
-            )
-        });
+    if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
         return None;
     }
+    d.Format.0 = 60;
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let mut plane: Option<ID3D12Resource> = None;
+    // SAFETY: the host's own description, changed to a legal one; the out
+    // pointer is ours.
+    let made = unsafe {
+        host.device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &d,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut plane,
+        )
+    };
+    if let Err(e) = made {
+        tracing::warn!(error = %e, desc = ?d, "no stencil plane texture");
+    }
+    tracing::info!(width = d.Width, height = d.Height, "stencil plane of a 16-bit depth target as a texture of its own");
+    Some(HostTexture {
+        texture: plane?,
+        state: 0.into(),
+        twin: None,
+        stencil: None,
+        link: None,
+    })
+}
+
+/// The texture standing for the stencil plane of a title depth target
+/// whose host copy has none ([`stencil_plane`]), for shader views of it.
+#[cfg(windows)]
+pub(crate) fn host_stencil_plane<'a>(
+    this: This,
+) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.format != DEPTH16_STENCIL {
+        return None;
+    }
+    let plane = r.host.as_deref()?.stencil.as_deref()?;
+    plane.link.is_none().then_some(&plane.texture)
+}
+
+/// A twin for the unordered access to plane `plane` of host depth target
+/// `depth`: a texture with unordered access instead of depth use, in a
+/// typeless format with the plane's bits ([`twin_format`]), so that views
+/// of the twin take the title's own format. Copies between the two keep
+/// the bits ([`twin_copy`]). `None` for a plane without such a format
+/// (24-bit depth), multisampled or not 2D targets, and planes of a target
+/// with stencil that has mips or slices.
+#[cfg(windows)]
+fn host_twin(
+    depth: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    plane: u32,
+) -> Option<HostTexture> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let host = crate::host::host()?;
+    // SAFETY: a live resource.
+    let mut d = unsafe { depth.GetDesc() };
+    let depth_family = family(d.Format.0 as u32);
+    let format = twin_format(depth_family, plane);
+    let Some((typeless, whole)) = format.filter(|&(_, whole)| {
+        d.SampleDesc.Count == 1
+            && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && (whole || (d.MipLevels == 1 && d.DepthOrArraySize == 1))
+    }) else {
+        tracing::warn!(
+            format = d.Format.0,
+            plane,
+            samples = d.SampleDesc.Count,
+            mips = d.MipLevels,
+            slices = d.DepthOrArraySize,
+            "no unordered access twin for this plane of a depth target: its UAV writes are dropped"
+        );
+        return None;
+    };
     d.Format.0 = typeless as i32;
     d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     let heap = D3D12_HEAP_PROPERTIES {
@@ -977,7 +1339,79 @@ fn host_twin(
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no unordered access twin");
     }
-    twin
+    let twin = twin?;
+    let how = twin_copy(depth_family, plane);
+    // The buffer every subresource passes through.
+    let staging = (how == TwinCopy::Buffer)
+        .then(|| {
+            let count = u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize);
+            let mut footprints =
+                vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+            let mut total = 0;
+            // SAFETY: outputs for `count` subresources.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &d,
+                    0,
+                    count,
+                    0,
+                    Some(footprints.as_mut_ptr()),
+                    None,
+                    None,
+                    Some(&mut total),
+                );
+            }
+            let buffer = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total.max(1),
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut staging: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation; the out pointer is ours.
+            let made = unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &buffer,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut staging,
+                )
+            };
+            if let Err(e) = made {
+                tracing::warn!(error = %e, bytes = total, "no buffer for an unordered access twin's copies");
+            }
+            staging.map(|b| (b, footprints))
+        })
+        .flatten();
+    tracing::info!(
+        depth = d.Format.0,
+        plane,
+        width = d.Width,
+        height = d.Height,
+        ?how,
+        "unordered access twin for a depth target"
+    );
+    Some(HostTexture {
+        texture: twin,
+        state: 0.into(),
+        twin: None,
+        stencil: None,
+        link: Some(Link {
+            plane,
+            whole,
+            how,
+            staging,
+        }),
+    })
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1047,20 +1481,27 @@ fn hand_out_resource(
             let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
             // Depth and unordered access (see `host_texture`).
             const BOTH: u32 = 2 | 4;
-            let twin = (desc.flags & BOTH == BOTH)
-                .then(|| host_twin(&texture))
+            let both = desc.flags & BOTH == BOTH;
+            let twin = both
+                .then(|| host_twin(&texture, 0))
                 .flatten()
-                .map(|texture| {
-                    std::sync::Arc::new(HostTexture {
-                        texture,
-                        state: 0.into(),
-                        twin: None,
-                    })
-                });
+                .map(std::sync::Arc::new);
+            // SAFETY: a live resource.
+            let planes = matches!(family(unsafe { texture.GetDesc() }.Format.0 as u32), 19 | 44);
+            let stencil = if both && planes {
+                host_twin(&texture, 1)
+            } else if both && desc.format == DEPTH16_STENCIL {
+                stencil_plane(&texture)
+            } else {
+                None
+            }
+            .map(std::sync::Arc::new);
             std::sync::Arc::new(HostTexture {
                 texture,
                 state: state.into(),
                 twin,
+                stencil,
+                link: None,
             })
         }),
     });

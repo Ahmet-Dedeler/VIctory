@@ -305,6 +305,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
+            list.next_op();
             let (texture, before) = list.transition(b.first, wanted)?;
             Some(Barrier {
                 kind: 0,
@@ -332,7 +333,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             first: if b.first.is_null() {
                 b.first
             } else {
-                let (texture, _) = crate::resource::host_unordered(b.first)?;
+                let (texture, _) = crate::resource::host_unordered(b.first, 0)?;
                 texture.as_raw().cast_const().cast()
             },
             ..*b
@@ -759,10 +760,23 @@ extern "system" fn clear_dsv(
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        // A target whose host copy has no stencil plane (the console's
+        // 16-bit depth with stencil) clears its depth alone.
+        // SAFETY: a plain query.
+        let format = unsafe { texture.GetDesc() }.Format.0 as u32;
+        let planes = if matches!(crate::resource::family(format), 19 | 44) { 3 } else { 1 };
+        if flags & planes == 0 {
+            return;
+        }
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+            list.list.ClearDepthStencilView(
+                dsv,
+                D3D12_CLEAR_FLAGS((flags & planes) as i32),
+                depth,
+                stencil,
+                rects,
+            )
         };
     }
     #[cfg(not(windows))]

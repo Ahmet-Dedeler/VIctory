@@ -925,6 +925,57 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Logs a view the host refuses, once per texture and view description
+/// (diagnostics): the title texture, its host format and flags, and the
+/// view's format, dimension, mip and plane.
+#[cfg(feature = "diagnostics")]
+fn refused_view(
+    this: u64,
+    texture: &ID3D12Resource,
+    unordered: bool,
+    view: Option<(u32, u32, u32, u32)>,
+) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u64, bool, Option<(u32, u32, u32, u32)>)>>> =
+        std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.get_or_insert_with(Default::default).insert((this, unordered, view)) {
+        return;
+    }
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    tracing::warn!(
+        texture = format_args!("{this:#x}"),
+        unordered,
+        title = ?crate::resource::title_format_flags(this as crate::object::This),
+        format = d.Format.0,
+        flags = d.Flags.0,
+        width = d.Width,
+        height = d.Height,
+        view = ?view,
+        "refused view (format, dimension, mip, plane)"
+    );
+}
+
+/// " REFUSED(format, flags)" for a texture the host makes no shader (or
+/// unordered access) view of, as [`fits`] decides; else nothing (frame
+/// account).
+pub(crate) fn refused(texture: &ID3D12Resource, unordered: bool) -> String {
+    use crate::resource::DEPTH_FORMATS;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let allowed = if unordered {
+        d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
+    } else {
+        d.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
+    };
+    let own = d.Format.0 as u32;
+    if !allowed || DEPTH_FORMATS.iter().any(|&(typed, _)| typed == own) {
+        format!(" REFUSED(format {own}, flags {:#x})", d.Flags.0)
+    } else {
+        String::new()
+    }
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -1025,7 +1076,41 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
                 let mut desc = desc.as_ref().map(srv_desc);
+                // The stencil plane of a 16-bit depth target with stencil
+                // is a texture of its own: a view of that plane (plane 1,
+                // or the stencil format) reads it, the stencil in the
+                // second channel as the host's stencil views have it.
+                if let Some(d) = &desc
+                    && let Some(plane) = crate::resource::host_stencil_plane(resource)
+                    && (d.Format.0 == 47
+                        || (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D
+                            // SAFETY: a 2D texture view's union member.
+                            && unsafe { d.Anonymous.Texture2D.PlaneSlice } == 1))
+                {
+                    // 0, memory component 0, 0, 1.
+                    const STENCIL_IN_GREEN: u32 = 4 | 0 << 3 | 4 << 6 | 5 << 9 | 1 << 12;
+                    let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R8_UINT,
+                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                        Shader4ComponentMapping: STENCIL_IN_GREEN,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_SRV {
+                                MipLevels: 1,
+                                ..Default::default()
+                            },
+                        },
+                    };
+                    // SAFETY: a live texture and a slot of our heap.
+                    unsafe { device.CreateShaderResourceView(plane, Some(&view), at) };
+                    return Some(Some(plane.clone()));
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                    #[cfg(feature = "diagnostics")]
+                    refused_view(resource as u64, texture, false, desc.as_ref().map(|d| {
+                        // SAFETY: a texture view's union member.
+                        let t = unsafe { d.Anonymous.Texture2D };
+                        (d.Format.0 as u32, d.ViewDimension.0 as u32, t.MostDetailedMip, t.PlaneSlice)
+                    }));
                     return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
@@ -1047,7 +1132,21 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some((texture, twin_format)) = crate::resource::host_unordered(resource) else {
+            // The plane the view names (a depth target's twins are one
+            // per plane).
+            let plane = desc.as_ref().map_or(0, |words| {
+                let d = uav_desc(words);
+                // SAFETY: a texture view's union members.
+                unsafe {
+                    match d.ViewDimension {
+                        D3D12_UAV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.PlaneSlice,
+                        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => d.Anonymous.Texture2DArray.PlaneSlice,
+                        _ => 0,
+                    }
+                }
+            });
+            let Some((texture, twin_format)) = crate::resource::host_unordered(resource, plane)
+            else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at)
@@ -1067,8 +1166,24 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 {
                     d.Format.0 = format as i32;
                 }
+                // A twin has one plane, whichever of the depth target's
+                // it stands for.
+                match d.ViewDimension {
+                    D3D12_UAV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.PlaneSlice = 0,
+                    D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                        d.Anonymous.Texture2DArray.PlaneSlice = 0
+                    }
+                    _ => {}
+                }
             }
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+                #[cfg(feature = "diagnostics")]
+                refused_view(resource as u64, texture, true, desc.as_ref().map(|d| {
+                    // SAFETY: a texture view's union member (plane slice
+                    // after the mip slice).
+                    let t = unsafe { d.Anonymous.Texture2D };
+                    (d.Format.0 as u32, d.ViewDimension.0 as u32, t.MipSlice, t.PlaneSlice)
+                }));
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.

@@ -534,6 +534,7 @@ impl State {
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        list.next_op();
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -957,6 +958,14 @@ impl State {
             let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
                 return text;
             };
+            if !compute {
+                let _ = write!(
+                    text,
+                    " | {} ref {:#x}",
+                    p.state,
+                    STENCIL_REF.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
             let (mut reads, mut writes): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
             for stage in &p.stages {
                 for u in &stage.translated().used {
@@ -982,10 +991,21 @@ impl State {
                     }
                     let (list, what) = match view {
                         Some(View::Shader(r, _)) => match crate::resource::host_resource(r as This) {
-                            Some(_) => (&mut reads, format!("{r:#x}")),
+                            Some(t) => (
+                                &mut reads,
+                                format!("{r:#x}{}", crate::descriptor::host::refused(t, false)),
+                            ),
                             None => continue,
                         },
-                        Some(View::Unordered(r, ..)) => (&mut writes, format!("{r:#x}")),
+                        Some(View::Unordered(r, ..)) => (
+                            &mut writes,
+                            match crate::resource::host_resource(r as This) {
+                                Some(t) => {
+                                    format!("{r:#x}{}", crate::descriptor::host::refused(t, true))
+                                }
+                                None => format!("{r:#x}"),
+                            },
+                        ),
                         Some(View::Placed(true, ..)) => (&mut writes, "placed".to_owned()),
                         Some(View::Placed(false, ..)) => (&mut reads, "placed".to_owned()),
                         None if u.kind == ResourceType::Uav => (&mut writes, "unset".to_owned()),
@@ -1700,7 +1720,11 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     unsafe { list.list.OMSetBlendFactor(factor) };
 }
 
+/// The stencil reference set last, for the frame account.
+pub(crate) static STENCIL_REF: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
+    STENCIL_REF.store(reference, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }

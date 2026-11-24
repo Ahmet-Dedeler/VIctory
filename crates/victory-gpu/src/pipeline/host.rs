@@ -202,6 +202,33 @@ impl GraphicsState {
         )
     }
 
+    /// Depth, stencil and the first target's blend in short (frame account).
+    pub(crate) fn short(&self) -> String {
+        let d = &self.depth;
+        let b = &self.blend.RenderTarget[0];
+        format!(
+            "depth {}{} f{} | stencil {} r{:#x} w{:#x} front f{} p{} z{} x{} back f{} p{} | blend {} {}+{} op{} mask {:#x} | cull {}",
+            if d.DepthEnable.as_bool() { "test" } else { "off" },
+            if d.DepthWriteMask.0 != 0 { "+write" } else { "" },
+            d.DepthFunc.0,
+            if d.StencilEnable.as_bool() { "on" } else { "off" },
+            d.StencilReadMask,
+            d.StencilWriteMask,
+            d.FrontFace.StencilFunc.0,
+            d.FrontFace.StencilPassOp.0,
+            d.FrontFace.StencilDepthFailOp.0,
+            d.FrontFace.StencilFailOp.0,
+            d.BackFace.StencilFunc.0,
+            d.BackFace.StencilPassOp.0,
+            if b.BlendEnable.as_bool() { "on" } else { "off" },
+            b.SrcBlend.0,
+            b.DestBlend.0,
+            b.BlendOp.0,
+            b.RenderTargetWriteMask,
+            self.rasterizer.CullMode.0,
+        )
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -287,6 +314,8 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// Its depth, stencil and blend state in short, for the frame account.
+    pub(crate) state: String,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -517,6 +546,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                state: String::new(),
                 slots: 0,
                 inputs: Vec::new(),
             });
@@ -564,6 +594,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                state: g.short(),
                 slots: 0,
                 inputs: Vec::new(),
             });
@@ -645,6 +676,15 @@ impl HostPipeline {
                 pShaderBytecode: gs.as_ptr().cast(),
                 BytecodeLength: gs.len(),
             };
+            // A rectangle has no facing: whichever way its three corners
+            // wind, both triangles of the strip draw.
+            desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            // Diagnostics: these draws without their depth test, to tell a
+            // test that fails from a draw that covers nothing.
+            #[cfg(feature = "diagnostics")]
+            if std::env::var_os("VICTORY_RECTS_UNTESTED").is_some() {
+                desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            }
             // SAFETY: the description points at live data.
             match unsafe { host.device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) } {
                 Ok(pso) => {
@@ -667,6 +707,7 @@ impl HostPipeline {
             root,
             stages: bound,
             name: format!("{shaders:?}"),
+            state: g.short(),
             slots: g.slots(),
             inputs: g.elements(),
         })

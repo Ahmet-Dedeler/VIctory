@@ -371,6 +371,15 @@ pub(crate) fn dump_targets(frame: u64) {
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
         dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        // A depth target's unordered access twin, 500 numbers on.
+        // (the stencil plane's 600 on).
+        for (twin, at) in [(&copy.twin, 500), (&copy.stencil, 600)] {
+            let Some(twin) = twin else { continue };
+            // SAFETY: a live resource.
+            let d = unsafe { twin.texture.GetDesc() };
+            let state = twin.state.load(Relaxed);
+            dump_one(host, &twin.texture, state, frame, i + at, *resource as crate::object::This, &d);
+        }
     }
 }
 
