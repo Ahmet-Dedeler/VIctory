@@ -19,14 +19,40 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
-    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
+    /// Frame numbers, and offsets from the first frame with a mesh pipeline.
+    static LIST: std::sync::OnceLock<(Vec<u64>, Vec<u64>)> = std::sync::OnceLock::new();
+    let (frames, after_mesh) = LIST.get_or_init(|| {
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
-        list.split(',')
-            .filter_map(|f| f.trim().parse().ok())
-            .collect()
-    })
-    .contains(&n)
+        let entries = || list.split(',').map(str::trim);
+        (
+            entries().filter_map(|f| f.parse().ok()).collect(),
+            entries()
+                .filter_map(|f| f.strip_prefix('m')?.parse().ok())
+                .collect(),
+        )
+    });
+    let first = MESH_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+    frames.contains(&n) || first != 0 && n >= first && after_mesh.contains(&(n - first))
+}
+
+/// The frame being built when the fifth mesh pipeline was made (0: none
+/// yet). A title's frame numbers on reaching its world differ from run to
+/// run, so `VICTORY_CAPTURE_FRAMES` also takes `m<k>`: the k-th frame after
+/// this one.
+static MESH_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Notes that a mesh pipeline was made. The fifth sets the frame: a
+/// loading screen may draw with one or two long before the world does.
+pub(crate) fn mesh_pipeline_made() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if MADE.fetch_add(1, Relaxed) + 1 != 5 {
+        return;
+    }
+    let frame = crate::queue::presented() + 1;
+    if MESH_FRAME.compare_exchange(0, frame, Relaxed, Relaxed).is_ok() {
+        tracing::info!(frame, "fifth mesh pipeline; frames listed as m<k> count from here");
+    }
 }
 
 /// Whether frame `n` is saved.

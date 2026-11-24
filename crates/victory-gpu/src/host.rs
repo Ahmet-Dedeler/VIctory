@@ -335,6 +335,33 @@ impl Host {
         })
     }
 
+    /// The most bytes a mesh shader's outputs may take on this host, if it
+    /// has a limit of its own. Apple's GPUs (D3DMetal) take 32,768 as
+    /// [`crate::pipeline::host::metal_mesh_bytes`] counts them: the pipeline
+    /// is created all the same (no error reaches us), drawn as nothing, and
+    /// a submission that dispatches with it never finishes.
+    pub(crate) fn mesh_output_limit(&self) -> Option<u32> {
+        static LIMIT: OnceLock<Option<u32>> = OnceLock::new();
+        *LIMIT.get_or_init(|| {
+            const APPLE: u32 = 0x106B;
+            // SAFETY: plain queries of the device's adapter.
+            let desc = unsafe {
+                let luid = self.device.GetAdapterLuid();
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter>(luid))
+                    .and_then(|a| a.GetDesc())
+            };
+            let (vendor, name) = match &desc {
+                Ok(d) => (d.VendorId, String::from_utf16_lossy(&d.Description)),
+                Err(_) => (0, String::new()),
+            };
+            let name = name.trim_end_matches('\0');
+            let limit = (vendor == APPLE || name.contains("Apple")).then_some(32_768);
+            tracing::info!(vendor = format_args!("{vendor:#x}"), name, ?limit, "host adapter; mesh output limit");
+            limit
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -464,7 +491,18 @@ impl Host {
                 .iter()
                 .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
                 .collect();
-            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+            // Of a lone list (`VICTORY_SUBMIT_ONE_BY_ONE`), also its draws
+            // and dispatches, in short (noted with device-removed data on).
+            #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+            let mut ops = String::new();
+            #[cfg(feature = "diagnostics")]
+            if let [run] = runs {
+                for note in run.notes.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                    ops.push_str(note.split(" | ").next().unwrap_or(""));
+                    ops.push_str("; ");
+                }
+            }
+            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, %ops, "slow host submission");
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
@@ -475,20 +513,58 @@ impl Host {
                 last_notes(runs)
             ));
         }
-        for list in runs {
-            let deferred = list.deferred();
-            // Before the bottom-of-pipe writes, which tell the title the
-            // GPU is done.
-            for step in &deferred.copies {
+        #[cfg(feature = "diagnostics")]
+        let after = std::time::Instant::now();
+        // What the submission's shaders may have written goes back into
+        // title memory, each byte once: lists and draws declare the same
+        // unordered-access ranges over and over (a world frame of Grand
+        // Theft Auto VI declared 18-23 GB, most of it the same buffers).
+        // Before the bottom-of-pipe writes, which tell the title the GPU is
+        // done.
+        let mut ranges: Vec<(usize, usize, usize, &std::sync::Arc<crate::shadow::Shadow>)> = Vec::new();
+        let deferred: Vec<_> = runs.iter().map(|list| list.deferred()).collect();
+        for d in &deferred {
+            for step in &d.copies {
                 if let Step::GpuWrite(shadow, address, len) = step {
-                    shadow.copy_back(*address, *len);
+                    ranges.push((std::sync::Arc::as_ptr(shadow) as usize, *address, address + len, shadow));
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::BackDeclared, *len as u64);
                 }
             }
-            for &(at, what, bytes) in &deferred.writes {
+        }
+        ranges.sort_unstable_by_key(|&(shadow, from, to, _)| (shadow, from, to));
+        let mut next = 0;
+        while next < ranges.len() {
+            let (shadow, from, mut to, copy) = ranges[next];
+            next += 1;
+            while next < ranges.len() && ranges[next].0 == shadow && ranges[next].1 <= to {
+                to = to.max(ranges[next].2);
+                next += 1;
+            }
+            copy.copy_back_bytes(from, to - from);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BackBytes, (to - from) as u64);
+        }
+        #[cfg(feature = "diagnostics")]
+        let back = after.elapsed();
+        for d in &deferred {
+            for step in &d.copies {
+                if let Step::GpuWrite(shadow, address, len) = step {
+                    shadow.written(*address, *len);
+                }
+            }
+            for &(at, what, bytes) in &d.writes {
                 what.write(at as *mut u8, bytes);
             }
         }
+        drop(deferred);
         self.log_messages();
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::BackUs, back.as_micros() as u64);
+            add(C::AfterUs, (after.elapsed() - back).as_micros() as u64);
+        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations

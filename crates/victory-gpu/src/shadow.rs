@@ -112,8 +112,10 @@ impl Shadow {
     /// After the submission ran: copies what its shaders may have written
     /// back into title memory (unmapped pages left alone). Pages wholly
     /// written are current in this copy, so our own write is not taken for
-    /// the title's.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) {
+    /// the title's. A submission declares a range once per list and draw
+    /// that binds it: this is called for each byte once, then
+    /// [`Shadow::written`] per declaration.
+    pub(crate) fn copy_back_bytes(&self, address: usize, len: usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from < to {
@@ -131,6 +133,11 @@ impl Shadow {
                 copied[first - base..last - base].fill(now);
             }
         }
+    }
+
+    /// One declaration of `[address, address + len)` as written by shaders
+    /// has run and its bytes are back in title memory.
+    pub(crate) fn written(&self, address: usize, len: usize) {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(i) = pending.iter().position(|&r| r == (address, address + len)) {
             pending.swap_remove(i);

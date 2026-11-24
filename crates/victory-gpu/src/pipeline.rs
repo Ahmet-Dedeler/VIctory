@@ -220,7 +220,11 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     }
     let p = pipeline(this);
     p.host
-        .get_or_init(|| host::HostPipeline::new(&p.shaders, p.graphics.as_deref()))
+        .get_or_init(|| {
+            #[cfg(feature = "diagnostics")]
+            let _span = crate::copystat::span(crate::copystat::T::Pipeline);
+            host::HostPipeline::new(&p.shaders, p.graphics.as_deref())
+        })
         .as_ref()
 }
 
