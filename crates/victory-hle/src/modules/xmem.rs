@@ -360,15 +360,55 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section of physical pages: its handle, its size, and a view of all of
+/// it for our own writes into its pages (made at the first one, kept).
+struct Section(HANDLE, usize, std::sync::OnceLock<usize>);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
 // SAFETY: as above.
 unsafe impl Sync for Section {}
 
+impl Section {
+    /// Where our own view of the whole section starts, or `None` if the
+    /// host has no room for it.
+    ///
+    /// DirectStorage writes its page destinations through it. A view per
+    /// request (map, write, unmap) is three calls into the host's address
+    /// space bookkeeping, which serves one caller at a time: under Wine
+    /// 0.4 ms a request alone and no more than about 4,000 a second from
+    /// any number of workers in an idle process (measured on a Mac; the
+    /// world's loading ran 220-1,000 a second on 18 busy workers, with up
+    /// to 3,200 requests waiting), and the title's own page mappings and
+    /// every copy of title memory wait behind them.
+    fn own(&self) -> Option<usize> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        let at = *self.2.get_or_init(|| {
+            // SAFETY: a view of a section we own, ours until the section goes.
+            let view = unsafe { MapViewOfFile(self.0, FILE_MAP_WRITE, 0, 0, self.1) };
+            if view.Value.is_null() {
+                tracing::warn!(
+                    len = self.1,
+                    error = %std::io::Error::last_os_error(),
+                    "no view of our own of a physical allocation; its pages are written through a view each time"
+                );
+            }
+            view.Value as usize
+        });
+        (at != 0).then_some(at)
+    }
+}
+
 impl Drop for Section {
     fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        if let Some(&at) = self.2.get()
+            && at != 0
+        {
+            // SAFETY: our view; nothing refers to it once the section's
+            // last page is gone.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) };
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -446,7 +486,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, size, std::sync::OnceLock::new()));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -482,7 +522,8 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 }
 
 /// A view of our own on consecutive slices of one section, committed and
-/// writable, unmapped when dropped.
+/// writable, unmapped when dropped: for a section we have no view of all
+/// of ([`Section::own`]).
 struct View {
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
@@ -552,31 +593,61 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 }
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
-/// whether or not they are mapped anywhere (DirectStorage destinations).
-/// One view per run of consecutive pages, not one per page: each view
-/// costs a map, a commit and an unmap (which flushes every core's TLB).
-/// False if a page is unknown or the host fails.
+/// whether or not they are mapped anywhere (DirectStorage destinations),
+/// run of consecutive pages by run ([`Pages`]). False if a page is unknown
+/// or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
+        let Some(mut pages) = Pages::of(slice, *n) else {
             return false;
         };
         let k = (n * PAGE - within).min(data.len() - done);
-        view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        pages.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
     true
+}
+
+/// Consecutive slices of one section, writable: through our own view of
+/// the section, or a view of them alone where there is none.
+enum Pages {
+    Kept(Arc<Section>, usize, usize),
+    Mapped(View),
+}
+
+impl Pages {
+    /// `n` slices from `slice` on, committed.
+    fn of(slice: &Slice, n: usize) -> Option<Pages> {
+        match slice.section.own() {
+            Some(base) => {
+                let (at, len) = (base + slice.index * PAGE, n * PAGE);
+                (slice.index * PAGE + len <= slice.section.1 && commit(at, len))
+                    .then(|| Pages::Kept(slice.section.clone(), at, len))
+            }
+            None => View::map(slice, n).map(Pages::Mapped),
+        }
+    }
+
+    fn bytes(&mut self) -> &mut [u8] {
+        match self {
+            // SAFETY: `len` committed read-write bytes of our view of the
+            // section, which lives as long as the section we hold (other
+            // views of the slices only alias them, as the console's do).
+            Pages::Kept(_, at, len) => unsafe { std::slice::from_raw_parts_mut(*at as *mut u8, *len) },
+            Pages::Mapped(view) => view.bytes(),
+        }
+    }
 }
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.
 pub(crate) struct PageWindow {
-    view: View,
+    pages: Pages,
     within: usize,
     len: usize,
 }
@@ -584,7 +655,7 @@ pub(crate) struct PageWindow {
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
-        &mut self.view.bytes()[within..within + len]
+        &mut self.pages.bytes()[within..within + len]
     }
 }
 
@@ -599,7 +670,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         return None;
     };
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        pages: Pages::of(slice, *n)?,
         within: offset % PAGE,
         len,
     })
