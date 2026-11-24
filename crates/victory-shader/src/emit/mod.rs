@@ -392,7 +392,6 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
-    use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
@@ -407,7 +406,6 @@ mod tests {
         }
     }
     use super::container::SigElement;
-    use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
 
@@ -446,8 +444,13 @@ mod tests {
         }
     }
 
-    /// A pixel shader writing a constant colour.
+    /// A pixel shader writing a constant colour. Every host builds it:
+    /// `constant_color_is_a_well_formed_container` checks it without D3D12,
+    /// and the Windows tests run it through dxil.dll and a device.
     fn constant_color() -> Vec<u8> {
+        use super::bitcode::Attr;
+        use super::shader::Shader;
+
         let mut s = Shader::new(true);
         s.outputs.push(SigElement {
             name: "SV_Target".into(),
