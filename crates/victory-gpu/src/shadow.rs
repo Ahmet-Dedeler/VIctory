@@ -208,6 +208,27 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+/// Puts the bytes the GPU wrote (where `host` differs from `old`, its bytes
+/// before the submission) into `title`, then makes `host` equal to `title`.
+/// True if `title` changed.
+///
+/// Without a branch per byte, so the compiler makes vector code of it: the
+/// world's submissions go through 64 KiB pieces by the thousand a frame.
+fn merge(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let n = title.len().min(host.len()).min(old.len());
+    let (title, host, old) = (&mut title[..n], &mut host[..n], &old[..n]);
+    let mut changed = 0u8;
+    for i in 0..n {
+        let (t, h) = (title[i], host[i]);
+        let wrote = if h != old[i] { 0xff } else { 0 };
+        let now = (h & wrote) | (t & !wrote);
+        changed |= now ^ t;
+        title[i] = now;
+        host[i] = now;
+    }
+    changed != 0
+}
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
@@ -455,14 +476,7 @@ impl Shadow {
                     // takes the title's bytes in turn.
                     #[cfg(feature = "diagnostics")]
                     let t1 = std::time::Instant::now();
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
+                    let changed = merge(title, host, old);
                     #[cfg(feature = "diagnostics")]
                     {
                         merging += since(t1);
@@ -783,6 +797,41 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    #[test]
+    fn merge_gives_the_title_what_the_gpu_wrote_and_the_copy_the_rest() {
+        // Every case a byte can be in, over more than a vector's width and
+        // an odd length.
+        let n = 1003;
+        let old: Vec<u8> = (0..n).map(|i| (i % 7) as u8).collect();
+        // The GPU wrote every third byte (one in six of them the value the
+        // title has there already); the title wrote every fifth.
+        let mut host = old.clone();
+        let mut title = old.clone();
+        for i in (0..n).step_by(5) {
+            title[i] = 100 + (i % 50) as u8;
+        }
+        for i in (0..n).step_by(3) {
+            host[i] = if i % 6 == 0 { title[i] } else { 200 };
+        }
+        // An old byte the GPU wrote back to what it was is not a write.
+        let (before_host, before_title) = (host.clone(), title.clone());
+        assert!(merge(&mut title, &mut host, &old));
+        for i in 0..n {
+            let want = if before_host[i] != old[i] { before_host[i] } else { before_title[i] };
+            assert_eq!((title[i], host[i]), (want, want), "byte {i}");
+        }
+        // Nothing the GPU wrote differs from the title's bytes: unchanged.
+        let mut host = old.clone();
+        host[3] = 9;
+        let mut title = old.clone();
+        title[3] = 9;
+        title[4] = 77;
+        let kept = title.clone();
+        assert!(!merge(&mut title, &mut host, &old));
+        assert_eq!(title, kept);
+        assert_eq!(host, kept);
+    }
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {
