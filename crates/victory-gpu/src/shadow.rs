@@ -75,6 +75,14 @@ impl UnchangedPages {
         self.compared(address, current.len(), current != before)
     }
 
+    /// Bytes of `[from, to)` (title addresses) in pages not yet known
+    /// unchanged, counted in whole pages.
+    fn unknown(&self, from: usize, to: usize) -> usize {
+        let first = from / PAGE - self.start / PAGE;
+        let last = (to - 1) / PAGE - self.start / PAGE;
+        self.pages[first..=last].iter().filter(|&&known| !known).count() * PAGE
+    }
+
     /// Whether the page of `address` was compared in full already and
     /// found as it was.
     fn known(&self, address: usize) -> bool {
@@ -345,7 +353,9 @@ impl Shadow {
             // A big range is compared ahead on several threads (the world
             // declares 100-170 MB a submission and its shaders write a
             // tenth of that); the pieces are then gone through in order.
-            let ahead = (to - from >= crate::host::PARALLEL_FROM).then(|| {
+            // (Only where that much is still to compare: a submission's
+            // later ranges mostly lie in pages its first ones went through.)
+            let ahead = (unchanged.unknown(start + from, start + to) >= crate::host::PARALLEL_FROM).then(|| {
                 // SAFETY: inside the mapping, which only this thread writes.
                 let host = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
                 compare_ahead(host, start + from, before, unchanged)
@@ -811,6 +821,10 @@ mod tests {
             })
             .collect();
         assert_eq!(got, expected);
+        // All 201 pages of the range were unknown but the one; now all are
+        // known but those of the five changed pieces.
+        assert_eq!(fresh().unknown(address, address + len), 200 * PAGE);
+        assert_eq!(other.unknown(address, address + len), 5 * PAGE);
         // Five pieces hold the seven changed bytes (three are in the first).
         assert_eq!(got.iter().filter(|&&d| d).count(), 5);
         assert_eq!(other.pages, one.pages);
