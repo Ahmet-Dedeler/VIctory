@@ -697,6 +697,22 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// view of its part. Placeholders are never joined: that would also join
 /// separate reservations, or pieces the title split, for good. All or
 /// nothing: if a view fails, those made before it are placeholders again.
+/// The physical memory shown at `address`: which section and the byte in
+/// it; `None` for memory that is no view of physical pages. Two addresses
+/// with one answer are one memory (diagnostics: textures the title places
+/// over the same pages through different mappings).
+pub(crate) fn physical_at(address: u64) -> Option<(u64, u64)> {
+    let physical = physical();
+    let address = address as usize;
+    let (&base, (len, slice)) = physical.views.range(..=address).next_back()?;
+    (address < base + len).then(|| {
+        (
+            Arc::as_ptr(&slice.section) as u64,
+            (slice.index * PAGE + (address - base)) as u64,
+        )
+    })
+}
+
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     let end = base + len;
     split_at(base);

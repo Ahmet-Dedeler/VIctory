@@ -276,6 +276,15 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
+    /// The five dwords the host copy holds for title address `address`
+    /// right now (diagnostics: an indirect record after its submission).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn peek(&self, address: u64) -> Option<[u32; 5]> {
+        let at = self.offset(address);
+        // SAFETY: inside the mapping.
+        (at + 20 <= self.len).then(|| unsafe { self.data.add(at as usize).cast::<[u32; 5]>().read_unaligned() })
+    }
+
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);

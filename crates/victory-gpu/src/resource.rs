@@ -615,6 +615,17 @@ pub fn use_page_mapper(mapper: PageMapper) {
     let _ = PAGE_MAPPER.set(mapper);
 }
 
+/// Which physical memory an address of title memory shows: an opaque
+/// number for the memory and the byte in it (`None`: not a view of
+/// physical pages). Diagnostics.
+pub type PageIdentity = fn(u64) -> Option<(u64, u64)>;
+static PAGE_IDENTITY: std::sync::OnceLock<PageIdentity> = std::sync::OnceLock::new();
+
+/// The runtime's resolver of physical memory behind an address.
+pub fn use_page_identity(identity: PageIdentity) {
+    let _ = PAGE_IDENTITY.set(identity);
+}
+
 pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
 }
@@ -1432,6 +1443,14 @@ pub(crate) fn texture_place(this: This) -> Option<(u64, u64, u64, u32, u32, u32)
         d.width.div_ceil(texels) * u64::from(d.height).div_ceil(texels) * bytes
     });
     Some((memory as u64, bytes, d.width, d.height, d.format, d.flags))
+}
+
+/// The physical memory behind a texture's first byte, if its memory is a
+/// view of physical pages (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn texture_physical(this: This) -> Option<(u64, u64)> {
+    let (memory, _) = texture_memory(this)?;
+    PAGE_IDENTITY.get()?(memory as u64)
 }
 
 /// A buffer's host memory and size; `None` for textures.

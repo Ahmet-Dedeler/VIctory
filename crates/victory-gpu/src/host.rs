@@ -1103,6 +1103,9 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    /// Diagnostics: host copies to look at once the list has run (an
+    /// indirect record's copy, its title address, the line it belongs to).
+    peeks: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, String)>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -1467,6 +1470,15 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        for list in runs {
+            let peeks = std::mem::take(&mut list.deferred().peeks);
+            for (shadow, address, label) in peeks {
+                if let Some(words) = shadow.peek(address) {
+                    crate::capture::record_line(format!("{label} | host copy once run {words:?}"));
+                }
+            }
+        }
         // Host timestamps the lists resolved, on the title's GPU clock.
         let mut clock = None;
         for list in runs {
@@ -2223,6 +2235,13 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// Diagnostics: notes what `shadow` holds at `address` once the list
+    /// has run, under `label` (`capture::record_line`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_peek(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, label: String) {
+        self.deferred().peeks.push((shadow.clone(), address, label));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
