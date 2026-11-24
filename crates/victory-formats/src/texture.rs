@@ -772,6 +772,14 @@ impl Layout {
     }
 }
 
+/// Runs every job, the last on the calling thread and the others on the
+/// threads kept for [`Layout::detile_parallel`], and returns when all are
+/// done: for other work on big blocks of memory that splits the same way
+/// (copies of title memory at submission).
+pub fn run_parallel<'a>(jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
+    pool::run(jobs);
+}
+
 /// Threads kept for [`Layout::detile_parallel`]: starting threads for every
 /// texture costs more than the detiling where threads are dear (under Wine
 /// and a CPU translator, about a millisecond each).
