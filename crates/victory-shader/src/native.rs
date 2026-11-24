@@ -126,6 +126,8 @@ const MAX_GROUP_THREADS: u64 = 1024;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
+/// The LDS a GFX10 thread group can address.
+const MAX_LDS_BYTES: u32 = 64 << 10;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -691,6 +693,12 @@ fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
     let threads = half(0);
     if threads == 0 {
         return Err(Malformed("implausible thread-group size"));
+    }
+    // Lowering declares the LDS as `lds_bytes.div_ceil(4)` dwords and states
+    // it again in bytes (`lds_dwords * 4`), a u32 product that overflows for
+    // sizes near `u32::MAX`; a group's LDS can't exceed 64 KiB anyway.
+    if lds_bytes > MAX_LDS_BYTES {
+        return Err(Malformed("implausible LDS size"));
     }
     Ok(StageIo::Ms(MeshIo {
         outputs,
@@ -1303,5 +1311,18 @@ mod tests {
         let mut blob = ms.clone();
         blob[e + MS_INFO..][..2].copy_from_slice(&0u16.to_le_bytes());
         assert_eq!(refused_blob(&xbch(&blob)), "implausible thread-group size");
+
+        // A mesh group's LDS: 64 KiB fits; a byte more, or u32::MAX, does not.
+        let lds = |bytes: u32| {
+            let mut blob = ms.clone();
+            let record = e - RECORD_SIZE as usize;
+            blob[record + RECORD_LDS..][..4].copy_from_slice(&bytes.to_le_bytes());
+            xbch(&blob)
+        };
+        let p = native_programs(&part(&[(KIND_NATIVE, &lds(MAX_LDS_BYTES))])).unwrap();
+        assert!(matches!(&p[0].io, StageIo::Ms(m) if m.lds_bytes == 64 << 10));
+        for bad in [MAX_LDS_BYTES + 1, u32::MAX] {
+            assert_eq!(refused_blob(&lds(bad)), "implausible LDS size", "{bad}");
+        }
     }
 }
