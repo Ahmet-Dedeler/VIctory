@@ -44,18 +44,18 @@ pub fn dump_stacks_on_schedule() {
 
 /// `THREAD_BASIC_INFORMATION` (ntddk).
 #[repr(C)]
-struct BasicInfo {
-    exit_status: i32,
-    teb: *const usize,
-    client_id: [usize; 2],
-    affinity: usize,
-    priority: i32,
-    base_priority: i32,
+pub(crate) struct BasicInfo {
+    pub(crate) exit_status: i32,
+    pub(crate) teb: *const usize,
+    pub(crate) client_id: [usize; 2],
+    pub(crate) affinity: usize,
+    pub(crate) priority: i32,
+    pub(crate) base_priority: i32,
 }
 
 /// `GetThreadContext` wants a 16-byte aligned context.
 #[repr(C, align(16))]
-struct Aligned(CONTEXT);
+pub(crate) struct Aligned(pub(crate) CONTEXT);
 
 /// Prints every other thread's stack to stderr. Each thread is suspended
 /// only while its context is read and unwound into a buffer allocated
@@ -159,7 +159,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     (frames, (info.priority, info.base_priority))
 }
 
-fn start_of(thread: HANDLE) -> usize {
+pub(crate) fn start_of(thread: HANDLE) -> usize {
     let mut start = 0usize;
     // SAFETY: writes one pointer-sized start address.
     unsafe {
@@ -174,7 +174,7 @@ fn start_of(thread: HANDLE) -> usize {
     start
 }
 
-fn name_of(thread: HANDLE) -> String {
+pub(crate) fn name_of(thread: HANDLE) -> String {
     let mut name = std::ptr::null_mut();
     // SAFETY: the system allocates the string; we free it with LocalFree.
     unsafe {

@@ -159,6 +159,36 @@ pub fn report_crashes() {
     ensure_stack_guarantee();
 }
 
+/// Exceptions the vectored handler saw, by kind: `clzero`,
+/// `monitorx`/`mwaitx`, `clwb`, SSE4a, everything else. Each is a full
+/// exception round trip on the thread that raised it.
+pub(crate) static TRAPS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub(crate) const TRAP_NAMES: [&str; 5] = ["clzero", "monitorx/mwaitx", "clwb", "sse4a", "other"];
+/// Where they were raised: instruction address and count, a small open table.
+pub(crate) static TRAP_SITES: [[std::sync::atomic::AtomicU64; 2]; 64] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 64];
+
+fn count_trap(kind: usize, rip: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    TRAPS[kind].fetch_add(1, Relaxed);
+    let start = (rip.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58) as usize;
+    for i in 0..TRAP_SITES.len() {
+        let slot = &TRAP_SITES[(start + i) % TRAP_SITES.len()];
+        let mut at = slot[0].load(Relaxed);
+        if at == 0 {
+            at = match slot[0].compare_exchange(0, rip, Relaxed, Relaxed) {
+                Ok(_) => rip,
+                Err(now) => now,
+            };
+        }
+        if at == rip {
+            slot[1].fetch_add(1, Relaxed);
+            return;
+        }
+    }
+}
+
 /// What the vectored handler reports as it happens.
 const FATAL: [i32; 6] = [
     EXCEPTION_ACCESS_VIOLATION,
@@ -192,6 +222,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         let slice = &bytes[..n];
 
         if let Some(&[0x0f, 0x01, op @ (0xfa..=0xfc)]) = slice.get(..3) {
+            count_trap(usize::from(op != 0xfc), context.Rip);
             match op {
                 0xfc => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
                 0xfa => {}
@@ -203,6 +234,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         }
         if let Some(pass) = clwb_loop(slice) {
             // A whole write-back loop in one exception (see `clwb_loop`).
+            count_trap(2, context.Rip);
             retire_clwb(context.Rip as usize, &slice[..n.min(5)]);
             let limit = *gpr(context, pass.limit);
             let base = gpr(context, pass.base);
@@ -218,6 +250,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         }
         if let Some(len) = clwb_len(slice) {
             // A write-back hint: the PC's memory is coherent, so it has nothing to do.
+            count_trap(2, context.Rip);
             retire_clwb(context.Rip as usize, &slice[..len]);
             context.Rip += len as u64;
             return true;
@@ -225,6 +258,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         let Some(len) = sse4a(slice, &mut context.Anonymous.FltSave.XmmRegisters) else {
             return false;
         };
+        count_trap(3, context.Rip);
         context.Rip += len as u64;
         true
     }
@@ -550,6 +584,8 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
+    // SAFETY: as above.
+    count_trap(4, unsafe { (*(*info).ContextRecord).Rip });
     // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.
