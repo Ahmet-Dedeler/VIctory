@@ -82,13 +82,18 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
         .or_insert_with(|| {
-            Arc::new(Shader {
+            let shader = Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
-            })
+            });
+            // The container as the title gave it, even for a pipeline that
+            // VICTORY_SKIP_PIPELINES keeps from ever being translated.
+            #[cfg(all(windows, feature = "diagnostics"))]
+            dump(&shader, None);
+            shader
         })
         .clone()
 }
