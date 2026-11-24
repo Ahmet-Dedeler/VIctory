@@ -55,7 +55,26 @@ struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
     read: Vec<u8>,
+    /// Hashed refreshes in a row that found other contents.
+    changed: u32,
+    /// Refreshes since the memory was last hashed.
+    unhashed: u32,
+    /// When the memory was last looked at (memory not watched).
+    looked: Option<std::time::Instant>,
 }
+
+/// Memory whose writes are not tracked at all ([`crate::watch::tracking`])
+/// is looked at this often at most: every list of a frame that samples a
+/// texture asks, and hashing megabytes each time took most of a frame
+/// (loading screens: 35-60 ms). Shorter than a frame at 30 fps, so a
+/// video still gets every frame.
+const LOOK_EVERY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// A texture that changed this many times in a row (a video plane) is
+/// taken to change every time: detiled without being hashed first.
+const ALWAYS_CHANGING: u32 = 4;
+/// ...and hashed only every so many refreshes, to notice when it stops.
+const HASH_EVERY: u32 = 8;
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -201,7 +220,46 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
-        if !committed(self.memory, size) {
+        if !crate::watch::tracking() {
+            let now = std::time::Instant::now();
+            if last
+                .looked
+                .is_some_and(|at| now.duration_since(at) < LOOK_EVERY)
+            {
+                return 0;
+            }
+            last.looked = Some(now);
+            // One guarded read of the whole texture instead of asking
+            // region by region whether it is committed: under Wine every
+            // such question waits for the lock the title's page mappings
+            // hold while it loads (hundreds of milliseconds a texture).
+            static SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+            let mut scratch = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+            if scratch.len() < size {
+                scratch.resize(size, 0);
+            }
+            #[cfg(feature = "diagnostics")]
+            let asked = std::time::Instant::now();
+            let mapped = crate::host::read(self.memory, scratch.as_mut_ptr(), size);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::TexQueryUs,
+                asked.elapsed().as_micros() as u64,
+            );
+            if !mapped {
+                return 0;
+            }
+            return self.take(last, &scratch[..size]);
+        }
+        #[cfg(feature = "diagnostics")]
+        let asked = std::time::Instant::now();
+        let mapped = committed(self.memory, size);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::TexQueryUs,
+            asked.elapsed().as_micros() as u64,
+        );
+        if !mapped {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -213,13 +271,38 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        self.take(last, tiled)
+    }
+
+    /// Detiles `tiled`, the texture's memory as it is now (not watched), if
+    /// it is not what was detiled last. Returns the bytes looked at.
+    fn take(&self, last: &mut Last, tiled: &[u8]) -> usize {
+        let size = tiled.len();
+        if last.changed >= ALWAYS_CHANGING && last.unhashed + 1 < HASH_EVERY {
+            // Hashing would only confirm it: the hash costs more than the
+            // detiling it could save.
+            last.unhashed += 1;
+            self.detile(tiled);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            return size;
+        }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        let hashing = std::time::Instant::now();
+        let hash = blake3::hash(tiled);
+        last.unhashed = 0;
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::TexHashed, size as u64);
+            add(C::TexHashUs, hashing.elapsed().as_micros() as u64);
+        }
         if last.hash == Some(hash) {
+            last.changed = 0;
             return size;
         }
         last.hash = Some(hash);
+        last.changed += 1;
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -228,6 +311,17 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        self.detile_now(tiled);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::TexDetileUs,
+            started.elapsed().as_micros() as u64,
+        );
+    }
+
+    fn detile_now(&self, tiled: &[u8]) {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -245,10 +339,17 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            // Up to eight threads: more gain little on memory this size.
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+            if let Err(e) = self.layout.detile_parallel(
+                tiled,
+                mip,
+                slice,
+                linear,
+                pitch,
+                pitch * rows as usize,
+                threads,
+            ) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }

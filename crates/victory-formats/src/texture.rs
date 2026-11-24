@@ -594,10 +594,81 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        self.detile_rows(tiled, mip, slice, linear, row_pitch, depth_pitch, None)
+    }
+
+    /// [`Layout::detile`] for rows `rows` only (all with `None`), `linear`
+    /// starting at the first of them.
+    #[allow(clippy::too_many_arguments)]
+    fn detile_rows(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+        rows: Option<std::ops::Range<u32>>,
+    ) -> Result<(), Error> {
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, rows, |t, l, len| {
             linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
         })
     }
+
+    /// [`Layout::detile`] on up to `threads` threads, each taking a band of
+    /// rows: for the big subresources that change every frame (a 4K video
+    /// plane is 8 MB, element by element). Small or 3D subresources are
+    /// done on the calling thread.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detile_parallel(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+        threads: usize,
+    ) -> Result<(), Error> {
+        /// Bytes from which the threads pay off.
+        const PARALLEL_FROM: usize = 1 << 20;
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let (height, bytes) = (
+            m.height as usize,
+            m.width as usize * self.desc.element_bytes as usize,
+        );
+        let threads = threads.min(height / 16);
+        if threads < 2 || m.depth != 1 || height * bytes < PARALLEL_FROM || row_pitch < bytes {
+            return self.detile(tiled, mip, slice, linear, row_pitch, depth_pitch);
+        }
+        if linear.len() < (height - 1) * row_pitch + bytes {
+            return Err(Error::TooSmall);
+        }
+        let band = height.div_ceil(threads);
+        let failed = std::sync::Mutex::new(None);
+        let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = linear
+            .chunks_mut(band * row_pitch)
+            .enumerate()
+            .filter(|(i, _)| i * band < height)
+            .map(|(i, part)| {
+                let rows = (i * band) as u32..((i + 1) * band).min(height) as u32;
+                let failed = &failed;
+                Box::new(move || {
+                    let done =
+                        self.detile_rows(tiled, mip, slice, part, row_pitch, depth_pitch, Some(rows));
+                    if let Err(e) = done {
+                        *failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                    }
+                }) as Box<dyn FnOnce() + Send + '_>
+            })
+            .collect();
+        pool::run(jobs);
+        match failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
     pub fn tile(
@@ -609,12 +680,14 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, None, |t, l, len| {
             tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
         })
     }
 
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
+    /// With `rows`, only those rows of a subresource one slice deep, the
+    /// linear buffer starting at the first of them.
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
@@ -624,6 +697,7 @@ impl Layout {
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
+        rows: Option<std::ops::Range<u32>>,
         mut copy: impl FnMut(usize, usize, usize),
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
@@ -644,9 +718,16 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
+        let rows = match rows {
+            Some(rows) if depth != 1 || rows.end > m.height || rows.is_empty() => {
+                return Err(Error::Invalid);
+            }
+            Some(rows) => rows,
+            None => 0..m.height,
+        };
         let need = (depth as usize - 1)
             .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
+            .zip((rows.len().max(1) - 1).checked_mul(row_pitch))
             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
@@ -674,8 +755,8 @@ impl Layout {
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+            for y in rows.clone() {
+                let linear_row = z as usize * depth_pitch + (y - rows.start) as usize * row_pitch;
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy(tiled_row as usize, linear_row, bytes);
@@ -688,6 +769,93 @@ impl Layout {
             }
         }
         Ok(())
+    }
+}
+
+/// Threads kept for [`Layout::detile_parallel`]: starting threads for every
+/// texture costs more than the detiling where threads are dear (under Wine
+/// and a CPU translator, about a millisecond each).
+mod pool {
+    use std::sync::mpsc::{Sender, channel};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+    type Job = Box<dyn FnOnce() + Send + 'static>;
+
+    /// Workers in the pool; the caller of [`run`] works too.
+    const WORKERS: usize = 7;
+
+    fn queue() -> &'static Mutex<Sender<Job>> {
+        static QUEUE: OnceLock<Mutex<Sender<Job>>> = OnceLock::new();
+        QUEUE.get_or_init(|| {
+            let (sender, receiver) = channel::<Job>();
+            let receiver = Arc::new(Mutex::new(receiver));
+            for i in 0..WORKERS {
+                let receiver = receiver.clone();
+                let _ = std::thread::Builder::new()
+                    .name(format!("victory-detile {i}"))
+                    .spawn(move || {
+                        loop {
+                            let job = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            match job {
+                                Ok(job) => job(),
+                                Err(_) => return,
+                            }
+                        }
+                    });
+            }
+            Mutex::new(sender)
+        })
+    }
+
+    /// Counts jobs still running; a job leaves by dropping its guard, also
+    /// when it panics.
+    struct Running(Mutex<usize>, Condvar);
+
+    struct Leave(Arc<Running>);
+
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+            self.0.1.notify_all();
+        }
+    }
+
+    /// Runs every job, the last on the calling thread and the others on
+    /// the pool, and returns when all are done.
+    pub(super) fn run<'a>(mut jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
+        let Some(mine) = jobs.pop() else { return };
+        let running = Arc::new(Running(Mutex::new(jobs.len()), Condvar::new()));
+        for job in jobs {
+            let leave = Leave(running.clone());
+            // SAFETY: only the lifetime changes. What the job borrows
+            // outlives it: this function returns only once every job has
+            // run or been dropped (each drops its `Leave` either way), as
+            // the wait below sees.
+            let job: Job = unsafe {
+                std::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Job>(Box::new(move || {
+                    let _leave = leave;
+                    // A panicking job must not take the worker with it.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }))
+            };
+            let sent = queue().lock().unwrap_or_else(|e| e.into_inner()).send(job);
+            if let Err(unsent) = sent {
+                // No workers (they could not be started): run it here.
+                (unsent.0)();
+            }
+        }
+        // Waits for the others even if our own job panics.
+        struct Wait(Arc<Running>);
+        impl Drop for Wait {
+            fn drop(&mut self) {
+                let mut left = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+                while *left > 0 {
+                    left = self.0.1.wait(left).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        }
+        let _wait = Wait(running);
+        mine();
     }
 }
 
@@ -941,6 +1109,37 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Bands of rows detiled on several threads give what one thread gives,
+    /// with padded rows and a last row that ends short of its pitch.
+    #[test]
+    fn parallel_detile_matches() {
+        for d in [
+            desc(1280, 720, 1, 1, Swizzle::SW_64KB_S),
+            desc(1024, 1000, 1, 4, Swizzle::SW_64KB_D),
+            desc(2048, 600, 1, 1, Swizzle::LINEAR),
+        ] {
+            let l = Layout::new(&d).unwrap();
+            let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 31 + i / 251) as u8).collect();
+            let m = l.mips[0];
+            let bytes = m.width as usize * d.element_bytes as usize;
+            let pitch = bytes + 48;
+            let len = (m.height as usize - 1) * pitch + bytes;
+            let mut one = vec![0xAAu8; len];
+            l.detile(&tiled, 0, 0, &mut one, pitch, len).unwrap();
+            for threads in [2, 5, 8, 4096] {
+                let mut many = vec![0xAAu8; len];
+                l.detile_parallel(&tiled, 0, 0, &mut many, pitch, len, threads)
+                    .unwrap();
+                assert!(many == one, "{d:?} on {threads} threads");
+            }
+            let mut short = vec![0u8; len - 1];
+            assert_eq!(
+                l.detile_parallel(&tiled, 0, 0, &mut short, pitch, len, 4),
+                Err(Error::TooSmall)
+            );
         }
     }
 

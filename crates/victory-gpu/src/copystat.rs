@@ -37,12 +37,58 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Of texture refreshes, microseconds asking whether the memory is
+    /// committed, hashing it and detiling it.
+    TexQueryUs,
+    TexHashUs,
+    TexDetileUs,
+    /// After a submission: bytes of what its shaders may have written
+    /// copied back into title memory, the microseconds that took, and the
+    /// microseconds of the rest (the title's bottom-of-pipe writes, the
+    /// host's messages); the bytes its lists declared as written (the same
+    /// ranges many times).
+    BackBytes,
+    BackUs,
+    AfterUs,
+    BackDeclared,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = 29;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// Entry points whose wall time is summed (title threads call them, several
+/// at once, so the sums can exceed the frame): running submissions,
+/// presenting, making host pipelines, bringing a host list up to date for
+/// a draw or dispatch (that includes making its pipeline).
+#[derive(Clone, Copy)]
+pub(crate) enum T {
+    Execute,
+    Present,
+    Pipeline,
+    Prepare,
+}
+const TIMES: usize = 4;
+/// Per entry point: microseconds, calls, longest call in microseconds.
+static TIME: [[AtomicU64; 3]; TIMES] = [const { [const { AtomicU64::new(0) }; 3] }; TIMES];
+
+/// Times an entry point from now until it is dropped.
+pub(crate) struct Span(T, std::time::Instant);
+
+pub(crate) fn span(t: T) -> Span {
+    Span(t, std::time::Instant::now())
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        let us = self.1.elapsed().as_micros() as u64;
+        let t = &TIME[self.0 as usize];
+        t[0].fetch_add(us, Relaxed);
+        t[1].fetch_add(1, Relaxed);
+        t[2].fetch_max(us, Relaxed);
+    }
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -126,6 +172,36 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+    );
+    tracing::info!(
+        "texture refreshes per frame: {:.2} ms asking for committed memory, {:.2} ms hashing, {:.2} ms detiling",
+        ms(c[C::TexQueryUs as usize]),
+        ms(c[C::TexHashUs as usize]),
+        ms(c[C::TexDetileUs as usize]),
+    );
+    let t: Vec<[f64; 3]> = TIME
+        .iter()
+        .map(|t| [0, 1, 2].map(|i| t[i].swap(0, Relaxed) as f64))
+        .collect();
+    let per = |k: T| {
+        let [us, calls, longest] = t[k as usize];
+        format!("{:.1} ms in {:.0} calls (longest {:.0} ms)", us / 1e3 / frames, calls / frames, longest / 1e3)
+    };
+    tracing::info!(
+        "time per frame in our entry points: submissions {}; present {}; host pipelines {}; \
+         draw and dispatch preparation {}",
+        per(T::Execute),
+        per(T::Present),
+        per(T::Pipeline),
+        per(T::Prepare),
+    );
+    tracing::info!(
+        "after submissions, per frame: {:.1} MB copied back into title memory ({:.1} MB declared \
+         as written) in {:.1} ms; {:.1} ms in the title's GPU writes and host messages",
+        mb(c[C::BackBytes as usize]),
+        mb(c[C::BackDeclared as usize]),
+        ms(c[C::BackUs as usize]),
+        ms(c[C::AfterUs as usize]),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
