@@ -141,6 +141,16 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Writes a shader container's digest (bytes 4..20, over everything after
+/// them), as the host's validator would: for a container made by a compiler
+/// that had no signing library at hand.
+pub fn sign(container: &mut [u8]) {
+    if container.len() > 20 {
+        let digest = container::hash(&container[20..]);
+        container[4..20].copy_from_slice(&digest);
+    }
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {

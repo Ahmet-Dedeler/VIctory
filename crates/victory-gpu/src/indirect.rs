@@ -276,13 +276,56 @@ fn compile() -> windows::core::Result<(Vec<u8>, &'static str)> {
             tracing::info!("argument clamp: compiled by the system compiler (cs_5_1)");
             Ok((bytes, "system"))
         }
-        Err(_) => {
-            let bytes = dxc_compile(SOURCE)
-                .inspect_err(|e| tracing::warn!(error = %e, "argument clamp: DXC failed"))?;
-            tracing::info!("argument clamp: compiled by DXC (cs_6_0)");
-            Ok((bytes, "dxc"))
-        }
+        Err(_) => match dxc_compile(SOURCE) {
+            Ok(bytes) => {
+                tracing::info!("argument clamp: compiled by DXC (cs_6_0)");
+                Ok((bytes, "dxc"))
+            }
+            Err(e) => match precompiled() {
+                Some(bytes) => Ok((bytes, "precompiled")),
+                None => {
+                    tracing::warn!(
+                        error = %e,
+                        file = %precompiled_name(),
+                        "argument clamp: DXC failed, and there is no precompiled clamp beside the executable"
+                    );
+                    Err(e)
+                }
+            },
+        },
     }
+}
+
+/// The file name of the precompiled clamp for this very [`SOURCE`]: a
+/// container made from other text is never taken for it.
+fn precompiled_name() -> String {
+    let hash = blake3::hash(SOURCE.as_bytes()).to_hex();
+    format!("argument-clamp-{}.dxil", &hash[..16])
+}
+
+/// [`SOURCE`] compiled ahead of the run (`dxc -T cs_6_0 -E main -O3`), for
+/// a host with neither compiler: CrossOver's Wine on a Mac has a system
+/// compiler without stores to structured buffers and no `dxcompiler.dll`,
+/// but D3DMetal ships a native DXC the container can be made with. Read
+/// from `VICTORY_CLAMP_DXIL`, else from [`precompiled_name`] beside the
+/// executable; an unsigned container (no `dxil.dll` at hand) gets its
+/// digest here.
+fn precompiled() -> Option<Vec<u8>> {
+    let path = match std::env::var_os("VICTORY_CLAMP_DXIL") {
+        Some(path) => std::path::PathBuf::from(path),
+        None => std::env::current_exe().ok()?.parent()?.join(precompiled_name()),
+    };
+    let mut bytes = std::fs::read(&path).ok()?;
+    let size = bytes.get(24..28).map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")));
+    if bytes.get(..4) != Some(b"DXBC") || size != Some(bytes.len() as u32) {
+        tracing::warn!(path = %path.display(), "argument clamp: the precompiled file is no shader container");
+        return None;
+    }
+    if bytes[4..20].iter().all(|&b| b == 0) {
+        victory_shader::emit::sign(&mut bytes);
+    }
+    tracing::info!(path = %path.display(), bytes = bytes.len(), "argument clamp: precompiled container (cs_6_0)");
+    Some(bytes)
 }
 
 struct Clamp {
