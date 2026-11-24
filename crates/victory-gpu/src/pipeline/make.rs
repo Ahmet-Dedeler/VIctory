@@ -60,8 +60,22 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            let started = Instant::now();
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            // A host that takes seconds over one pipeline holds a worker
+            // that long (Apple's compiler service on big mesh and compute
+            // programs): named, to tell slow pipelines from many.
+            if started.elapsed() > Duration::from_secs(3) {
+                tracing::info!(
+                    ms = started.elapsed().as_millis(),
+                    shaders = ?self.shaders,
+                    waiting = waiting(),
+                    "slow host pipeline"
+                );
+            }
+            made
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
