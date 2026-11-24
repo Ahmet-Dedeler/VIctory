@@ -72,6 +72,45 @@ pub(crate) fn note_frame_op(line: impl FnOnce() -> String) {
     OPS.lock().unwrap_or_else(|e| e.into_inner()).push(line);
 }
 
+/// The records of an indirect execution's line (see [`save_frame_ops`]).
+fn indirect_values(line: &str) -> Option<String> {
+    if !line.starts_with("indirect ") {
+        return None;
+    }
+    let field = |key: &str| {
+        let rest = &line[line.find(key)? + key.len()..];
+        Some(&rest[..rest.find(' ').unwrap_or(rest.len())])
+    };
+    let hex = |text: &str| u64::from_str_radix(text.trim_start_matches("0x"), 16).ok();
+    let kind: u32 = field("kind ")?.parse().ok()?;
+    let max: usize = field("max ")?.parse().ok()?;
+    let stride: usize = field("stride=")?.parse().ok()?;
+    let (args, count) = (hex(field("args=")?)?, hex(field("count=")?)?);
+    let dwords = match kind {
+        0 => 4,
+        1 => 5,
+        _ => 3,
+    };
+    let read = |address: u64, n: usize| -> Option<Vec<u32>> {
+        let mut words = vec![0u32; n];
+        crate::host::read(address as *const u8, words.as_mut_ptr().cast(), 4 * n).then_some(words)
+    };
+    let mut text = String::new();
+    if count != 0 {
+        text.push_str(&match read(count, 1) {
+            Some(c) => format!("count {} ", c[0]),
+            None => "count unreadable ".into(),
+        });
+    }
+    for record in 0..max.min(3) {
+        match read(args + (record * stride) as u64, dwords) {
+            Some(words) => text.push_str(&format!("{words:?}")),
+            None => text.push_str("[unreadable]"),
+        }
+    }
+    Some(text)
+}
+
 /// At the present of frame `frame`: saves the noted draws and dispatches.
 pub(crate) fn save_frame_ops(frame: u64) {
     let ops = std::mem::take(&mut *OPS.lock().unwrap_or_else(|e| e.into_inner()));
@@ -79,6 +118,17 @@ pub(crate) fn save_frame_ops(frame: u64) {
     if ops.is_empty() {
         return;
     }
+    // An indirect execution's records as title memory holds them now (what
+    // the GPU wrote is copied back after each submission): the first three
+    // and the count. Not what the GPU read if the buffer was written again
+    // later in the frame, but empty arguments all through a frame show here.
+    let ops: Vec<String> = ops
+        .into_iter()
+        .map(|line| match indirect_values(&line) {
+            Some(values) => format!("{line} | now {values}"),
+            None => line,
+        })
+        .collect();
     let path = folder.join(format!("frame-{frame}-ops.txt"));
     if let Err(e) = std::fs::write(&path, ops.join("\n") + "\n") {
         tracing::warn!(error = %e, path = %path.display(), "frame operations not saved");

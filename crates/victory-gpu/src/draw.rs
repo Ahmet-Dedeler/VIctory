@@ -939,7 +939,19 @@ impl State {
                         continue;
                     };
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    let (list, what) = match crate::descriptor::view(handle) {
+                    let view = crate::descriptor::view(handle);
+                    // Buffers by the title memory they view.
+                    if let Some((address, len)) =
+                        view.as_ref().and_then(crate::descriptor::host::buffer_range)
+                    {
+                        let what = format!("buf:{address:#x}+{len:#x}");
+                        let list = if u.kind == ResourceType::Uav { &mut writes } else { &mut reads };
+                        if !list.contains(&what) {
+                            list.push(what);
+                        }
+                        continue;
+                    }
+                    let (list, what) = match view {
                         Some(View::Shader(r, _)) => match crate::resource::host_resource(r as This) {
                             Some(_) => (&mut reads, format!("{r:#x}")),
                             None => continue,
@@ -1336,7 +1348,10 @@ impl State {
         let ran = self.execute_indirect_on(list, (kind, stride, max), arguments, count);
         #[cfg(feature = "diagnostics")]
         self.account(
-            format_args!("indirect kind {kind} max {max} counted {}", count.is_some()),
+            format_args!(
+                "indirect kind {kind} max {max} stride={stride} args={arguments:#x} count={:#x}",
+                count.unwrap_or(0)
+            ),
             kind == 2,
             ran,
         );
