@@ -237,6 +237,23 @@ pub(crate) fn dred_on() -> bool {
     })
 }
 
+/// The system Wine runs on ("Darwin", "Linux"), if we run under Wine: its
+/// ntdll says so.
+fn wine_host() -> Option<String> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    type HostVersion = unsafe extern "C" fn(*mut *const std::ffi::c_char, *mut *const std::ffi::c_char);
+    // SAFETY: NUL-terminated names; ntdll is always loaded; Wine's export
+    // takes two out pointers and hands back static strings.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        let export = GetProcAddress(ntdll, c"wine_get_host_version".as_ptr().cast())?;
+        let host_version: HostVersion = std::mem::transmute(export);
+        let (mut system, mut release) = (std::ptr::null(), std::ptr::null());
+        host_version(&mut system, &mut release);
+        (!system.is_null()).then(|| std::ffi::CStr::from_ptr(system).to_string_lossy().into_owned())
+    }
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
@@ -336,28 +353,18 @@ impl Host {
     }
 
     /// The most bytes a mesh shader's outputs may take on this host, if it
-    /// has a limit of its own. Apple's GPUs (D3DMetal) take 32,768 as
-    /// [`crate::pipeline::host::metal_mesh_bytes`] counts them: the pipeline
-    /// is created all the same (no error reaches us), drawn as nothing, and
-    /// a submission that dispatches with it never finishes.
+    /// has a limit of its own. Apple's GPUs take 32,768 as
+    /// [`crate::pipeline::host::metal_mesh_bytes`] counts them: D3DMetal
+    /// creates the pipeline all the same (no error reaches us), draws
+    /// nothing with it, and a submission that dispatches with it never
+    /// finishes. Its adapter calls itself "AMD Compatibility Mode", so the
+    /// host is known by Wine saying it runs on Darwin.
     pub(crate) fn mesh_output_limit(&self) -> Option<u32> {
         static LIMIT: OnceLock<Option<u32>> = OnceLock::new();
         *LIMIT.get_or_init(|| {
-            const APPLE: u32 = 0x106B;
-            // SAFETY: plain queries of the device's adapter.
-            let desc = unsafe {
-                let luid = self.device.GetAdapterLuid();
-                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-                    .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter>(luid))
-                    .and_then(|a| a.GetDesc())
-            };
-            let (vendor, name) = match &desc {
-                Ok(d) => (d.VendorId, String::from_utf16_lossy(&d.Description)),
-                Err(_) => (0, String::new()),
-            };
-            let name = name.trim_end_matches('\0');
-            let limit = (vendor == APPLE || name.contains("Apple")).then_some(32_768);
-            tracing::info!(vendor = format_args!("{vendor:#x}"), name, ?limit, "host adapter; mesh output limit");
+            let system = wine_host();
+            let limit = (system.as_deref() == Some("Darwin")).then_some(32_768);
+            tracing::info!(wine_host = ?system, ?limit, "mesh output limit of the host");
             limit
         })
     }
@@ -483,6 +490,23 @@ impl Host {
             }
         }
         let gpu = prepared.elapsed();
+        // With `VICTORY_SUBMIT_ONE_BY_ONE` and device-removed data on: every
+        // submission with what it ran, to set beside the host's own log (a
+        // GPU that reports a hang there names no command).
+        #[cfg(feature = "diagnostics")]
+        if let [run] = runs
+            && dred_on()
+        {
+            let notes = run.notes.lock().unwrap_or_else(|e| e.into_inner());
+            if !notes.is_empty() {
+                let mut ops = String::new();
+                for note in notes.iter().take(24) {
+                    ops.push_str(note.split(" | ").next().unwrap_or(""));
+                    ops.push_str("; ");
+                }
+                tracing::info!(n = *submitted, ms = gpu.as_millis(), of = notes.len(), %ops, "submission");
+            }
+        }
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
