@@ -562,6 +562,18 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 None
             }
             resource::Source::Phi { .. } => unreachable!("leaves are no phis"),
+            // A per-lane vector load is a leaf like `Loaded` (see
+            // `Source::Fetched`); the PR that introduced these variants did
+            // not update this tally (local v5 rewrote it), so the arms are
+            // added here. `leaves()` expands `Select`/`Lanes` into their
+            // arguments, so they never reach this match.
+            resource::Source::Fetched { load, .. } => {
+                t.loaded += 1;
+                address(load)
+            }
+            resource::Source::Select { .. } | resource::Source::Lanes { .. } => {
+                unreachable!("leaves are no selects")
+            }
         };
         // Heaps hold dynamic resources, which no used entry lists; code
         // tables are no root parameter.
