@@ -2132,7 +2132,11 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    #[cfg(feature = "diagnostics")]
+                    let copying = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    #[cfg(feature = "diagnostics")]
+                    add(C::TitleCopyUs, copying.elapsed().as_micros() as u64);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -2231,7 +2235,10 @@ impl Batch {
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
+            {
+                crate::copystat::range(from, to - from, us, 0);
+                crate::copystat::add(crate::copystat::C::FlushUs, us);
+            }
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
@@ -2294,11 +2301,15 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+    #[cfg(feature = "diagnostics")]
+    let falling = std::time::Instant::now();
     if !title_dst && len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
         read_pieces(src, dst, len);
     }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::FallbackUs, falling.elapsed().as_micros() as u64);
 }
 
 /// Copies into host memory from this size on run as several at once: one
@@ -2323,7 +2334,14 @@ fn copy_in_parts(dst: *mut u8, src: *const u8, len: usize) {
                 if !read(from, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+                    #[cfg(feature = "diagnostics")]
+                    let falling = std::time::Instant::now();
                     read_sparse(from, to, n);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(
+                        crate::copystat::C::FallbackUs,
+                        falling.elapsed().as_micros() as u64,
+                    );
                 }
             }) as Box<dyn FnOnce() + Send>
         })
@@ -2333,6 +2351,14 @@ fn copy_in_parts(dst: *mut u8, src: *const u8, len: usize) {
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
+///
+/// Under Wine each question waits for the lock the title's page mappings
+/// hold while it streams: 11-270 us, and a pool mapped view by view is a
+/// region a view. A busy world frame on a Mac asks 4,000-38,000 times,
+/// 0.3-4 s (the copy statistics count both). Reading stretches ahead after
+/// several committed regions in a row did not lower the count (run P15:
+/// mapped views and holes alternate); what would is the runtime, which
+/// makes those mappings, saying which parts of a range are mapped.
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
@@ -2345,6 +2371,8 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::FallbackQueries, 1);
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {

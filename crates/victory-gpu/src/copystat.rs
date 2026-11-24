@@ -51,8 +51,16 @@ pub(crate) enum C {
     BackUs,
     AfterUs,
     BackDeclared,
+    /// Of the copies: microseconds in copies into title memory (their
+    /// own, without the refreshes they make run first), in refreshes, and
+    /// after a read met an unmapped page (finding the mapped parts and
+    /// reading them); queries for the state of memory made there.
+    TitleCopyUs,
+    FlushUs,
+    FallbackUs,
+    FallbackQueries,
 }
-const COUNTERS: usize = 29;
+const COUNTERS: usize = 33;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -172,6 +180,15 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+    );
+    tracing::info!(
+        "copies per frame, where the time goes: {:.1} ms refreshing host copies, {:.1} ms copying \
+         into title memory, {:.1} ms (of both) after reads that met unmapped pages, in {:.0} \
+         queries for the state of memory",
+        ms(c[C::FlushUs as usize]),
+        ms(c[C::TitleCopyUs as usize]),
+        ms(c[C::FallbackUs as usize]),
+        c[C::FallbackQueries as usize],
     );
     tracing::info!(
         "texture refreshes per frame: {:.2} ms asking for committed memory, {:.2} ms hashing, {:.2} ms detiling",
