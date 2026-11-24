@@ -1147,6 +1147,41 @@ impl Host {
         self.caps.resource_binding_tier()
     }
 
+    /// The widest wave the host runs (`WaveLaneCountMax`; 64 on the
+    /// console's GPU family, 32 on Apple's); logged once. Unknown counts as
+    /// any.
+    pub(crate) fn wave_lanes(&self) -> u32 {
+        static LANES: OnceLock<u32> = OnceLock::new();
+        *LANES.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok();
+            let mut lanes = if ok && options.WaveOps.as_bool() && options.WaveLaneCountMax != 0 {
+                options.WaveLaneCountMax
+            } else {
+                u32::MAX
+            };
+            // Apple's GPUs run 32-lane waves whatever D3DMetal reports.
+            if wine_host().as_deref() == Some("Darwin") {
+                lanes = lanes.min(32);
+            }
+            tracing::info!(
+                ok,
+                min = options.WaveLaneCountMin,
+                max = options.WaveLaneCountMax,
+                "wave lanes of the host"
+            );
+            lanes
+        })
+    }
+
     /// The most bytes a mesh shader's outputs may take on this host, if it
     /// has a limit of its own. Apple's GPUs take 32,768 as
     /// [`crate::pipeline::host::metal_mesh_bytes`] counts them: D3DMetal

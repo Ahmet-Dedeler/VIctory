@@ -457,7 +457,30 @@ impl HostPipeline {
                 },
             )
         };
-        if compute.is_some() {
+        if let Some(cs) = compute {
+            // A program that depends on the lane layout declares the
+            // console's wave size. A host of narrower waves does not run it:
+            // Apple's converter (behind D3DMetal, 32-lane waves) fails
+            // ("Wave size is not supported"), D3DMetal hands back a pipeline
+            // all the same, and a submission that dispatches with it never
+            // finishes.
+            let needs = cs.translated().and_then(|t| wave_lanes(&t.host.dxil));
+            if let Some(needs) = needs
+                && needs > host.wave_lanes()
+            {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        ?shaders,
+                        needs,
+                        host = host.wave_lanes(),
+                        "no host pipeline for compute programs of wider waves than the host's \
+                         (logged once; VICTORY_SPLIT_WAVES=1 translates them for 32-lane waves)"
+                    )
+                });
+                WIDE_WAVE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return refuse("the compute program needs wider waves than the host GPU runs", shaders);
+            }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -609,6 +632,29 @@ impl HostPipeline {
             inputs: g.elements(),
         })
     }
+}
+
+/// Compute pipelines refused because their program needs wider waves than
+/// the host runs.
+pub(crate) static WIDE_WAVE_REFUSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The wave size a translated program requires (`PSV0`'s minimum wave lane
+/// count), if it requires one.
+pub(crate) fn wave_lanes(dxil: &[u8]) -> Option<u32> {
+    let u32_at = |b: &[u8], at: usize| {
+        b.get(at..at + 4)
+            .map(|v| u32::from_le_bytes(v.try_into().expect("4 bytes")) as usize)
+    };
+    let info = (0..u32_at(dxil, 28)?).find_map(|i| {
+        let at = u32_at(dxil, 32 + 4 * i)?;
+        (dxil.get(at..at + 4)? == b"PSV0")
+            .then(|| dxil.get(at + 8..at + 8 + u32_at(dxil, at + 4)?))
+            .flatten()
+    })?;
+    // The runtime information's size, then the information: minimum and
+    // maximum wave lane count at 16 and 20 (0 and all ones: any).
+    let (min, max) = (u32_at(info, 4 + 16)? as u32, u32_at(info, 4 + 20)? as u32);
+    (min != 0 && min == max).then_some(min)
 }
 
 /// The bytes Apple's Metal counts for a translated mesh shader's outputs
