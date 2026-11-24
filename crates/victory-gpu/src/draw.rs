@@ -1495,6 +1495,28 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        // Diagnostics (`VICTORY_RECTS_DIRECT`): a one-record rectangle draw
+        // run as a direct draw with the record title memory holds, to tell
+        // an indirect draw the host does not run from one that draws
+        // nothing.
+        #[cfg(feature = "diagnostics")]
+        if kind == DRAW
+            && self.topology == RECTANGLES
+            && max == 1
+            && count.is_none()
+            && std::env::var_os("VICTORY_RECTS_DIRECT").is_some()
+        {
+            let mut record = [0u32; 4];
+            if crate::host::read(arguments as *const u8, record.as_mut_ptr().cast(), 16)
+                && record[0] <= 1 << 16
+                && record[1] <= 1 << 16
+                && self.prepare_rects(list, false)
+            {
+                // SAFETY: an open list with everything set.
+                unsafe { list.list.DrawInstanced(record[0], record[1], record[2], record[3]) };
+                return true;
+            }
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -1577,17 +1599,31 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        // A rectangle draw counted by vertices, on a host that runs no such
+        // indirect draw with a geometry shader: as an indexed one over the
+        // numbers 0, 1, 2, ... (see `crate::rects::indexed`).
+        let as_indexed = (kind == DRAW && self.topology == RECTANGLES && max == 1 && counter.is_none())
+            .then(|| crate::rects::indexed(list, &args.buffer, args.offset(arguments)))
+            .flatten();
+        if kind == DRAW && self.topology == RECTANGLES && as_indexed.is_none() && crate::rects::by_indices() {
+            once!(max, "an indirect rectangle draw of several records or with a count buffer runs as it is; this host may draw nothing for it");
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+            if let Some((record, indices, signature)) = &as_indexed {
+                list.list.ExecuteIndirect(signature, 1, *record, 0, None::<&ID3D12Resource>, 0);
+                crate::rects::indexed_done(list, record, indices);
+            } else {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &args.buffer,
+                    args.offset(arguments),
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                )
+            }
         };
         crate::indirect::done_counted(list, &args.buffer, counted.map(|c| c.buffer));
         if crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.has_root_uavs())
@@ -1606,7 +1642,7 @@ impl State {
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+pub(crate) fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());

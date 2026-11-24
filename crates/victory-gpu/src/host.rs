@@ -987,6 +987,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// The list's record for a draw run as an indexed one
+    /// (`crate::rects::indexed`): 20 bytes, its base vertex always 0.
+    indexed_record: OnceLock<Option<ID3D12Resource>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1284,6 +1287,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 queries: Mutex::default(),
                 budget: OnceLock::new(),
+                indexed_record: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2302,6 +2306,18 @@ impl HostList {
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
+    }
+
+    /// The list's buffer for one indexed draw record, zeroed when made.
+    pub(crate) fn indexed_record(&self) -> Option<&ID3D12Resource> {
+        self.indexed_record
+            .get_or_init(|| {
+                let (buffer, data) = host()?.shared_buffer(256)?;
+                // SAFETY: the buffer's own mapping of 256 bytes.
+                unsafe { std::ptr::write_bytes(data, 0, 256) };
+                Some(buffer)
+            })
+            .as_ref()
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each

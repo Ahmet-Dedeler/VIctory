@@ -211,6 +211,111 @@ pub(crate) fn geometry_shader(vs: &[u8]) -> Option<Arc<[u8]>> {
     bytes
 }
 
+/// Whether indirect rectangle draws counted by vertices run as indexed
+/// ones on this host. D3DMetal draws nothing for a non-indexed
+/// `ExecuteIndirect` with a geometry shader pipeline (measured: the same
+/// pipeline and record as a direct draw, or an indexed indirect draw with
+/// such a pipeline, fill their targets), and the title's tiled lighting is
+/// exactly that. `VICTORY_RECTS_INDEXED=0|1` overrides it.
+pub(crate) fn by_indices() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_RECTS_INDEXED").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => crate::host::host().is_some_and(|h| h.mesh_output_limit().is_some()),
+    })
+}
+
+/// How many vertex numbers [`indexed`]'s index buffer holds.
+const INDICES: u32 = 1 << 20;
+
+/// The index buffer of the numbers `0..INDICES`: an indexed draw over it
+/// gives the vertex shader the vertex numbers a non-indexed one would.
+fn identity() -> Option<&'static windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    static MADE: std::sync::OnceLock<Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>> =
+        std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let (buffer, data) = crate::host::host()?.shared_buffer(u64::from(INDICES) * 4)?;
+        // SAFETY: the buffer's own mapping, `INDICES` dwords.
+        unsafe {
+            for i in 0..INDICES {
+                data.cast::<u32>().add(i as usize).write_unaligned(i);
+            }
+        }
+        Some(buffer)
+    })
+    .as_ref()
+}
+
+/// Gets a one-record rectangle draw counted by vertices (its 16-byte
+/// record at `offset` of `args`, which is an indirect argument by now)
+/// ready to run as an indexed one: the record's vertex count, instance
+/// count and first vertex become the index count, instance count and
+/// first index of a 20-byte record in the list's own buffer (base vertex
+/// 0), its first instance the last dword; the index buffer of plain
+/// numbers is bound. The record, the index buffer and the signature to
+/// execute with, then [`indexed_done`]. `None` where the host needs none
+/// of this or has no buffers for it.
+/// shortcut: vertex numbers past 2^20 read past the index buffer.
+pub(crate) fn indexed<'a>(
+    list: &'a crate::host::HostList,
+    args: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    offset: u64,
+) -> Option<(
+    &'a windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    &'static windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    windows::Win32::Graphics::Direct3D12::ID3D12CommandSignature,
+)> {
+    use crate::host::transition;
+    use windows::Win32::Graphics::Direct3D12::*;
+    if !by_indices() {
+        return None;
+    }
+    const INDEXED: u32 = 1;
+    let (record, indices) = (list.indexed_record()?, identity()?);
+    let signature = crate::draw::host_signature(INDEXED, 20)?;
+    let view = D3D12_INDEX_BUFFER_VIEW {
+        // SAFETY: a live buffer.
+        BufferLocation: unsafe { indices.GetGPUVirtualAddress() },
+        SizeInBytes: INDICES * 4,
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+    };
+    // SAFETY: an open list and live buffers; ours rest in the common
+    // state, the arguments are an indirect argument.
+    unsafe {
+        list.list.ResourceBarrier(&[
+            transition(args, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(record, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+            transition(indices, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDEX_BUFFER),
+        ]);
+        list.list.CopyBufferRegion(record, 0, args, offset, 12);
+        list.list.CopyBufferRegion(record, 16, args, offset + 12, 4);
+        list.list.ResourceBarrier(&[
+            transition(args, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+            transition(record, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+        ]);
+        list.list.IASetIndexBuffer(Some(&view));
+    }
+    Some((record, indices, signature))
+}
+
+/// After an [`indexed`] draw: its buffers rest again.
+pub(crate) fn indexed_done(
+    list: &crate::host::HostList,
+    record: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    indices: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    use crate::host::transition;
+    use windows::Win32::Graphics::Direct3D12::*;
+    // SAFETY: an open list and live buffers in the states `indexed` left.
+    unsafe {
+        list.list.ResourceBarrier(&[
+            transition(record, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON),
+            transition(indices, D3D12_RESOURCE_STATE_INDEX_BUFFER, D3D12_RESOURCE_STATE_COMMON),
+        ]);
+    }
+}
+
 /// Diagnostics (`VICTORY_RECTS_FLAT`): a pixel shader that writes one
 /// colour, for rectangle variants, to see what such draws cover whatever
 /// their own pixel shader computes.
