@@ -5931,6 +5931,20 @@ impl<'a> Lower<'a> {
                 let r = self.console_read_lane(a, first);
                 int(self, r)
             }
+            "v_readfirstlane_b32" if self.x.native.stage == HwStage::Vs => {
+                // A vertex shader's invocation is one vertex: it has no
+                // wave of its own on the host, and what the console's
+                // compiler reads from the first lane here is a value every
+                // lane holds (the reciprocal of a constant for a division,
+                // say), so the vertex's own value is it. A wave operation
+                // in a vertex function is not defined on every host:
+                // Apple's converter makes `simd_broadcast_first` of it,
+                // which Metal defines for fragment and kernel functions,
+                // and the title's tiled lighting divides its vertex number
+                // by a first-lane reciprocal to find its tile.
+                let a = s(self, 0)?;
+                int(self, a)
+            }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
