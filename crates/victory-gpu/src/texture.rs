@@ -53,7 +53,7 @@ pub(crate) struct Staging {
 /// with room to read the memory into.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<[u64; 2]>,
     asked: u64,
     read: Vec<u8>,
     /// Hashed refreshes in a row that found other contents.
@@ -301,7 +301,10 @@ impl Staging {
         }
         #[cfg(feature = "diagnostics")]
         let hashing = std::time::Instant::now();
-        let hash = blake3::hash(tiled);
+        // Not a cryptographic hash: see the module (a vectorised one ran at
+        // 0.7 GB/s under a binary translator, most of a world frame's
+        // texture time).
+        let hash = victory_formats::fingerprint::fingerprint(tiled);
         last.unhashed = 0;
         #[cfg(feature = "diagnostics")]
         {
