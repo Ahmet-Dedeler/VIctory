@@ -32,6 +32,7 @@ use crate::stacks::{Aligned, BasicInfo, name_of, start_of};
 /// Reads `VICTORY_PROFILE` and, if set, starts the thread that waits for
 /// the file and samples.
 pub fn profile_on_request() {
+    watch_pools();
     let Ok(spec) = std::env::var("VICTORY_PROFILE") else {
         return;
     };
@@ -83,6 +84,85 @@ pub fn profile_on_request() {
                 }
             }
         });
+}
+
+/// `VICTORY_WATCH_POOL=<rva>[,<rva>...][@seconds]`: every few seconds (5),
+/// the fill of the title's fixed-size pools whose pointers are at these
+/// offsets in its executable (hexadecimal). For titles that end themselves
+/// when such a pool runs out: which one fills, how fast, and whether
+/// elements still come back.
+///
+/// The layout is the lock-free pool of RAGE titles (Grand Theft Auto VI):
+/// storage, element size and capacity (two `u32`), elements in use, and at
+/// 0x20 the head of the free list: an index (0x1fffe when empty) under a
+/// count of the elements returned so far.
+fn watch_pools() {
+    let Ok(spec) = std::env::var("VICTORY_WATCH_POOL") else {
+        return;
+    };
+    let (list, every) = spec.split_once('@').unwrap_or((&spec, "5"));
+    let every = Duration::from_secs_f64(every.trim().parse().unwrap_or(5.0));
+    let pools: Vec<usize> = list
+        .split(',')
+        .filter_map(|t| usize::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+        .collect();
+    if pools.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("victory-pools".into()).spawn(move || {
+        let started = Instant::now();
+        let mut last: Vec<Option<(u32, u32)>> = vec![None; pools.len()];
+        loop {
+            std::thread::sleep(every);
+            let base = crate::threads::title_base();
+            if base == 0 {
+                continue;
+            }
+            // One line a sample: each pool as in use/capacity, with what
+            // was taken and returned since the last line, and the bytes
+            // of an element.
+            let mut line = String::new();
+            for (i, &rva) in pools.iter().enumerate() {
+                let mut pointer = [0u8; 8];
+                if !read_memory(base + rva, &mut pointer) {
+                    continue;
+                }
+                let pool = usize::from_le_bytes(pointer);
+                let mut raw = [0u8; 0x38];
+                if pool == 0 || !read_memory(pool, &mut raw) {
+                    continue;
+                }
+                let u32_at = |at: usize| u32::from_le_bytes(raw[at..at + 4].try_into().unwrap_or_default());
+                let (size, capacity, used) = (u32_at(8), u32_at(0xc), u32_at(0x10));
+                let returned = u32_at(0x24);
+                let (taken, back) = match last[i] {
+                    // Taken = the growth in use plus what came back.
+                    Some((used0, returned0)) => {
+                        let back = returned.wrapping_sub(returned0);
+                        (i64::from(used) - i64::from(used0) + i64::from(back), back)
+                    }
+                    None => (0, 0),
+                };
+                last[i] = Some((used, returned));
+                line.push_str(&format!(" {rva:x}:{used}/{capacity}+{taken}-{back}x{size}"));
+            }
+            if !line.is_empty() {
+                say(&format!(
+                    "VIctory: title pools at {:.0} s (offset:in use/capacity+taken-returned x bytes):{line}",
+                    started.elapsed().as_secs_f64()
+                ));
+            }
+        }
+    });
+}
+
+/// Reads our own memory at `at`, false if it is not all readable.
+fn read_memory(at: usize, into: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0;
+    // SAFETY: the kernel checks the source; the destination is ours.
+    unsafe { ReadProcessMemory(GetCurrentProcess(), at as _, into.as_mut_ptr().cast(), into.len(), &mut done) != 0 }
 }
 
 /// Whether a file is there, by its attributes alone: the standard

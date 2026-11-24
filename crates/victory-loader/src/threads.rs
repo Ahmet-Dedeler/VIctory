@@ -30,9 +30,23 @@ fn images() -> std::sync::MutexGuard<'static, Vec<Mapped>> {
     IMAGES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The base of the first image mapped (the title's executable), or zero.
+static FIRST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Where the title's executable is mapped; zero before it is.
+pub(crate) fn title_base() -> usize {
+    FIRST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn mapped(image: &LoadedImage) {
     // SAFETY: reads our own static, so the linker keeps it (and its section).
     unsafe { std::ptr::from_ref(&ON_THREAD).read_volatile() };
+    let _ = FIRST.compare_exchange(
+        0,
+        image.base(),
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let image = Arc::new(image.clone());
     let mut images = images();
     images.retain(|m| m.image.base() != image.base());
