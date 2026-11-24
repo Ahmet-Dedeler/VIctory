@@ -56,14 +56,21 @@ pub fn profile_on_request() {
                     let line: Vec<String> = (0..now.len())
                         .map(|i| format!("{} {:.0}", TRAP_NAMES[i], (now[i] - last[i]) as f64 / secs))
                         .collect();
-                    eprintln!(
+                    say(&format!(
                         "VIctory: exceptions per second: {}; {} clzero sites are calls",
                         line.join(", "),
                         crate::redirect::WRITTEN.load(Relaxed)
-                    );
+                    ));
                     (last, said) = (now, Instant::now());
                 }
-                if file.exists() {
+                let hang = std::path::PathBuf::from(format!("{}.hang", file.display()));
+                if exists(&hang) {
+                    let _ = std::fs::remove_file(&hang);
+                    let text = probe_suspended();
+                    say(&format!("VIctory: suspended threads: {}", text.trim_end().replace('\n', "; ")));
+                    let _ = std::fs::write(format!("{}.txt", hang.display()), text);
+                }
+                if exists(&file) {
                     let _ = std::fs::remove_file(&file);
                     n += 1;
                     let out = format!("{}.{n}.txt", file.display());
@@ -76,6 +83,77 @@ pub fn profile_on_request() {
                 }
             }
         });
+}
+
+/// Whether a file is there, by its attributes alone: the standard
+/// library's `exists` opens the file and asks for its volume too, which
+/// under Wine is a device request to another process, twice every poll.
+fn exists(path: &std::path::Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: a NUL-terminated path.
+    unsafe { GetFileAttributesW(wide.as_ptr()) != INVALID_FILE_ATTRIBUTES }
+}
+
+/// Writes a line to standard error without taking the standard library's
+/// lock on it: a thread suspended in the middle of a log line keeps that
+/// lock, and this thread must go on reporting.
+fn say(text: &str) {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+    let line = format!("{text}\n");
+    let mut written = 0;
+    // SAFETY: the process's standard error and a buffer of that length.
+    unsafe {
+        WriteFile(
+            GetStdHandle(STD_ERROR_HANDLE),
+            line.as_ptr(),
+            line.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        )
+    };
+}
+
+/// Which threads somebody has suspended, found by suspending each once
+/// more (the call returns the count before it) and resuming it; with
+/// `VICTORY_HANG_RESUME=1` such a thread is resumed all the way. For a run
+/// that stopped: a thread suspended while it holds a lock of the runtime
+/// or the host stops everything that needs the lock.
+fn probe_suspended() -> String {
+    use std::fmt::Write;
+    let resume = std::env::var("VICTORY_HANG_RESUME").as_deref() == Ok("1");
+    let mut text = String::new();
+    let threads = threads();
+    let _ = writeln!(text, "{} threads", threads.len());
+    for t in &threads {
+        // SAFETY: a thread of this process, resumed at once.
+        let before = unsafe { SuspendThread(t.handle) };
+        if before != u32::MAX {
+            // SAFETY: as above.
+            unsafe { ResumeThread(t.handle) };
+        }
+        if before != 0 {
+            let _ = writeln!(
+                text,
+                "thread {} \"{}\" start {}: suspend count {before}{}",
+                t.id,
+                name_of(t.handle),
+                locate(start_of(t.handle)),
+                if resume && before != u32::MAX { ", resumed" } else { "" }
+            );
+            if resume && before != u32::MAX {
+                for _ in 0..before {
+                    // SAFETY: as above.
+                    unsafe { ResumeThread(t.handle) };
+                }
+            }
+        }
+        // SAFETY: we opened it.
+        unsafe { CloseHandle(t.handle) };
+    }
+    text
 }
 
 fn trap_counts() -> [u64; 5] {
@@ -115,7 +193,17 @@ struct Sampled {
     cpu: u64,
     stacks: HashMap<Vec<u64>, u32>,
     samples: u32,
+    /// The last stack sampled and how many samples in a row had it.
+    last: Vec<u64>,
+    same: u32,
 }
+
+/// A thread whose last samples were all the same stack (it waits) is
+/// sampled only every so many rounds, each sample counting for as many:
+/// most of a title's hundred threads wait, and a sample is three server
+/// calls.
+const SAME_BEFORE_SKIPPING: u32 = 4;
+const SKIP: u32 = 8;
 
 fn cpu_of(thread: HANDLE) -> u64 {
     let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
@@ -182,6 +270,8 @@ fn threads() -> Vec<Sampled> {
                     cpu: cpu_of(handle),
                     stacks: HashMap::new(),
                     samples: 0,
+                    last: Vec::new(),
+                    same: 0,
                 });
             } else if !handle.is_null() {
                 // SAFETY: we opened it.
@@ -211,6 +301,14 @@ fn sample(length: Duration, interval: Duration) -> String {
     while start.elapsed() < length {
         let round = Instant::now();
         for t in &mut threads {
+            let weight = if t.same >= SAME_BEFORE_SKIPPING {
+                if rounds % SKIP != t.id / 4 % SKIP {
+                    continue;
+                }
+                SKIP
+            } else {
+                1
+            };
             frames.clear();
             context.0.ContextFlags = CONTEXT_FULL_AMD64;
             // SAFETY: suspends, reads and resumes a thread that is not this
@@ -225,8 +323,14 @@ fn sample(length: Duration, interval: Duration) -> String {
                 ResumeThread(t.handle);
             }
             if !frames.is_empty() {
-                t.samples += 1;
-                *t.stacks.entry(frames.clone()).or_insert(0) += 1;
+                t.samples += weight;
+                *t.stacks.entry(frames.clone()).or_insert(0) += weight;
+                if frames == t.last {
+                    t.same += 1;
+                } else {
+                    t.same = 0;
+                    t.last.clone_from(&frames);
+                }
             }
         }
         rounds += 1;
