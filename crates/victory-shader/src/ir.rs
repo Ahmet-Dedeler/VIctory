@@ -242,7 +242,7 @@ fn spill_loads(
 }
 
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
-/// count. Fails on instructions the IR cannot express yet
+/// count, at most 256. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
     build_with(code, wave64, vgprs, false)
@@ -257,6 +257,11 @@ pub fn build_with(
     vgprs: u16,
     spilled: bool,
 ) -> Result<Program, ShaderError> {
+    // A VGPR is named by a byte; past 256, M0-relative access would wrap
+    // round to v0 and alias the registers it reads and writes.
+    if vgprs > 256 {
+        return Err(ShaderError::Malformed("more than 256 VGPRs"));
+    }
     let mut list = gfx10::decode(code)?;
     if spilled {
         list = spill_loads(list, wave64, code.len())?;
@@ -1428,5 +1433,30 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    /// Registers are named by a byte, so a count past 256 would make
+    /// M0-relative access wrap round to v0; it is refused instead.
+    #[test]
+    fn refuses_more_vgprs_than_a_byte_names() {
+        let code: Vec<u8> = [
+            0x7E00_8704_u32, // v_movrels_b32 v0, v4: v0 = v[4 + m0]
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = build(&code, false, 256).unwrap();
+        let reads = &p.blocks[0].insts[0].reads;
+        let last = reads.iter().filter_map(|r| match r.0 {
+            Reg::V(v) => Some(v),
+            _ => None,
+        });
+        assert_eq!(last.max(), Some(255), "256 VGPRs reach v255");
+        assert_eq!(
+            build(&code, false, 257),
+            Err(ShaderError::Malformed("more than 256 VGPRs"))
+        );
+        assert!(build(&code, false, u16::MAX).is_err());
     }
 }
