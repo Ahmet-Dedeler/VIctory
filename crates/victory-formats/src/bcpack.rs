@@ -1284,6 +1284,59 @@ mod tests {
         assert_eq!(dst[8..], block(139, 126, &|p| (p + 1) & 7));
     }
 
+    // cargo test --release -p victory-formats benchmark_bcpack -- --ignored --nocapture
+    #[test]
+    #[ignore = "synthetic CPU release benchmark"]
+    fn benchmark_bcpack() {
+        let t = Tables::parse(&tables()).unwrap();
+        let blocks = 200_000u32;
+        let records: Vec<Vec<u8>> = (0..blocks)
+            .map(|i| {
+                let mut r = vec![0, 0, (i * 7) as u8 & 127, (i * 13) as u8 & 127];
+                r.extend((0..8).map(|k| ((i + k) * 5 % 64) as u8));
+                r
+            })
+            .collect();
+        // Fragments of 2,000 symbols a lane, each resetting the state at its end.
+        let mut queues: Vec<std::collections::VecDeque<u8>> = (0..BC4_LANES.len())
+            .map(|j| {
+                let syms: Vec<u8> = records.iter().map(|r| r[j]).collect();
+                let mut bytes = Vec::new();
+                for part in syms.chunks(2000) {
+                    let mut f = fragment(BC4_LANES[j], part);
+                    f[0] |= 0x10;
+                    bytes.extend(f);
+                }
+                bytes.extend([0, 1, 0, 0]);
+                bytes.into()
+            })
+            .collect();
+        let mut src = Vec::new();
+        let mut check = vec![0; records.len() * 12];
+        let fetch = |j: usize| {
+            let b = queues[j].pop_front()?;
+            src.push(b);
+            Some(b)
+        };
+        lanes(&t, &BC4_LANES, 1, records.len(), fetch, &mut check).unwrap();
+        assert!(check == records.concat(), "the stream does not decode to its records");
+        let mut dst = vec![0u8; blocks as usize * 8];
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            decode(4, std::hint::black_box(&src), &mut dst, &t).unwrap();
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        println!(
+            "BC4, {blocks} blocks: {} bytes in, {} out, {:.1} ms: {:.1} MB of output a second, {:.0} ns a symbol",
+            src.len(),
+            dst.len(),
+            best * 1e3,
+            dst.len() as f64 / best / 1e6,
+            best * 1e9 / (f64::from(blocks) * 12.0)
+        );
+    }
+
     #[test]
     fn lanes_take_bytes_in_schedule_order_and_long_fragments() {
         let t = Tables::parse(&tables()).unwrap();
