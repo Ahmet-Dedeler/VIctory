@@ -178,7 +178,8 @@ fn branched_into(code: &[u8], base: usize, from: usize, to: usize) -> bool {
 }
 
 /// The code a branch into the site could come from: its function by the
-/// unwind tables, or the committed memory within 512 bytes of it.
+/// unwind tables, or (a leaf function has none, as the title's clearing
+/// routine) the committed memory within 16 KiB of it.
 fn surroundings(at: usize) -> Option<(usize, &'static [u8])> {
     let mut image = 0;
     // SAFETY: looks up the function table entry covering the site, if any.
@@ -193,7 +194,7 @@ fn surroundings(at: usize) -> Option<(usize, &'static [u8])> {
     }
     let (low, high) = (info.BaseAddress as usize, info.BaseAddress as usize + info.RegionSize);
     let (from, to) = if entry.is_null() {
-        (at.saturating_sub(512), at + 512)
+        (at.saturating_sub(16 << 10), at + (16 << 10))
     } else {
         // SAFETY: a live table entry of a loaded image.
         let e = unsafe { &*entry };
@@ -361,6 +362,35 @@ fn write_call(site: &Site) {
     }
 }
 
+/// A clearing loop as the title's compilers build it, a line a pass:
+///
+/// ```text
+/// top: clzero
+///      add  rax, 0x40
+///      cmp  rax, limit
+///      jb   top
+/// ```
+///
+/// The limit's register and the bytes from `clzero` to the instruction
+/// after `jb`: a site that cannot be a call has its loop done in one
+/// exception (as the `clwb` loops are), `rax` and the flags left as the
+/// last pass leaves them.
+fn clearing_loop(code: &[u8]) -> Option<(u8, usize)> {
+    if code.get(..7)? != [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40] {
+        return None;
+    }
+    // cmp rax, limit: REX.W(+R) 39 /r, rax in r/m.
+    let &[rex @ (0x48 | 0x4c), 0x39, modrm] = code.get(7..10)? else {
+        return None;
+    };
+    if modrm >> 6 != 3 || modrm & 7 != 0 {
+        return None;
+    }
+    let limit = (modrm >> 3) & 7 | (rex & 4) << 1;
+    // jb top.
+    (code.get(10..12)? == [0x72, 0xf4] && limit != 0).then_some((limit, 12))
+}
+
 /// Answers an illegal-instruction exception at a `clzero` or at a site
 /// that was one: zeroes the line at `rax` and sends the thread on. `code`
 /// is the code from the faulting address on, within its page. False if the
@@ -381,12 +411,32 @@ pub(crate) unsafe fn clzero(context: &mut CONTEXT, code: &[u8]) -> bool {
     if moved == 0 && !is_clzero {
         return false;
     }
-    // SAFETY: what the instruction does: the title's own line.
-    unsafe { ((context.Rax & !63) as *mut u8).write_bytes(0, 64) };
     let Some(site) = site.filter(|_| moved != 0) else {
+        // No helper for this site: at least a whole loop in one exception.
+        if let Some((limit, len)) = clearing_loop(code) {
+            let limit = *crate::crash::gpr(context, limit);
+            let mut at = context.Rax;
+            loop {
+                // SAFETY: what each pass of the loop does: the title's lines.
+                unsafe { ((at & !63) as *mut u8).write_bytes(0, 64) };
+                at = at.wrapping_add(64);
+                if at >= limit {
+                    break;
+                }
+            }
+            context.Rax = at;
+            let flags = crate::crash::cmp_flags(at, limit);
+            context.EFlags = context.EFlags & !crate::crash::CMP_FLAGS | flags;
+            context.Rip += len as u64;
+            return true;
+        }
+        // SAFETY: what the instruction does: the title's own line.
+        unsafe { ((context.Rax & !63) as *mut u8).write_bytes(0, 64) };
         context.Rip += 3;
         return true;
     };
+    // SAFETY: what the instruction does: the title's own line.
+    unsafe { ((context.Rax & !63) as *mut u8).write_bytes(0, 64) };
     write_call(site);
     // As the call does: the return address pushed, on to the moved
     // instruction (the helper's first part is what the handler just did).
@@ -400,6 +450,10 @@ pub(crate) unsafe fn clzero(context: &mut CONTEXT, code: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tests that count exceptions run one at a time: the count is the
+    /// process's.
+    static COUNTING: Mutex<()> = Mutex::new(());
 
     #[test]
     fn movable_instructions() {
@@ -450,6 +504,53 @@ mod tests {
         assert!(branched_into(&far, 0x2000, site, site + 7));
     }
 
+    #[test]
+    fn clearing_loops() {
+        // The title's: cmp rax, r10 and cmp rax, rdx.
+        let r10 = [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4];
+        assert_eq!(clearing_loop(&r10), Some((10, 12)));
+        let rdx = [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xd0, 0x72, 0xf4, 0xc3];
+        assert_eq!(clearing_loop(&rdx), Some((2, 12)));
+        // Another step, a compare of other registers, another jump, cut off.
+        let mut other = r10;
+        other[6] = 0x80;
+        assert_eq!(clearing_loop(&other), None);
+        let mut other = r10;
+        other[9] = 0xd1; // cmp rcx, r10
+        assert_eq!(clearing_loop(&other), None);
+        let mut other = r10;
+        other[11] = 0xf0;
+        assert_eq!(clearing_loop(&other), None);
+        let mut other = r10;
+        other[10] = 0x76; // jbe
+        assert_eq!(clearing_loop(&other), None);
+        assert_eq!(clearing_loop(&r10[..11]), None);
+    }
+
+    #[test]
+    fn a_loop_that_is_not_rewritten_is_cleared_in_one_exception() {
+        let _counting = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
+        crate::crash::report_crashes();
+        // As the loop the branch test leaves alone, in the title's shape:
+        // mov rax, rcx; top: clzero; add rax, 0x40; cmp rax, rdx; jb top;
+        // ret; and a jump to the add nothing takes.
+        let code = [
+            0x48, 0x89, 0xc8, // 0
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xd0, 0x72, 0xf4, 0xc3, // 3..16
+            0xeb, 0xf4, // 16: jmp to 6 (the add)
+        ];
+        let before = crate::crash::TRAPS[0].load(Ordering::Relaxed);
+        let (f, memory) = run(&code, 1, 24);
+        cleared(&memory, 24);
+        let raised = crate::crash::TRAPS[0].load(Ordering::Relaxed) - before;
+        assert!(raised <= 1, "{raised} exceptions for one loop");
+        // SAFETY: the function's code, as it was.
+        assert_eq!(unsafe { std::slice::from_raw_parts(f.add(3), 3) }, [0x0f, 0x01, 0xfc]);
+        // One line: the loop's single pass.
+        let (_, memory) = run(&code, 1, 1);
+        cleared(&memory, 1);
+    }
+
     /// Runs `code` (a function of the Windows convention taking a start and
     /// an end address) on memory of ours.
     fn run(code: &[u8], calls: usize, lines: usize) -> (*const u8, Vec<u8>) {
@@ -491,6 +592,7 @@ mod tests {
 
     #[test]
     fn a_loop_of_the_titles_shape_is_rewritten_and_still_clears() {
+        let _counting = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
         crate::crash::report_crashes();
         // mov rax, rcx; top: clzero; add rax, 0x40; cmp rax, rdx; jb top; ret
         let code = [
@@ -537,6 +639,7 @@ mod tests {
 
     #[test]
     fn a_site_a_branch_lands_inside_stays_as_it_is() {
+        let _counting = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
         crate::crash::report_crashes();
         // mov rax, rcx; jmp top; (padding) top: clzero; mid: add rax, 0x40;
         // cmp rax, rdx; jb top; ret; and a jump to mid nothing takes.
@@ -559,13 +662,15 @@ mod tests {
         let traps = crate::crash::TRAPS[0].load(Ordering::Relaxed);
         // SAFETY: eight whole lines inside `m`.
         clear(start, unsafe { start.add(64 * 8) });
-        assert_eq!(crate::crash::TRAPS[0].load(Ordering::Relaxed) - traps, 8);
+        // Not a call, so an exception each time: one for the whole loop.
+        assert_eq!(crate::crash::TRAPS[0].load(Ordering::Relaxed) - traps, 1);
         // SAFETY: the function's code.
         assert_eq!(unsafe { std::slice::from_raw_parts(f.add(7), 3) }, [0x0f, 0x01, 0xfc]);
     }
 
     #[test]
     fn threads_racing_on_a_site_all_clear_their_lines() {
+        let _counting = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
         crate::crash::report_crashes();
         // mov rax, rcx; top: mov r10, rax; add r10, 0x40; clzero; cmp r10, rdx;
         // mov rax, r10; jb top; ret  (the compare form: clzero, then cmp).
