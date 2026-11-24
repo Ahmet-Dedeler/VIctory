@@ -2321,7 +2321,26 @@ impl HostList {
             // SAFETY: the list's own mapped word, written before it runs.
             deferred
                 .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+                .push(Step::Host(Box::new(move || unsafe {
+                    // Diagnostics: what the list's last submission spent.
+                    // Past the budget its later records ran empty.
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        let spent = (at as *const u32).read_volatile();
+                        if spent >= 1 << 27 {
+                            let n = BUDGETS_SPENT.fetch_add(1, Ordering::Relaxed);
+                            if n < 16 || n.is_power_of_two() {
+                                tracing::warn!(
+                                    spent,
+                                    budget = 1u32 << 27,
+                                    lists = n + 1,
+                                    "a list spent its indirect budget: its later indirect records ran empty"
+                                );
+                            }
+                        }
+                    }
+                    (at as *mut u32).write_volatile(0)
+                })));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
@@ -3374,6 +3393,10 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
     text
 }
 
+/// Submissions that had spent their indirect budget (diagnostics).
+#[cfg(feature = "diagnostics")]
+static BUDGETS_SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn transition(
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
@@ -3446,6 +3469,17 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
         let background = crate::background();
+        // A background run's window where `VICTORY_WINDOW_AT=x,y` says (out
+        // of the way of whoever works at the machine); else where the
+        // system puts it.
+        let at = std::env::var("VICTORY_WINDOW_AT")
+            .ok()
+            .filter(|_| background)
+            .and_then(|v| {
+                let (x, y) = v.split_once(',')?;
+                Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+            })
+            .unwrap_or((CW_USEDEFAULT, CW_USEDEFAULT));
         let hwnd = CreateWindowExW(
             if background {
                 WS_EX_NOACTIVATE
@@ -3459,8 +3493,8 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             } else {
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE
             },
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            at.0,
+            at.1,
             rect.right - rect.left,
             rect.bottom - rect.top,
             None,

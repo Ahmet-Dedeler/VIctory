@@ -61,6 +61,26 @@ pub(crate) fn busy_frame(frame: u64) {
 /// targets' pictures: the two together say which pass left a target empty.
 static OPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// The textures a listed frame's lines name: title memory, bytes of the
+/// first mip, size, the title's format and flags.
+static TEXTURES: std::sync::Mutex<std::collections::BTreeMap<u64, (u64, u64, u64, u32, u32, u32)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Notes a texture a line of a listed frame names (see [`save_frame_ops`]).
+pub(crate) fn note_texture(resource: crate::object::This) {
+    if !dump_on() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    let Some((memory, bytes, width, height, format, flags)) = crate::resource::texture_place(resource)
+    else {
+        return;
+    };
+    TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(resource as u64, (memory, bytes, width, height, format, flags));
+}
+
 /// Counts a draw or dispatch of the frame being built and, in a listed
 /// frame, notes its line.
 pub(crate) fn note_frame_op(line: impl FnOnce() -> String) {
@@ -129,6 +149,20 @@ pub(crate) fn save_frame_ops(frame: u64) {
             None => line,
         })
         .collect();
+    // The textures those lines name, with the title memory each lies in:
+    // two objects over the same memory are one texture to the title.
+    let textures = std::mem::take(&mut *TEXTURES.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut table: Vec<String> = textures
+        .iter()
+        .map(|(id, (memory, bytes, width, height, format, flags))| {
+            format!("{id:#x} memory {memory:#x}+{bytes:#x} {width}x{height} f{format} flags {flags:#x}")
+        })
+        .collect();
+    table.sort();
+    let path = folder.join(format!("frame-{frame}-textures.txt"));
+    if let Err(e) = std::fs::write(&path, table.join("\n") + "\n") {
+        tracing::warn!(error = %e, path = %path.display(), "frame textures not saved");
+    }
     let path = folder.join(format!("frame-{frame}-ops.txt"));
     if let Err(e) = std::fs::write(&path, ops.join("\n") + "\n") {
         tracing::warn!(error = %e, path = %path.display(), "frame operations not saved");

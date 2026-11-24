@@ -112,6 +112,24 @@ fn source(outputs: &[Element]) -> Option<String> {
         }
     }
     let p = position?;
+    // Diagnostics (`VICTORY_RECTS_FULL`): the first rectangle of a draw
+    // covers the whole target wherever the vertex shader put it, to tell a
+    // vertex shader that places no rectangle from a draw that does not run.
+    #[cfg(feature = "diagnostics")]
+    if std::env::var_os("VICTORY_RECTS_FULL").is_some() {
+        return Some(format!(
+            "struct V {{\n{fields}}};\n\
+             [maxvertexcount(4)]\n\
+             void main(triangle V i[3], uint n : SV_PrimitiveID, inout TriangleStream<V> o) {{\n\
+             \x20   if (n != 0) return;\n\
+             \x20   V d = i[0];\n\
+             \x20   d.e{p} = float4(-1, -1, 0.5, 1); o.Append(d);\n\
+             \x20   d.e{p} = float4(-1, 1, 0.5, 1); o.Append(d);\n\
+             \x20   d.e{p} = float4(1, -1, 0.5, 1); o.Append(d);\n\
+             \x20   d.e{p} = float4(1, 1, 0.5, 1); o.Append(d);\n\
+             }}\n"
+        ));
+    }
     Some(format!(
         "struct V {{\n{fields}}};\n\
          [maxvertexcount(4)]\n\

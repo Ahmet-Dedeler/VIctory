@@ -973,9 +973,13 @@ impl State {
                 return text;
             };
             if !compute {
+                for &t in self.targets.iter().chain([&self.depth]) {
+                    crate::capture::note_texture(t as This);
+                }
+                let (viewport, scissor) = *LAST_VIEW.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = write!(
                     text,
-                    " | {} ref {:#x}",
+                    " | {} ref {:#x} | viewport {viewport:?} scissor {scissor:?}",
                     p.state,
                     STENCIL_REF.load(std::sync::atomic::Ordering::Relaxed)
                 );
@@ -1002,6 +1006,9 @@ impl State {
                             list.push(what);
                         }
                         continue;
+                    }
+                    if let Some(View::Shader(r, _) | View::Unordered(r, ..)) = view {
+                        crate::capture::note_texture(r as This);
                     }
                     let (list, what) = match view {
                         Some(View::Shader(r, _)) => match crate::resource::host_resource(r as This) {
@@ -1729,12 +1736,25 @@ const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
 /// Fixed-function state, straight onto the host list.
+/// The first viewport and scissor set last, for the frame account.
+#[cfg(feature = "diagnostics")]
+static LAST_VIEW: std::sync::Mutex<([f32; 6], [i32; 4])> = std::sync::Mutex::new(([0.0; 6], [0; 4]));
+
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+    #[cfg(feature = "diagnostics")]
+    if let Some(v) = viewports.first() {
+        LAST_VIEW.lock().unwrap_or_else(|e| e.into_inner()).0 =
+            [v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth];
+    }
     // SAFETY: an open list.
     unsafe { list.list.RSSetViewports(viewports) };
 }
 
 pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
+    #[cfg(feature = "diagnostics")]
+    if let Some(r) = rects.first() {
+        LAST_VIEW.lock().unwrap_or_else(|e| e.into_inner()).1 = [r.left, r.top, r.right, r.bottom];
+    }
     // SAFETY: an open list.
     unsafe { list.list.RSSetScissorRects(rects) };
 }

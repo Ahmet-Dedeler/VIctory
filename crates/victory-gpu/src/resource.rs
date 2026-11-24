@@ -1423,6 +1423,17 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// A texture's title memory, the bytes of its first mip there, its size
+/// and the title's format and flags (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn texture_place(this: This) -> Option<(u64, u64, u64, u32, u32, u32)> {
+    let (memory, d) = texture_memory(this)?;
+    let bytes = element(d.format).map_or(0, |(bytes, texels)| {
+        d.width.div_ceil(texels) * u64::from(d.height).div_ceil(texels) * bytes
+    });
+    Some((memory as u64, bytes, d.width, d.height, d.format, d.flags))
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
