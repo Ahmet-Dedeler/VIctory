@@ -342,7 +342,7 @@ mod tests {
         let io = io::raise(&p, &native)?;
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        crate::emit::emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+        crate::emit::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).map(|_| ())
     }
 
     /// Assembled with llvm-mc (gfx1030, wave64): an `if` whose else-mask
@@ -435,9 +435,12 @@ mod tests {
         ];
         for uses in idioms {
             let words = else_mask_spilled(uses);
-            // The spill reads the mask as a number where its lanes are not.
+            // The spill reads the mask as a number where its lanes are not:
+            // refused in the per-lane form; with upstream #439 the program
+            // then runs in the console flow, which reads the mask whole.
             match translate(&words, false) {
                 Err(ShaderError::Unsupported { what, .. }) => assert_eq!(what, HOLDING),
+                Ok(()) => {}
                 r => panic!("{r:?}"),
             }
             translate(&words, true).unwrap();

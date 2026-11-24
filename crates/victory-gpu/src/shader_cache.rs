@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, Target, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -67,28 +67,38 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+/// The translation of a console shader container for a host that runs
+/// `target`'s wave sizes, from the cache when there is one.
+pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
     // Apple GPUs (known here by their mesh output limit) run compute samples
     // with implicit derivatives only in one-dimensional groups. The setting
     // changes translations: an executable gets one cache per setting.
-    static AT_LEVELS: OnceLock<[u8; 32]> = OnceLock::new();
-    let key = AT_LEVELS.get_or_init(|| {
+    static AT_LEVELS: OnceLock<bool> = OnceLock::new();
+    let at_levels = *AT_LEVELS.get_or_init(|| {
         let on = crate::host::host().is_some_and(|h| h.mesh_output_limit().is_some());
         victory_shader::emit::set_compute_samples_at_levels(on);
         if on {
             tracing::info!("compute programs of 2D and 3D groups sample at explicit levels on this host");
         }
-        let mut key = *build();
-        key[0] ^= on as u8;
-        key
+        on
     });
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
+    let mut key = key(build(), target);
+    key[0] ^= at_levels as u8;
     match CACHE.get() {
-        Some(cache) => cached(cache, key, container, translate),
+        Some(cache) => cached(cache, &key, container, translate),
         None => translate(container),
     }
+}
+
+/// The part of an entry's key before the container: the build, and the
+/// host's wave sizes (a translation for one host's waves is not another's).
+fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(&target.key());
+    *h.finalize().as_bytes()
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -359,6 +369,22 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn keys_tell_hosts_wave_sizes_apart() {
+        let build = [7u8; 32];
+        let nvidia = Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        let rdna = Target {
+            lanes_min: 32,
+            lanes_max: 64,
+        };
+        assert_eq!(key(&build, nvidia), key(&build, nvidia));
+        assert_ne!(key(&build, nvidia), key(&build, rdna));
+        assert_ne!(key(&build, nvidia), key(&[8; 32], nvidia));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
