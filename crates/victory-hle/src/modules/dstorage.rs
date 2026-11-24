@@ -472,12 +472,29 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
+        {
+            let took = started.elapsed().as_nanos() as u64;
+            let mut longest = LONGEST.lock().unwrap_or_else(|e| e.into_inner());
+            if took > longest.0 {
+                *longest = (took, job.request.options, job.request.destination_size);
+            }
+        }
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
+            let running: usize = self.lanes.values().map(|l| l.running.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let inflating = INFLATING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let unpacking = UNPACKING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let longest = std::mem::take(&mut *LONGEST.lock().unwrap_or_else(|e| e.into_inner()));
             tracing::debug!(
+                inflating_workers = format_args!("{:.2}", inflating / elapsed.as_secs_f64()),
+                unpacking_workers = format_args!("{:.2}", unpacking / elapsed.as_secs_f64()),
+                running,
+                longest_ms = longest.0 / 1_000_000,
+                longest_options = format_args!("{:#x}", longest.1),
+                longest_bytes = longest.2,
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
@@ -829,9 +846,13 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+        Some(tables) => {
+            let started = std::time::Instant::now();
+            let done = bcpack::decode(bc, &source, out, tables);
+            UNPACKING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            done.map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string()))
+        }
         None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
@@ -847,11 +868,15 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
-        .map_err(|status| {
-            tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
-        })
+    let started = std::time::Instant::now();
+    let done =
+        miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
+            .map_err(|status| {
+                tracing::debug!(?status, "dstorage: zlib stream");
+                INVALID_DATA
+            });
+    INFLATING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    done
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -910,6 +935,13 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
+/// Likewise inflating zlib data and unpacking BCPack data (the decoding
+/// alone, without reading and without the buffers made for it).
+static INFLATING: AtomicU64 = AtomicU64::new(0);
+static UNPACKING: AtomicU64 = AtomicU64::new(0);
+/// The longest request since the last summary: nanoseconds, its options and
+/// its destination size.
+static LONGEST: Mutex<(u64, u64, u32)> = Mutex::new((0, 0, 0));
 
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
