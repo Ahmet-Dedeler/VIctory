@@ -165,6 +165,11 @@ pub fn run(
     jobs: Option<usize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    // As on a host of that kind (`victory_shader::emit::set_compute_samples_at_levels`),
+    // to check its translations without one.
+    if std::env::var_os("VICTORY_COMPUTE_SAMPLES_AT_LEVELS").is_some() {
+        emit::set_compute_samples_at_levels(true);
+    }
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;

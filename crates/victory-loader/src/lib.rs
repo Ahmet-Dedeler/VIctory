@@ -40,7 +40,8 @@ mod windows;
 
 #[cfg(windows)]
 pub use crash::{
-    locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
+    end_unhandled, locate, log_crash, log_crashes_to, note_title_output, report_crashes,
+    report_unhandled,
     resume_null_writes,
 };
 #[cfg(all(windows, feature = "diagnostics"))]

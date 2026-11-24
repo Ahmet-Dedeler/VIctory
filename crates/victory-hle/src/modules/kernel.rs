@@ -270,7 +270,7 @@ pub extern "system" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
 
 extern "system" fn report_unhandled(info: *const c_void) -> i32 {
     host::report_unhandled(info);
-    match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
+    let passed = match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
         filter => {
             type Filter = extern "system" fn(*const c_void) -> i32;
@@ -278,7 +278,13 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
             let filter: Filter = unsafe { std::mem::transmute(filter) };
             filter(info)
         }
+    };
+    if passed == 0 {
+        // Nobody took it (the title's filter wrote its report and let it
+        // pass): the run ends here, not in the host's debugger dialog.
+        host::end_unhandled(info);
     }
+    passed
 }
 
 /// See [`exit`]; only the current process is logged.
@@ -507,6 +513,11 @@ mod host {
         unsafe { victory_loader::report_unhandled(info.cast()) };
     }
 
+    pub(super) fn end_unhandled(info: *const c_void) {
+        // SAFETY: the system's exception pointers, passed to the filter.
+        unsafe { victory_loader::end_unhandled(info.cast()) };
+    }
+
     pub(super) fn note_title_output(line: &str) {
         victory_loader::note_title_output(line);
     }
@@ -588,6 +599,8 @@ mod host {
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
 
     pub(super) fn report_unhandled(_: *const c_void) {}
+
+    pub(super) fn end_unhandled(_: *const c_void) {}
 
     pub(super) fn note_title_output(_: &str) {}
 

@@ -142,7 +142,10 @@ pub fn report_crashes() {
     INSTALLED.call_once(|| {
         unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
             // SAFETY: the system passes the exception being dispatched.
-            unsafe { report_unhandled(info) };
+            unsafe {
+                report_unhandled(info);
+                end_unhandled(info);
+            }
             EXCEPTION_CONTINUE_SEARCH
         }
         // SAFETY: registers handlers that only read the exception they are
@@ -563,6 +566,44 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
+}
+
+/// For an unhandled-exception filter, once the exception is reported and
+/// nothing took it (the title's own filter, if it has one, let it pass):
+/// ends the process with the exception's code. Left to the host, the
+/// exception ends in its own dialog (Wine: "Unhandled exception ... Do you
+/// wish to debug it?", Windows: error reporting) with the title's window
+/// still up and its threads stopped, which reads as a hang. A title's fatal
+/// checks often fire on several threads at once: the first here waits a
+/// moment for the others' reports, the others wait for it.
+/// `VICTORY_KEEP_DEBUGGER=1` leaves the exception to the host.
+///
+/// # Safety
+/// `info` comes from the system, for an exception being dispatched.
+pub unsafe fn end_unhandled(info: *const EXCEPTION_POINTERS) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *KEEP.get_or_init(|| std::env::var_os("VICTORY_KEEP_DEBUGGER").is_some()) {
+        return;
+    }
+    static ENDING: AtomicBool = AtomicBool::new(false);
+    if ENDING.swap(true, Ordering::SeqCst) {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+    // SAFETY: the system's exception record.
+    let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let text = format!(
+        "VIctory: the title's exception {code:#x} was not handled: the run ends here (exit code {code:#x}); \
+         the reports above are also in crashes.log\n"
+    );
+    eprint!("{text}");
+    append_to_log(&text);
+    // SAFETY: ends our own process.
+    unsafe { TerminateProcess(GetCurrentProcess(), code as u32) };
 }
 
 /// MSVC's code for a C++ `throw`, and its magic first parameter.
