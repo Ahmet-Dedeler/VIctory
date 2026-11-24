@@ -9335,20 +9335,42 @@ impl<'a> Lower<'a> {
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
-            let args = self
-                .x
-                .st
-                .phi_masks
-                .get(&phi.value)
-                .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
             let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let x = self
-                    .boolean(args[n], qb)
-                    .map_err(|w| unsupported(offset, w))?;
-                incoming.push((x, qb));
+            if self.console_cf {
+                // Console flow (upstream #439): every lane arrives by every
+                // edge, so a join also takes masks that are constants or
+                // built from scalars.
+                for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                    let Some(qb) = self.tail[q] else { continue };
+                    let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                    let arg = &phi.args[n];
+                    let m = *self
+                        .x
+                        .st
+                        .masks
+                        .get(arg)
+                        .or(self.x.st.others.get(arg))
+                        .ok_or_else(|| {
+                            unsupported(offset, "a lane-mask join of an untracked mask")
+                        })?;
+                    let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                    incoming.push((x, qb));
+                }
+            } else {
+                let args = self
+                    .x
+                    .st
+                    .phi_masks
+                    .get(&phi.value)
+                    .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
+                for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                    let Some(qb) = self.tail[q] else { continue };
+                    let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                    let x = self
+                        .boolean(args[n], qb)
+                        .map_err(|w| unsupported(offset, w))?;
+                    incoming.push((x, qb));
+                }
             }
             self.s.m.set_phi(v, incoming);
         }
@@ -9402,26 +9424,6 @@ impl<'a> Lower<'a> {
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
-        }
-        while let Some((v, b, i)) = self.pending_masks.pop() {
-            let phi = &p.blocks[b].phis[i];
-            let offset = p.blocks[b].offset;
-            let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                // Console flow: every lane arrives by every edge, so a join
-                // also takes masks that are constants or built from scalars.
-                let arg = &phi.args[n];
-                let others = self.console_cf.then(|| self.x.st.others.get(arg)).flatten();
-                let m =
-                    *self.x.st.masks.get(arg).or(others).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
-                incoming.push((x, qb));
-            }
-            self.s.m.set_phi(v, incoming);
         }
         Ok(())
     }
