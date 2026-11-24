@@ -475,6 +475,25 @@ mod tests {
         s.finish()
     }
 
+    /// What D3D12 and the validator check before reading the bitcode, without
+    /// either: the container parses, its size field is its length, its parts
+    /// are the ones a pixel shader carries, and the digest is the one
+    /// `container::hash` gives for the bytes after it.
+    #[test]
+    fn constant_color_is_a_well_formed_container() {
+        let c = constant_color();
+        let parsed = Container::parse(&c).unwrap();
+        assert_eq!(crate::dxbc::u32_at(&c, 0x18).unwrap() as usize, c.len());
+        let fourccs: Vec<_> = parsed.parts.iter().map(|p| p.fourcc.0).collect();
+        assert_eq!(
+            fourccs,
+            [*b"SFI0", *b"ISG1", *b"OSG1", *b"PSV0", *b"HASH", *b"DXIL"]
+        );
+        let dxil = parsed.part(crate::dxbc::FourCC(*b"DXIL")).unwrap();
+        assert_eq!(&dxil.data[8..12], b"DXIL");
+        assert_eq!(parsed.digest, super::container::hash(&c[20..]));
+    }
+
     #[test]
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
