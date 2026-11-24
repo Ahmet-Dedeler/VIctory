@@ -141,6 +141,29 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// See [`set_compute_samples_at_levels`].
+static COMPUTE_SAMPLES_AT_LEVELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// For a host that runs texture samples with implicit derivatives only in
+/// compute programs of one-dimensional thread groups (Apple's converter
+/// behind D3DMetal: "Compute texture samples in SM6.6 are only supported for
+/// 1D threadgroup size"; the pipeline is made all the same and does
+/// nothing). With `on`, compute programs of other groups sample at an
+/// explicit level instead: level 0 (or the level clamp), the bias as the
+/// level for biased samples, level 0 for comparisons, and a level query
+/// answers 0. Set once, before the first translation: translations differ.
+// shortcut: the level the derivatives would give is not computed (the
+// coordinates of the lane's quad neighbours are at hand in a wave, so it
+// could be); such samples are sharper than on the console.
+pub fn set_compute_samples_at_levels(on: bool) {
+    COMPUTE_SAMPLES_AT_LEVELS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The value last given to [`set_compute_samples_at_levels`].
+pub fn compute_samples_at_levels() -> bool {
+    COMPUTE_SAMPLES_AT_LEVELS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Writes a shader container's digest (bytes 4..20, over everything after
 /// them), as the host's validator would: for a container made by a compiler
 /// that had no signing library at hand.

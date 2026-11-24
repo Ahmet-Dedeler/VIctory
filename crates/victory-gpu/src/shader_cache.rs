@@ -70,9 +70,23 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    // Apple GPUs (known here by their mesh output limit) run compute samples
+    // with implicit derivatives only in one-dimensional groups. The setting
+    // changes translations: an executable gets one cache per setting.
+    static AT_LEVELS: OnceLock<[u8; 32]> = OnceLock::new();
+    let key = AT_LEVELS.get_or_init(|| {
+        let on = crate::host::host().is_some_and(|h| h.mesh_output_limit().is_some());
+        victory_shader::emit::set_compute_samples_at_levels(on);
+        if on {
+            tracing::info!("compute programs of 2D and 3D groups sample at explicit levels on this host");
+        }
+        let mut key = *build();
+        key[0] ^= on as u8;
+        key
+    });
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, key, container, translate),
         None => translate(container),
     }
 }

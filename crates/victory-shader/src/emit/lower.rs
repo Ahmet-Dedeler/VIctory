@@ -7465,6 +7465,21 @@ impl<'a> Lower<'a> {
                     *slot = self.s.m.bin(c, Bin::SDiv, *slot, n);
                 }
             }
+            // A host without implicit derivatives in this program (see
+            // `set_compute_samples_at_levels`): explicit levels instead.
+            let at_levels = self.x.native.stage == HwStage::Cs
+                && super::compute_samples_at_levels()
+                && self.s.threads.is_some_and(|[_, y, z]| y > 1 || z > 1);
+            if op == 81 && at_levels {
+                let Operand::Vector { reg, .. } = *data else {
+                    return Err("an image result");
+                };
+                let zero = self.s.m.i32(0);
+                for (k, _) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), zero, guard);
+                }
+                return Ok(());
+            }
             if op == 81 {
                 // The clamped then the unclamped level of detail.
                 let Operand::Vector { reg, .. } = *data else {
@@ -7533,9 +7548,36 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(clamp_val);
-                    self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    if at_levels {
+                        let lod = if has_clamp { clamp_val } else { self.s.m.f32(0) };
+                        args.push(lod);
+                        self.s.op(
+                            c,
+                            "sampleLevel.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            62,
+                            &args,
+                        )
+                    } else {
+                        args.push(clamp_val);
+                        self.s
+                            .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    }
+                }
+                61 if at_levels => {
+                    let bias = addr_dword(self, usize::from(offset_word))?;
+                    let bias = self.as_float(bias);
+                    args.extend(&os);
+                    args.push(bias);
+                    self.s.op(
+                        c,
+                        "sampleLevel.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        62,
+                        &args,
+                    )
                 }
                 61 => {
                     let bias = addr_dword(self, usize::from(offset_word))?;
@@ -7576,14 +7618,14 @@ impl<'a> Lower<'a> {
                     let reference = self.as_float(reference);
                     args.extend(&os);
                     args.push(reference);
-                    let name = if op == 64 {
+                    let (name, code) = if op == 64 && !at_levels {
                         args.push(clamp_val);
-                        "sampleCmp.f32"
+                        ("sampleCmp.f32", 64)
                     } else {
-                        "sampleCmpLevelZero.f32"
+                        ("sampleCmpLevelZero.f32", 65)
                     };
                     self.s
-                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, code, &args)
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
