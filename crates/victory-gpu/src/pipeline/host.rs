@@ -258,6 +258,7 @@ pub(crate) struct Stage {
     pub(crate) root_srvs: Vec<(u8, u32)>,
     /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
     pub(crate) stride_table: Option<u32>,
+    pub(crate) root_uavs: Vec<(u8, u32)>,
 }
 
 impl Stage {
@@ -296,6 +297,10 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
+    pub(crate) fn has_root_uavs(&self) -> bool {
+        self.stages.iter().any(|s| !s.root_uavs.is_empty())
+    }
+
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
@@ -342,6 +347,7 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        let mut root_views: Vec<((i32, u8), u32)> = Vec::new();
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
@@ -350,6 +356,7 @@ impl HostPipeline {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 stride_table: None,
+                root_uavs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -377,20 +384,18 @@ impl HostPipeline {
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
                 ),
+                (
+                    &t.root_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.root_uavs,
+                ),
             ] {
                 for &slot in slots {
-                    out.push((slot, params.len() as u32));
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
-                        },
-                        ShaderVisibility: visibility,
-                    });
+                    let param =
+                        push_root_view(&mut params, &mut root_views, kind, slot, visibility);
+                    if !out.contains(&(slot, param)) {
+                        out.push((slot, param));
+                    }
                 }
             }
             if t.stride_table {
@@ -674,6 +679,38 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     // SAFETY: a translation's own bytes, alive while its shader is.
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }
         .to_vec()
+}
+
+/// Adds or reuses a root view parameter for `(kind, slot)`, widening its
+/// visibility to `ALL` when shared across multiple shader stages so shared
+/// root descriptors do not consume extra root signature dwords.
+fn push_root_view(
+    params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+    seen: &mut Vec<((i32, u8), u32)>,
+    kind: D3D12_ROOT_PARAMETER_TYPE,
+    slot: u8,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> u32 {
+    if let Some(&(_, existing)) = seen.iter().find(|&&(k, _)| k == (kind.0, slot)) {
+        if params[existing as usize].ShaderVisibility != visibility {
+            params[existing as usize].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+        return existing;
+    }
+    let index = params.len() as u32;
+    seen.push(((kind.0, slot), index));
+    params.push(D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: u32::from(slot),
+                RegisterSpace: ROOT_CBV_SPACE,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: visibility,
+    });
+    index
 }
 
 fn root_signature(
