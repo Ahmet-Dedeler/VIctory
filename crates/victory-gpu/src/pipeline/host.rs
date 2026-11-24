@@ -686,6 +686,14 @@ impl HostPipeline {
             if std::env::var_os("VICTORY_RECTS_UNTESTED").is_some() {
                 desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
             }
+            // Diagnostics: one colour instead of the pixel shader's.
+            #[cfg(feature = "diagnostics")]
+            if let Some(ps) = crate::rects::flat_pixel_shader() {
+                desc.PS = D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps.as_ptr().cast(),
+                    BytecodeLength: ps.len(),
+                };
+            }
             // SAFETY: the description points at live data.
             match unsafe { host.device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) } {
                 Ok(pso) => {

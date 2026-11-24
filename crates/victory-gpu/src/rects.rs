@@ -193,6 +193,27 @@ pub(crate) fn geometry_shader(vs: &[u8]) -> Option<Arc<[u8]>> {
     bytes
 }
 
+/// Diagnostics (`VICTORY_RECTS_FLAT`): a pixel shader that writes one
+/// colour, for rectangle variants, to see what such draws cover whatever
+/// their own pixel shader computes.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn flat_pixel_shader() -> Option<&'static [u8]> {
+    static MADE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        std::env::var_os("VICTORY_RECTS_FLAT")?;
+        let source = "float4 main() : SV_Target { return float4(1.0, 0.5, 0.25, 1.0); }\n";
+        let mut bytes = crate::indirect::dxc_compile_as(source, windows::core::w!("ps_6_0"))
+            .inspect_err(|e| tracing::warn!(error = %e, "no flat pixel shader"))
+            .ok()?;
+        if bytes.len() > 20 && bytes[4..20].iter().all(|&b| b == 0) {
+            victory_shader::emit::sign(&mut bytes);
+        }
+        tracing::info!(bytes = bytes.len(), "VICTORY_RECTS_FLAT: rectangle variants write one colour");
+        Some(bytes)
+    })
+    .as_deref()
+}
+
 /// The source for a vertex shader that outputs a position alone, for
 /// making its precompiled file (`cargo test -p victory-gpu position_only_source -- --nocapture`).
 #[cfg(test)]
