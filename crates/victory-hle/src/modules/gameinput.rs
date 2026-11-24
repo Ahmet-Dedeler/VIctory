@@ -1478,7 +1478,7 @@ mod host {
         });
         if now.duration_since(w.read) >= Duration::from_millis(50) {
             w.read = now;
-            let text = std::fs::read_to_string(file).unwrap_or_default();
+            let text = victory_core::files::read_to_string(file).unwrap_or_default();
             if let Some((number, name)) = text.trim().split_once(':')
                 && let (Ok(number), Some(vk)) = (number.trim().parse::<u64>(), key(name))
                 && number > w.last
