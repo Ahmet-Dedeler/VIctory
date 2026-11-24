@@ -783,6 +783,13 @@ pub fn run_parallel<'a>(jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
 /// Threads kept for [`Layout::detile_parallel`]: starting threads for every
 /// texture costs more than the detiling where threads are dear (under Wine
 /// and a CPU translator, about a millisecond each).
+///
+/// A batch of jobs is one shared list. Every worker has its own channel
+/// and is told of the batch at once; the caller takes jobs from the list
+/// too, so a batch is never slower than the caller doing it alone, and a
+/// worker that wakes late finds what is left. (One shared channel woke the
+/// workers one after another, each a few hundred microseconds under Wine:
+/// eight sub-millisecond jobs then ran no faster than one thread.)
 mod pool {
     use std::sync::mpsc::{Sender, channel};
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -792,78 +799,86 @@ mod pool {
     /// Workers in the pool; the caller of [`run`] works too.
     const WORKERS: usize = 7;
 
-    fn queue() -> &'static Mutex<Sender<Job>> {
-        static QUEUE: OnceLock<Mutex<Sender<Job>>> = OnceLock::new();
-        QUEUE.get_or_init(|| {
-            let (sender, receiver) = channel::<Job>();
-            let receiver = Arc::new(Mutex::new(receiver));
-            for i in 0..WORKERS {
-                let receiver = receiver.clone();
-                let _ = std::thread::Builder::new()
-                    .name(format!("victory-detile {i}"))
-                    .spawn(move || {
-                        loop {
-                            let job = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                            match job {
-                                Ok(job) => job(),
-                                Err(_) => return,
-                            }
-                        }
-                    });
+    /// The jobs not yet taken, and how many are not yet done.
+    struct Batch {
+        jobs: Mutex<Vec<Job>>,
+        left: Mutex<usize>,
+        done: Condvar,
+    }
+
+    impl Batch {
+        /// Takes and runs jobs until none is left to take.
+        fn work(&self) {
+            loop {
+                let job = self.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop();
+                let Some(job) = job else { return };
+                // The count goes down also when the job panics, which must
+                // not take a worker (or the caller's wait) with it.
+                struct Done<'a>(&'a Batch);
+                impl Drop for Done<'_> {
+                    fn drop(&mut self) {
+                        *self.0.left.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+                        self.0.done.notify_all();
+                    }
+                }
+                let _done = Done(self);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
             }
-            Mutex::new(sender)
+        }
+    }
+
+    fn workers() -> &'static [Mutex<Sender<Arc<Batch>>>] {
+        static WORKERS_: OnceLock<Vec<Mutex<Sender<Arc<Batch>>>>> = OnceLock::new();
+        WORKERS_.get_or_init(|| {
+            (0..WORKERS)
+                .filter_map(|i| {
+                    let (sender, receiver) = channel::<Arc<Batch>>();
+                    std::thread::Builder::new()
+                        .name(format!("victory-detile {i}"))
+                        .spawn(move || {
+                            while let Ok(batch) = receiver.recv() {
+                                batch.work();
+                            }
+                        })
+                        .ok()
+                        .map(|_| Mutex::new(sender))
+                })
+                .collect()
         })
     }
 
-    /// Counts jobs still running; a job leaves by dropping its guard, also
-    /// when it panics.
-    struct Running(Mutex<usize>, Condvar);
-
-    struct Leave(Arc<Running>);
-
-    impl Drop for Leave {
-        fn drop(&mut self) {
-            *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
-            self.0.1.notify_all();
+    /// Runs every job, on the calling thread and the pool, and returns
+    /// when all are done.
+    pub(super) fn run<'a>(jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
+        let n = jobs.len();
+        if n == 0 {
+            return;
         }
-    }
-
-    /// Runs every job, the last on the calling thread and the others on
-    /// the pool, and returns when all are done.
-    pub(super) fn run<'a>(mut jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
-        let Some(mine) = jobs.pop() else { return };
-        let running = Arc::new(Running(Mutex::new(jobs.len()), Condvar::new()));
-        for job in jobs {
-            let leave = Leave(running.clone());
-            // SAFETY: only the lifetime changes. What the job borrows
-            // outlives it: this function returns only once every job has
-            // run or been dropped (each drops its `Leave` either way), as
-            // the wait below sees.
-            let job: Job = unsafe {
-                std::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Job>(Box::new(move || {
-                    let _leave = leave;
-                    // A panicking job must not take the worker with it.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-                }))
-            };
-            let sent = queue().lock().unwrap_or_else(|e| e.into_inner()).send(job);
-            if let Err(unsent) = sent {
-                // No workers (they could not be started): run it here.
-                (unsent.0)();
-            }
+        // SAFETY: only the lifetime changes. What the jobs borrow outlives
+        // them: this function returns only once every job has run (the
+        // wait below, also when a job of ours panics), and a job no thread
+        // has taken is still in the list, which is emptied before that.
+        let jobs: Vec<Job> = jobs
+            .into_iter()
+            .rev()
+            .map(|job| unsafe {
+                std::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Job>(job)
+            })
+            .collect();
+        let batch = Arc::new(Batch {
+            jobs: Mutex::new(jobs),
+            left: Mutex::new(n),
+            done: Condvar::new(),
+        });
+        // One helper a job beyond the caller's own.
+        for worker in workers().iter().take(n - 1) {
+            let _ = worker.lock().unwrap_or_else(|e| e.into_inner()).send(batch.clone());
         }
-        // Waits for the others even if our own job panics.
-        struct Wait(Arc<Running>);
-        impl Drop for Wait {
-            fn drop(&mut self) {
-                let mut left = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
-                while *left > 0 {
-                    left = self.0.1.wait(left).unwrap_or_else(|e| e.into_inner());
-                }
-            }
+        batch.work();
+        let mut left = batch.left.lock().unwrap_or_else(|e| e.into_inner());
+        while *left > 0 {
+            left = batch.done.wait(left).unwrap_or_else(|e| e.into_inner());
         }
-        let _wait = Wait(running);
-        mine();
     }
 }
 
@@ -1122,6 +1137,51 @@ mod tests {
 
     /// Bands of rows detiled on several threads give what one thread gives,
     /// with padded rows and a last row that ends short of its pitch.
+    #[test]
+    fn a_batch_runs_every_job_once_and_waits_for_all() {
+        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+        for n in [0usize, 1, 2, 7, 8, 9, 40] {
+            let ran: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+            let total = AtomicUsize::new(0);
+            for _ in 0..50 {
+                let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = (0..n)
+                    .map(|i| {
+                        let (ran, total) = (&ran, &total);
+                        Box::new(move || {
+                            ran[i].fetch_add(1, Ordering::Relaxed);
+                            total.fetch_add(1, Ordering::Relaxed);
+                        }) as Box<dyn FnOnce() + Send + '_>
+                    })
+                    .collect();
+                run_parallel(jobs);
+            }
+            assert_eq!(total.load(Ordering::Relaxed), 50 * n);
+            assert!(ran.iter().all(|r| r.load(Ordering::Relaxed) == 50));
+        }
+        // Batches from several threads at once; a panicking job is counted
+        // done and takes nobody with it.
+        let total = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for round in 0..40 {
+                        let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = (0..8)
+                            .map(|i| {
+                                let total = &total;
+                                Box::new(move || {
+                                    total.fetch_add(1, Ordering::Relaxed);
+                                    assert!(!(round == 3 && i == 5), "a job that panics");
+                                }) as Box<dyn FnOnce() + Send + '_>
+                            })
+                            .collect();
+                        run_parallel(jobs);
+                    }
+                });
+            }
+        });
+        assert_eq!(total.load(Ordering::Relaxed), 4 * 40 * 8);
+    }
+
     #[test]
     fn parallel_detile_matches() {
         for d in [
