@@ -44,6 +44,11 @@ static BUSY_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 const BUSY: u64 = 300;
 static OPS_THIS_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The first busy frame (0: none yet).
+pub(crate) fn first_busy() -> u64 {
+    BUSY_FRAME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// At a present: notes the frame as the first busy one if it is.
 pub(crate) fn busy_frame(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
