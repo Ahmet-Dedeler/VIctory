@@ -17,16 +17,72 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
-/// too, and their draws traced at debug level.
+/// too, and their draws traced at debug level. `w<k>` lists the k-th frame
+/// after the first busy one (see [`busy_frame`]): a title's frame numbers
+/// on reaching its world differ from run to run.
 pub(crate) fn listed(n: u64) -> bool {
-    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
+    /// Frame numbers, and offsets from the first busy frame.
+    static LIST: std::sync::OnceLock<(Vec<u64>, Vec<u64>)> = std::sync::OnceLock::new();
+    let (frames, after_busy) = LIST.get_or_init(|| {
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
-        list.split(',')
-            .filter_map(|f| f.trim().parse().ok())
-            .collect()
-    })
-    .contains(&n)
+        let entries = || list.split(',').map(str::trim);
+        (
+            entries().filter_map(|f| f.parse().ok()).collect(),
+            entries()
+                .filter_map(|f| f.strip_prefix('w')?.parse().ok())
+                .collect(),
+        )
+    });
+    let first = BUSY_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+    frames.contains(&n) || first != 0 && n > first && after_busy.contains(&(n - first))
+}
+
+/// The first frame with [`BUSY`] draws and dispatches or more (0: none
+/// yet), which is where a title's world begins; menus and loading screens
+/// record a few dozen.
+static BUSY_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const BUSY: u64 = 300;
+static OPS_THIS_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// At a present: notes the frame as the first busy one if it is.
+pub(crate) fn busy_frame(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let ops = OPS_THIS_FRAME.swap(0, Relaxed);
+    if ops >= BUSY && BUSY_FRAME.compare_exchange(0, frame, Relaxed, Relaxed).is_ok() {
+        tracing::info!(frame, ops, "first busy frame; frames listed as w<k> count from here");
+    }
+}
+
+/// With `VICTORY_DUMP_TARGETS` set: the draws and dispatches the title
+/// records for the frames listed in `VICTORY_CAPTURE_FRAMES`, one line each
+/// in recording order (what it runs, whether it reached the host, the
+/// targets it draws to, the textures it reads and the resources it
+/// writes), saved at that frame's present as `frame-<n>-ops.txt` beside the
+/// targets' pictures: the two together say which pass left a target empty.
+static OPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Counts a draw or dispatch of the frame being built and, in a listed
+/// frame, notes its line.
+pub(crate) fn note_frame_op(line: impl FnOnce() -> String) {
+    OPS_THIS_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !dump_on() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    let line = line();
+    OPS.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+}
+
+/// At the present of frame `frame`: saves the noted draws and dispatches.
+pub(crate) fn save_frame_ops(frame: u64) {
+    let ops = std::mem::take(&mut *OPS.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(folder) = folder() else { return };
+    if ops.is_empty() {
+        return;
+    }
+    let path = folder.join(format!("frame-{frame}-ops.txt"));
+    if let Err(e) = std::fs::write(&path, ops.join("\n") + "\n") {
+        tracing::warn!(error = %e, path = %path.display(), "frame operations not saved");
+    }
 }
 
 /// Whether frame `n` is saved.
@@ -176,6 +232,30 @@ pub(crate) fn save_read_back(
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 ) {
     let f = footprint.Footprint;
+    if f.Format == DXGI_FORMAT_R10G10B10A2_UNORM {
+        // A 10-bit frame (HDR presentation): the top 8 bits of each
+        // channel, as encoded (not tone mapped).
+        let mut data = std::ptr::null_mut();
+        // SAFETY: as below.
+        unsafe {
+            if buffer.Map(0, None, Some(&mut data)).is_err() {
+                return;
+            }
+            let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
+            let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * h);
+            let mut rgba = Vec::with_capacity(w * h * 4);
+            for y in 0..h {
+                for x in 0..w {
+                    let at = y * pitch + 4 * x;
+                    let v = u32::from_le_bytes([rows[at], rows[at + 1], rows[at + 2], rows[at + 3]]);
+                    rgba.extend([(v >> 2) as u8, (v >> 12) as u8, (v >> 22) as u8, 255]);
+                }
+            }
+            save(frame, f.Width, f.Height, w * 4, false, &rgba);
+            buffer.Unmap(0, None);
+        }
+        return;
+    }
     let bgra = match f.Format {
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
         DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
@@ -281,12 +361,25 @@ fn dump_one(
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        // Ahead of the line `to_rgba` logs with the target's values.
+        tracing::info!(frame, i, ?resource, width = d.Width, height = d.Height, format = d.Format.0, "target dumped");
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+                "frame-{frame}-{i:03}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            // Every `step`-th pixel of a large target: a world frame has
+            // a hundred of them, 33 MB each at 3840x2160.
+            let (w, h) = (f.Width as usize, f.Height as usize);
+            let step = w.div_ceil(1280).max(1);
+            let (sw, sh) = (w.div_ceil(step), h.div_ceil(step));
+            let mut small = Vec::with_capacity(sw * sh * 4);
+            for y in (0..h).step_by(step) {
+                for x in (0..w).step_by(step) {
+                    small.extend_from_slice(&rgba[(y * w + x) * 4..][..4]);
+                }
+            }
+            save_as(&name, sw as u32, sh as u32, sw * 4, false, &small);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
@@ -384,7 +477,17 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         (0.0, finite.fold(0.0f32, f32::max))
     };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high, "target values");
+    // How much of the target holds anything: a pass that left it cleared
+    // shows as one value everywhere.
+    let first = values.first().copied().unwrap_or([0.0; 3]);
+    let other = values.iter().filter(|v| **v != first).count();
+    tracing::info!(
+        format,
+        low,
+        high,
+        differing = other as f64 / values.len().max(1) as f64,
+        "target values"
+    );
     for v in values {
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);

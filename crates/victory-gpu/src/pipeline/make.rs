@@ -105,6 +105,12 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// The pipeline's shaders, as logged (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn shaders(p: &Pending) -> String {
+    format!("{:?}", p.shaders)
+}
+
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 

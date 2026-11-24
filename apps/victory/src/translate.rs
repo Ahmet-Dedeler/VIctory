@@ -318,8 +318,15 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
-    let example = || format!("{}{}", path.display(), source.label());
-    let Some(bytes) = source.bytes() else {
+    // With the container's hash as a run logs it (`#<16 hex digits>`), so a
+    // list names the shaders of a run's log.
+    let bytes = source.bytes();
+    let hash = bytes
+        .as_ref()
+        .map(|b| blake3::hash(b).to_hex()[..16].to_owned())
+        .unwrap_or_default();
+    let example = || format!("{}{} #{hash}", path.display(), source.label());
+    let Some(bytes) = bytes else {
         return t.fail("corrupt record".into(), example);
     };
     t.containers += 1;
@@ -434,6 +441,9 @@ fn check(
 ) {
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
+    }
+    if t.list {
+        t.lines.push(format!("{}  emitted", label()));
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list

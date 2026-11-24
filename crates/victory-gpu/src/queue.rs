@@ -282,8 +282,12 @@ extern "system" fn present(
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
-    if crate::capture::listed(frame) {
-        crate::capture::dump_targets(frame);
+    {
+        if crate::capture::listed(frame) {
+            crate::capture::save_frame_ops(frame);
+            crate::capture::dump_targets(frame);
+        }
+        crate::capture::busy_frame(frame);
     }
     #[cfg(windows)]
     if planes > 0

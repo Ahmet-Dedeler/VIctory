@@ -792,6 +792,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            self.account(format_args!("dispatch {x}x{y}x{z}"), true, false);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -801,7 +802,10 @@ impl State {
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            {
+                crate::pipeline::note_drop(self.pipeline as This);
+                self.account(format_args!("dispatch {x}x{y}x{z}"), true, false);
+            }
             return;
         };
         if !p.compute {
@@ -810,8 +814,12 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            self.account(format_args!("dispatch {x}x{y}x{z} (bind failed)"), true, false);
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        self.account(format_args!("dispatch {x}x{y}x{z}"), true, true);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -886,12 +894,71 @@ impl State {
                 }
                 Err(_) => false,
             };
+        #[cfg(feature = "diagnostics")]
+        self.account(format_args!("mesh {x}"), false, ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             list.missed_draw();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// Diagnostics: the line of a draw or dispatch in the account of a
+    /// listed frame (see [`crate::capture::note_frame_op`]): what it runs,
+    /// whether it reached the host, the targets it draws to, the textures
+    /// its shaders read and the resources they write (title objects by
+    /// address, as the target dumps name them).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn account(&self, kind: std::fmt::Arguments<'_>, compute: bool, ran: bool) {
+        crate::capture::note_frame_op(|| {
+            use std::fmt::Write;
+            let mut text = format!(
+                "{kind} {} {}",
+                if ran { "ran" } else { "DROPPED" },
+                crate::pipeline::describe(self.pipeline as This)
+            );
+            if !compute {
+                let _ = write!(
+                    text,
+                    " | targets {:x?} depth {:#x} topology {}",
+                    self.targets, self.depth, self.topology
+                );
+            }
+            let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+                return text;
+            };
+            let (mut reads, mut writes): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+            for stage in &p.stages {
+                for u in &stage.translated().used {
+                    if !matches!(u.kind, ResourceType::Srv | ResourceType::Uav) {
+                        continue;
+                    }
+                    let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                    else {
+                        continue;
+                    };
+                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    let (list, what) = match crate::descriptor::view(handle) {
+                        Some(View::Shader(r, _)) => match crate::resource::host_resource(r as This) {
+                            Some(_) => (&mut reads, format!("{r:#x}")),
+                            None => continue,
+                        },
+                        Some(View::Unordered(r, ..)) => (&mut writes, format!("{r:#x}")),
+                        Some(View::Placed(true, ..)) => (&mut writes, "placed".to_owned()),
+                        Some(View::Placed(false, ..)) => (&mut reads, "placed".to_owned()),
+                        None if u.kind == ResourceType::Uav => (&mut writes, "unset".to_owned()),
+                        None => (&mut reads, "unset".to_owned()),
+                        _ => continue,
+                    };
+                    if !list.contains(&what) {
+                        list.push(what);
+                    }
+                }
+            }
+            let _ = write!(text, " | reads {reads:?} | writes {writes:?}");
+            text
+        });
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -1150,6 +1217,8 @@ impl State {
             }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        self.account(format_args!("draw {vertices}x{instances}"), false, ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             list.missed_draw();
@@ -1243,6 +1312,8 @@ impl State {
             }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        self.account(format_args!("indexed {indices}x{instances}"), false, ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             list.missed_draw();
@@ -1253,13 +1324,32 @@ impl State {
 }
 
 impl State {
+    /// [`State::execute_indirect_on`], with its line in the account of a
+    /// listed frame (diagnostics).
+    pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        let ran = self.execute_indirect_on(list, (kind, stride, max), arguments, count);
+        #[cfg(feature = "diagnostics")]
+        self.account(
+            format_args!("indirect kind {kind} max {max} counted {}", count.is_some()),
+            kind == 2,
+            ran,
+        );
+        ran
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
-    pub(crate) fn execute_indirect(
+    fn execute_indirect_on(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
@@ -1340,6 +1430,11 @@ impl State {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
+                // Told apart from the rest: rectangles are what post
+                // processing and UI draw.
+                Some(_) if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES => {
+                    why("a rectangle list, which indirect execution does not draw")
+                }
                 Some(p) => why(&format!(
                     "prepare failed (compute {}, mesh {})",
                     p.compute, p.mesh

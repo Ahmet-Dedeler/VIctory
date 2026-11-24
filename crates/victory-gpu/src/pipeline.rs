@@ -307,6 +307,21 @@ pub(crate) fn note_drop(this: This) {
     }
 }
 
+/// Diagnostics: a title pipeline in a few words, for the account of a
+/// frame's draws: its shaders, then why it has no host pipeline if it has
+/// none (shaders that do not translate, refused, being made).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn describe(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline".into();
+    }
+    let p = pipeline(this);
+    match make::missing(&p.host) {
+        Some(why) => format!("{} NO-HOST-PIPELINE: {why}", make::shaders(&p.host)),
+        None => make::shaders(&p.host),
+    }
+}
+
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
