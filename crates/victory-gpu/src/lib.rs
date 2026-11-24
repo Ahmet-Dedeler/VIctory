@@ -33,6 +33,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod rects;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod probe;
 pub mod list;
 pub mod object;
 pub mod pipeline;

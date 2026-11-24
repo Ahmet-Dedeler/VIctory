@@ -283,6 +283,9 @@ extern "system" fn present(
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
+        if frame == 30 {
+            crate::probe::indirect();
+        }
         if crate::capture::listed(frame) {
             crate::capture::save_frame_ops(frame);
             crate::capture::dump_targets(frame);
