@@ -228,8 +228,16 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 
 /// A format as the host has it. The console's 16-bit depth with stencil
 /// (and its typeless views) has no PC format: the 24-bit ones stand in.
+/// Nor have its 10-bit float colors (7e3 and 6e4 with 2-bit alpha): half
+/// floats hold them. (A host must never be handed a console-only number:
+/// Windows refuses it, Apple's D3DMetal aborts the process.)
+///
+/// shortcut: only right for textures the host GPU fills (render targets);
+/// contents the title writes in a 10-bit float format would need
+/// converting on upload.
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
+        116 | 117 => 10,
         118 => 45,
         119 => 46,
         120 => 47,

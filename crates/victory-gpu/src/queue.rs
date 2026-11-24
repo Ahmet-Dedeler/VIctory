@@ -123,6 +123,8 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
+        #[cfg(feature = "diagnostics")]
+        let _span = crate::copystat::span(crate::copystat::T::Execute);
         host.execute(&host_lists);
         return;
     }
@@ -248,6 +250,8 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let _span = crate::copystat::span(crate::copystat::T::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
