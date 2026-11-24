@@ -1694,11 +1694,63 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        // A background run does not read the real keyboard; the caption says
-        // so, or the window passes for one somebody can play in.
+        // Which build, from which folder, read by whom, how fast, how big,
+        // for how long: several builds and runs sit side by side on one
+        // machine, and the caption is all that tells their windows apart.
+        static IDENTITY: std::sync::OnceLock<(String, std::time::Instant)> =
+            std::sync::OnceLock::new();
+        let (identity, start) = IDENTITY.get_or_init(|| {
+            let folder = std::env::current_exe()
+                .ok()
+                .and_then(|exe| Some(exe.parent()?.file_name()?.to_string_lossy().into_owned()))
+                .unwrap_or_default();
+            // A background run does not read the real keyboard; the caption
+            // says so, or the window passes for one somebody can play in.
+            let keys = if crate::background() {
+                "keyboard off"
+            } else {
+                "keyboard on"
+            };
+            (
+                format!("VIctory {} | {folder}, {keys}", env!("VICTORY_BUILD")),
+                std::time::Instant::now(),
+            )
+        });
+        let frame = if ms >= 1000.0 {
+            format!("{:.1} s/frame", ms / 1000.0)
+        } else {
+            format!("{fps:.0} fps {ms:.1} ms/frame")
+        };
+        let memory = {
+            use windows_sys::Win32::System::ProcessStatus::{
+                K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+            };
+            let mut counters = PROCESS_MEMORY_COUNTERS {
+                cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: counters of that size; the pseudo handle of this process.
+            let ok = unsafe {
+                K32GetProcessMemoryInfo(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    &mut counters,
+                    counters.cb,
+                )
+            };
+            if ok != 0 && counters.WorkingSetSize != 0 {
+                format!(" | {:.1} GB", counters.WorkingSetSize as f64 / (1u64 << 30) as f64)
+            } else {
+                String::new()
+            }
+        };
+        let up = start.elapsed().as_secs();
+        let text = format!(
+            " | {identity} | {frame} | {draws:.0} draws{memory} | up {}:{:02}",
+            up / 60,
+            up % 60
+        );
         let label = if crate::background() {
-            "[background test run, keyboard off] "
+            "[background test run] "
         } else {
             ""
         };
