@@ -93,7 +93,9 @@ pub(crate) fn retire(resource: ID3D12Resource) {
 /// Takes retired resources old enough to drop once the current submission
 /// finishes on the GPU.
 fn take_retired() -> Vec<Retired> {
-    const KEEP_FRAMES: u64 = 4;
+    // LOCAL EXPERIMENT (Claude, v13): 4 -> 120, i.e. keep retired host resources for the whole run, to test the
+    // use-after-free theory for the world GPU faults (#59).
+    const KEEP_FRAMES: u64 = 120;
     let now = crate::queue::presented();
     let mut guard = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
     let mut ready = Vec::new();
