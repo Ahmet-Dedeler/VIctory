@@ -123,10 +123,41 @@ impl Shader {
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
+                #[cfg(feature = "diagnostics")]
+                dump(self, done.as_ref().ok());
                 done.ok()
             })
             .as_ref()
     }
+}
+
+/// Diagnostics: `VICTORY_DUMP_HASHES=<hash>,...` with `VICTORY_DUMP_DIR=<dir>`
+/// writes each listed shader's console container (`<hash>.container`), its
+/// translation (`<hash>.dxil`) and the resources it uses (`<hash>.used.txt`)
+/// into `dir`, for offline comparison. Game-derived output: refused inside a
+/// source tree (asset policy), and never to be published.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump(shader: &Shader, done: Option<&Translated>) {
+    let (Ok(list), Ok(dir)) = (std::env::var("VICTORY_DUMP_HASHES"), std::env::var("VICTORY_DUMP_DIR")) else {
+        return;
+    };
+    if !list.split(',').any(|h| h.trim().eq_ignore_ascii_case(&shader.hash)) {
+        return;
+    }
+    let dir = std::path::PathBuf::from(dir);
+    if dir.ancestors().any(|a| a.join(".victory-root").exists()) {
+        tracing::warn!(dir = %dir.display(), "shader dump refused: inside a source tree");
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let base = dir.join(&shader.hash);
+    let mut wrote = std::fs::write(base.with_extension("container"), &shader.container).is_ok();
+    if let Some(t) = done {
+        wrote &= std::fs::write(base.with_extension("dxil"), &t.host.dxil).is_ok();
+        let used: String = t.used.iter().map(|u| format!("{u:?}\n")).collect();
+        wrote &= std::fs::write(base.with_extension("used.txt"), used).is_ok();
+    }
+    tracing::info!(hash = %shader.hash, stage = shader.stage, wrote, "shader dumped");
 }
 
 #[cfg(windows)]
