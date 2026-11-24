@@ -382,7 +382,7 @@ impl Host {
         /// When a submission still running is first reported.
         const STILL_RUNNING: u32 = 5_000;
         /// When it is given up.
-        const HUNG: u32 = 20_000;
+        const HUNG: u32 = 12_000;
         // SAFETY: our event, set when the fence reaches the submission.
         if unsafe { WaitForSingleObject(self.event, STILL_RUNNING) }.0 != WAIT_TIMEOUT {
             return;

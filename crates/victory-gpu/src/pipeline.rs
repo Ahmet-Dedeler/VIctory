@@ -107,9 +107,10 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                // Debugging aid: `VICTORY_SKIP_SHADERS=<hash>,...` drops
-                // the draws and dispatches of pipelines with those shaders
-                // (to find the one a host GPU never finishes).
+                // Debugging aid: `VICTORY_SKIP_SHADERS=<hash or stage>,...`
+                // drops the draws and dispatches of pipelines with those
+                // shaders, or with any shader of a stage (`mesh`), to find
+                // the one a host GPU never finishes.
                 #[cfg(feature = "diagnostics")]
                 {
                     static SKIP: OnceLock<Vec<String>> = OnceLock::new();
@@ -118,7 +119,10 @@ impl Shader {
                         list.split(',').map(|h| h.trim().to_owned()).collect()
                     });
                     let hash = self.hash.to_string();
-                    if skip.iter().any(|h| !h.is_empty() && hash.starts_with(h.as_str())) {
+                    if skip
+                        .iter()
+                        .any(|h| !h.is_empty() && (hash.starts_with(h.as_str()) || h == self.stage))
+                    {
                         tracing::warn!(stage = self.stage, %hash, "shader skipped (VICTORY_SKIP_SHADERS); its pipelines' draws are dropped");
                         return None;
                     }
