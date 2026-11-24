@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -1022,6 +1022,23 @@ fn timing() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
 
+/// The system Wine runs on ("Darwin", "Linux"), if we run under Wine: its
+/// ntdll says so.
+fn wine_host() -> Option<String> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    type HostVersion = unsafe extern "C" fn(*mut *const std::ffi::c_char, *mut *const std::ffi::c_char);
+    // SAFETY: NUL-terminated names; ntdll is always loaded; Wine's export
+    // takes two out pointers and hands back static strings.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        let export = GetProcAddress(ntdll, c"wine_get_host_version".as_ptr().cast())?;
+        let host_version: HostVersion = std::mem::transmute(export);
+        let (mut system, mut release) = (std::ptr::null(), std::ptr::null());
+        host_version(&mut system, &mut release);
+        (!system.is_null()).then(|| std::ffi::CStr::from_ptr(system).to_string_lossy().into_owned())
+    }
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
@@ -1130,6 +1147,23 @@ impl Host {
         self.caps.resource_binding_tier()
     }
 
+    /// The most bytes a mesh shader's outputs may take on this host, if it
+    /// has a limit of its own. Apple's GPUs take 32,768 as
+    /// [`crate::pipeline::host::metal_mesh_bytes`] counts them: D3DMetal
+    /// creates the pipeline all the same (no error reaches us), draws
+    /// nothing with it, and a submission that dispatches with it never
+    /// finishes. Its adapter calls itself "AMD Compatibility Mode", so the
+    /// host is known by Wine saying it runs on Darwin.
+    pub(crate) fn mesh_output_limit(&self) -> Option<u32> {
+        static LIMIT: OnceLock<Option<u32>> = OnceLock::new();
+        *LIMIT.get_or_init(|| {
+            let system = wine_host();
+            let limit = (system.as_deref() == Some("Darwin")).then_some(32_768);
+            tracing::info!(wine_host = ?system, ?limit, "mesh output limit of the host");
+            limit
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -1169,6 +1203,43 @@ impl Host {
                 stamps: OnceLock::new(),
             })
         }
+    }
+
+    /// Waits for the submission just signalled on the fence. A host that
+    /// neither finishes nor removes the device (Apple's D3DMetal with work
+    /// its GPU never completes; Windows resets the driver after 2 s) is
+    /// reported after [`STILL_RUNNING`] and fails the run after [`HUNG`]:
+    /// the console has no such state, and the title would only wait.
+    fn wait(&self, runs: &[&HostList]) {
+        const WAIT_TIMEOUT: u32 = 258;
+        /// When a submission still running is first reported.
+        const STILL_RUNNING: u32 = 5_000;
+        /// When it is given up.
+        const HUNG: u32 = 12_000;
+        // SAFETY: our event, set when the fence reaches the submission.
+        if unsafe { WaitForSingleObject(self.event, STILL_RUNNING) }.0 != WAIT_TIMEOUT {
+            return;
+        }
+        let pipelines: std::collections::BTreeSet<String> = runs
+            .iter()
+            .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .collect();
+        tracing::warn!(
+            lists = runs.len(),
+            ?pipelines,
+            "host submission still running after 5 s{}",
+            last_notes(runs)
+        );
+        // SAFETY: as above.
+        if unsafe { WaitForSingleObject(self.event, HUNG - STILL_RUNNING) }.0 != WAIT_TIMEOUT {
+            return;
+        }
+        fail(format_args!(
+            "the host GPU did not finish a submission of {} lists in {} s; its pipelines: {pipelines:?}{}",
+            runs.len(),
+            HUNG / 1000,
+            last_notes(runs)
+        ));
     }
 
     /// Runs closed lists and waits for them.
@@ -1218,9 +1289,8 @@ impl Host {
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
+                    Ok(()) if groups.len() > 1 => self.wait(&runs[i..=i]),
+                    Ok(()) => self.wait(runs),
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
@@ -2213,7 +2283,7 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
-fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+pub(crate) fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -2787,12 +2857,14 @@ impl Host {
 /// commands each list of the failed submission noted (diagnostics, with
 /// `VICTORY_D3D12_DRED`).
 fn last_notes(runs: &[&HostList]) -> String {
+    // Of a lone list (`VICTORY_GPU_TIMING`), all it noted.
+    let last = if runs.len() == 1 { 256 } else { 6 };
     #[cfg(feature = "diagnostics")]
     {
         let mut text = String::new();
         for (i, r) in runs.iter().enumerate() {
             let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
-            for (n, _) in notes.iter().rev().take(6).rev() {
+            for (n, _) in notes.iter().rev().take(last).rev() {
                 text.push_str(&format!("; list {i} of {}, of its {}: {n}", runs.len(), notes.len()));
             }
         }
@@ -2800,7 +2872,7 @@ fn last_notes(runs: &[&HostList]) -> String {
     }
     #[cfg(not(feature = "diagnostics"))]
     {
-        let _ = runs;
+        let _ = (runs, last);
         String::new()
     }
 }
