@@ -164,6 +164,14 @@ fn load_dxc() -> windows::core::Result<windows::Win32::Foundation::HMODULE> {
 
 /// Compiles a compute shader with DXC (`dxcompiler.dll`).
 fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
+    dxc_compile_as(source, windows::core::w!("cs_6_0"))
+}
+
+/// Compiles `source`'s `main` for `profile` with DXC (`dxcompiler.dll`).
+pub(crate) fn dxc_compile_as(
+    source: &str,
+    profile: windows::core::PCWSTR,
+) -> windows::core::Result<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::Dxc::*;
     use windows::Win32::System::LibraryLoader::GetProcAddress;
     use windows::core::w;
@@ -188,7 +196,7 @@ fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
             Size: source.len(),
             Encoding: DXC_CP_UTF8.0,
         };
-        let arguments = [w!("-T"), w!("cs_6_0"), w!("-E"), w!("main"), w!("-O3")];
+        let arguments = [w!("-T"), profile, w!("-E"), w!("main"), w!("-O3")];
         let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
         let status = result.GetStatus()?;
         if status.is_err() {

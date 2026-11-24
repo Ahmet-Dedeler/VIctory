@@ -2621,6 +2621,18 @@ impl Meter {
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
+            {
+                let [aligned, unaligned, unset] = crate::draw::take_root_views();
+                if aligned + unaligned + unset > 0 {
+                    tracing::info!(
+                        aligned,
+                        unaligned,
+                        unset,
+                        "root views bound as tables since the last report: on 16 bytes of their host \
+                         copy, off them (null views unless VICTORY_ROOT_VIEW_ALIGN), unset or unmapped"
+                    );
+                }
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

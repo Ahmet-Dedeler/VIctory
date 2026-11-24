@@ -90,6 +90,32 @@ impl Drop for State {
     }
 }
 
+/// Root SRVs and UAVs bound as one-view tables since the last call: on 16
+/// bytes of their host copy, off them (a raw view must start on 16 bytes:
+/// such a view is bound as a null view and reads zeros), unset or outside
+/// title memory.
+static ROOT_VIEWS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+pub(crate) fn take_root_views() -> [u64; 3] {
+    [0, 1, 2].map(|i| ROOT_VIEWS[i].swap(0, Ordering::Relaxed))
+}
+
+/// The byte alignment a root view's start must have to be bound as a raw
+/// view: D3D12's 16. `VICTORY_ROOT_VIEW_ALIGN=4` tries the console's own 4
+/// on a host that may take it (a diagnostic: D3D12 does not allow it).
+fn root_view_alignment() -> u64 {
+    static ALIGN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ALIGN.get_or_init(|| {
+        match std::env::var("VICTORY_ROOT_VIEW_ALIGN").ok().and_then(|v| v.trim().parse().ok()) {
+            Some(n @ (4 | 8)) => {
+                tracing::warn!(bytes = n, "root views are bound as raw views off 16 bytes (VICTORY_ROOT_VIEW_ALIGN)");
+                n
+            }
+            _ => 16,
+        }
+    })
+}
+
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
@@ -740,7 +766,9 @@ impl State {
                         // SAFETY: a live buffer.
                         let base = unsafe { s.buffer.GetGPUVirtualAddress() };
                         let offset = s.gpu(*a) - base;
-                        if offset.is_multiple_of(16) {
+                        ROOT_VIEWS[usize::from(!offset.is_multiple_of(16))]
+                            .fetch_add(1, Ordering::Relaxed);
+                        if offset.is_multiple_of(root_view_alignment()) {
                             host.raw_at(index, &s.buffer, offset, s.left(*a), uav);
                         } else {
                             // A view from the aligned start would shift
@@ -754,6 +782,7 @@ impl State {
                         }
                     }
                     None => {
+                        ROOT_VIEWS[2].fetch_add(1, Ordering::Relaxed);
                         if let Some(a) = address {
                             once!(
                                 address = format_args!("{a:#x}"),
@@ -1207,10 +1236,18 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        // Rectangles made from the vertex id have nothing to expand: their
+        // pipeline's geometry-shader variant draws the fourth corner.
+        let by_id = rects
+            && crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects.is_some());
+        let ran = if by_id {
+            self.prepare_rects(list, false)
+        } else {
+            self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first))
+        };
         if ran {
             // Rectangles were expanded into their own vertex buffers.
-            let (count, from) = if rects {
+            let (count, from) = if rects && !by_id {
                 (vertices / 3 * 6, 0)
             } else {
                 (vertices, first)
@@ -1237,6 +1274,28 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// [`State::prepare`] for a rectangle list whose corners come from the
+    /// vertex id: the pipeline's variant with the geometry shader (see
+    /// `crate::rects`), the title's own vertex counts. False if the pipeline
+    /// has none.
+    fn prepare_rects(&mut self, list: &HostList, indexed: bool) -> bool {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        let Some(rects) = &p.rects else {
+            return false;
+        };
+        if !self.prepare(list, indexed) {
+            return false;
+        }
+        // SAFETY: an open list and a live pipeline of the same root signature.
+        unsafe { list.list.SetPipelineState(rects) };
+        list.keep(rects);
+        // The next draw binds its own pipeline again.
+        self.host_pipeline = 0;
+        true
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -1432,7 +1491,10 @@ impl State {
         // clamp's own compute pipeline; removed the heap-offset page fault (0x27ab000) there.
         self.host_heaps = [0; 2];
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED if self.topology == RECTANGLES => {
+                self.prepare_rects(list, kind == INDEXED)
+            }
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
@@ -1448,7 +1510,7 @@ impl State {
                 // Told apart from the rest: rectangles are what post
                 // processing and UI draw.
                 Some(_) if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES => {
-                    why("a rectangle list, which indirect execution does not draw")
+                    why("a rectangle list with vertex buffers or more than a position, which indirect execution does not draw")
                 }
                 Some(p) => why(&format!(
                     "prepare failed (compute {}, mesh {})",

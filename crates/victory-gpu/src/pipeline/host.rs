@@ -275,6 +275,10 @@ pub(crate) struct HostPipeline {
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
+    /// For a rectangle-list pipeline that makes its corners from the vertex
+    /// id: the same pipeline with the geometry shader that adds each
+    /// rectangle's fourth corner (see `crate::rects`).
+    pub(crate) rects: Option<ID3D12PipelineState>,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
@@ -509,6 +513,7 @@ impl HostPipeline {
                 compute: true,
                 mesh: false,
                 pso,
+                rects: None,
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
@@ -555,6 +560,7 @@ impl HostPipeline {
                 compute: false,
                 mesh: true,
                 pso,
+                rects: None,
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
@@ -621,10 +627,43 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
+        // Rectangles from the vertex id (no vertex inputs, a position and
+        // nothing else out): the variant that draws their fourth corner.
+        let rects = (g.topology.0 == RECTANGLES
+            && g.inputs.is_empty()
+            && stages
+                .first()
+                .and_then(|(vs, _)| vs.translated())
+                .is_some_and(|t| crate::rects::position_only(&t.host.dxil)))
+        .then(crate::rects::geometry_shader)
+        .flatten()
+        .and_then(|gs| {
+            // SAFETY: a second description of the same borrowed pointers
+            // (neither releases them).
+            let mut desc: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::ptr::read(&desc) };
+            desc.GS = D3D12_SHADER_BYTECODE {
+                pShaderBytecode: gs.as_ptr().cast(),
+                BytecodeLength: gs.len(),
+            };
+            // SAFETY: the description points at live data.
+            match unsafe { host.device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) } {
+                Ok(pso) => {
+                    tracing::info!(?shaders, "host pipeline for rectangles from the vertex id");
+                    crate::host::name(&pso, || format!("{shaders:?} rectangles"));
+                    Some(pso)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "host rectangle pipeline refused");
+                    host.log_messages();
+                    None
+                }
+            }
+        });
         Some(HostPipeline {
             compute: false,
             mesh: false,
             pso,
+            rects,
             root,
             stages: bound,
             name: format!("{shaders:?}"),
