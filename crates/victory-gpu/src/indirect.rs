@@ -4,9 +4,8 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So every record is clamped on the GPU,
 //! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler, or DXC when it refuses; the shader carries its
-//! root signature, which CreateRootSignature accepts from the compiler's
-//! blob).
+//! the system's compiler, or DXC when it refuses; the root signature is
+//! serialized separately on the host).
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -33,7 +32,6 @@ use windows::core::{Interface, s};
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1), UAV(u2)"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint count_at; };
 // The argument records and the list's budget, as dwords. The legacy
 // d3dcompiler in Wine (vkd3d-shader) has no Load methods on UAVs, so the
@@ -50,7 +48,6 @@ static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 static const uint NOT_COUNTED = 0xFFFFFFFF;
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint last = records;
@@ -315,12 +312,53 @@ fn make() -> windows::core::Result<Clamp> {
     let host = host().ok_or_else(windows::core::Error::empty)?;
     let (bytes, compiler) = compile()?;
     tracing::info!(compiler, bytes = bytes.len(), "argument clamp compiled");
-    // The shader carries its root signature in its `[RootSignature(RS)]`
-    // attribute; Microsoft accepts a shader blob with an embedded signature
-    // as a CreateRootSignature source, and the legacy compiler embeds it
-    // too, so no separate serialization is needed.
-    // SAFETY: `bytes` is the compiler's output and lives through the call.
-    let root = match unsafe { host.device.CreateRootSignature(0, &bytes[..]) } {
+    // An embedded signature is valid D3D12, but not all system compilers
+    // emit it. Serialize our four root parameters independently instead.
+    let mut params = vec![D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: 0,
+                RegisterSpace: 0,
+                Num32BitValues: 4,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }];
+    for register in 0..3 {
+        params.push(D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR {
+                    ShaderRegister: register,
+                    RegisterSpace: 0,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+    }
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        ..Default::default()
+    };
+    let mut blob = None;
+    let mut errors = None;
+    // SAFETY: the description borrows the live parameter vector.
+    unsafe {
+        D3D12SerializeRootSignature(
+            &desc,
+            D3D_ROOT_SIGNATURE_VERSION_1,
+            &mut blob,
+            Some(&mut errors),
+        )?;
+    }
+    let blob = blob.ok_or_else(windows::core::Error::empty)?;
+    // SAFETY: the blob owns this byte slice through CreateRootSignature.
+    let signature = unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+    };
+    let root = match unsafe { host.device.CreateRootSignature(0, signature) } {
         Ok(root) => root,
         Err(e) => {
             tracing::warn!(error = %e, compiler, "argument clamp: root signature refused");
@@ -361,6 +399,7 @@ pub(crate) struct Count<'a> {
 /// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
 /// the list's compute root signature and pipeline (callers bind theirs
 /// after). False if the clamp is not available.
+#[cfg(test)]
 pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
@@ -496,6 +535,7 @@ pub(crate) fn bound_counted(
 
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
+#[cfg(test)]
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
     done_counted(list, buffer, None);
 }
@@ -540,7 +580,6 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::host::HostList;
 
     /// PC argument numbering for the clamp's `kind`.
@@ -576,7 +615,10 @@ mod tests {
     }
 
     fn built() {
-        assert!(super::clamp().is_some(), "the argument clamp did not build");
+        if super::clamp().is_none() {
+            let error = super::make().err();
+            panic!("the argument clamp did not build: {error:?}");
+        }
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
