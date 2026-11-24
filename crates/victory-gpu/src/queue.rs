@@ -240,6 +240,22 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// `VICTORY_FRAME_DELAY_MS=<ms>[@<frame>]`: every present from that frame
+/// on (1) takes this much longer. To see what in a title follows its frame
+/// rate and what the clock: the same scene at another speed.
+#[cfg(feature = "diagnostics")]
+fn slow_down(frame: u64) {
+    static DELAY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let &(ms, from) = DELAY.get_or_init(|| {
+        let spec = std::env::var("VICTORY_FRAME_DELAY_MS").unwrap_or_default();
+        let (ms, from) = spec.split_once('@').unwrap_or((&spec, "1"));
+        (ms.trim().parse().unwrap_or(0), from.trim().parse().unwrap_or(1))
+    });
+    if ms > 0 && frame >= from {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 /// Shows the first plane's first resource in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
@@ -253,6 +269,8 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     let _span = crate::copystat::span(crate::copystat::T::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(feature = "diagnostics")]
+    slow_down(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
