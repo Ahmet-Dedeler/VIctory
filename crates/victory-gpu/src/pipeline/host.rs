@@ -345,6 +345,9 @@ impl HostPipeline {
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+        // Ranges of the one-view tables root SRVs and UAVs become, alive
+        // until the root signature is made.
+        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         let mut root_views: Vec<((i32, u8), u32)> = Vec::new();
@@ -391,8 +394,14 @@ impl HostPipeline {
                 ),
             ] {
                 for &slot in slots {
-                    let param =
-                        push_root_view(&mut params, &mut root_views, kind, slot, visibility);
+                    let param = push_root_view(
+                        &mut params,
+                        &mut ranges,
+                        &mut root_views,
+                        kind,
+                        slot,
+                        visibility,
+                    );
                     if !out.contains(&(slot, param)) {
                         out.push((slot, param));
                     }
@@ -681,11 +690,26 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
         .to_vec()
 }
 
+/// Whether root SRVs and UAVs are bound as one-view tables of the buffer's
+/// host copy (reads past its end return zeros, writes past it are dropped,
+/// as the console's buffer descriptors bound them) rather than root
+/// descriptors, which nothing bounds: a shader that runs past the host copy
+/// reaches unmapped or freed host memory and the GPU faults (#493 for root
+/// SRVs; root UAVs fault the same way on writes). `VICTORY_ROOT_VIEW_DIRECT=1`
+/// goes back to root descriptors.
+pub(crate) fn bounded_root_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_VIEW_DIRECT").is_none())
+}
+
 /// Adds or reuses a root view parameter for `(kind, slot)`, widening its
 /// visibility to `ALL` when shared across multiple shader stages so shared
-/// root descriptors do not consume extra root signature dwords.
+/// root descriptors do not consume extra root signature dwords. With
+/// [`bounded_root_views`], an SRV or UAV becomes a one-view table whose
+/// range lives in `ranges` (kept until the root signature is made).
 fn push_root_view(
     params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+    ranges: &mut Vec<Box<D3D12_DESCRIPTOR_RANGE1>>,
     seen: &mut Vec<((i32, u8), u32)>,
     kind: D3D12_ROOT_PARAMETER_TYPE,
     slot: u8,
@@ -699,6 +723,35 @@ fn push_root_view(
     }
     let index = params.len() as u32;
     seen.push(((kind.0, slot), index));
+    let table = match kind {
+        D3D12_ROOT_PARAMETER_TYPE_SRV if bounded_root_views() => Some(D3D12_DESCRIPTOR_RANGE_TYPE_SRV),
+        D3D12_ROOT_PARAMETER_TYPE_UAV if bounded_root_views() => Some(D3D12_DESCRIPTOR_RANGE_TYPE_UAV),
+        _ => None,
+    };
+    if let Some(range_type) = table {
+        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: range_type,
+            NumDescriptors: 1,
+            BaseShaderRegister: u32::from(slot),
+            RegisterSpace: ROOT_CBV_SPACE,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+            OffsetInDescriptorsFromTableStart: 0,
+        }));
+        // The box does not move when `ranges` grows.
+        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last().expect("just pushed");
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: range,
+                },
+            },
+            ShaderVisibility: visibility,
+        });
+        return index;
+    }
     params.push(D3D12_ROOT_PARAMETER1 {
         ParameterType: kind,
         Anonymous: D3D12_ROOT_PARAMETER1_0 {
