@@ -61,6 +61,50 @@ pub(crate) fn busy_frame(frame: u64) {
 /// targets' pictures: the two together say which pass left a target empty.
 static OPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// Indirect draw records read back from the host copy the GPU executes
+/// from, just before their execution ([`note_record`]).
+static RECORDS: std::sync::Mutex<Vec<(String, ID3D12Resource)>> = std::sync::Mutex::new(Vec::new());
+
+/// In a listed frame: records a read-back of the 20 bytes at `offset` of
+/// `args` (an indirect argument by now, and again after) into `list`,
+/// saved at the frame's present in `frame-<n>-records.txt` under `label`.
+/// What title memory holds at the end of the frame is not what the GPU
+/// read where the two copies differ.
+pub(crate) fn note_record(list: &crate::host::HostList, args: &ID3D12Resource, offset: u64, label: impl FnOnce() -> String) {
+    if !dump_on() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    let Some(host) = crate::host::host() else { return };
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: 64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut back: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; an open list and live buffers.
+    unsafe {
+        if host
+            .device
+            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut back)
+            .is_err()
+        {
+            return;
+        }
+        let Some(back) = back else { return };
+        let (argument, source) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list.list.ResourceBarrier(&[crate::host::transition(args, argument, source)]);
+        list.list.CopyBufferRegion(&back, 0, args, offset, 20);
+        list.list.ResourceBarrier(&[crate::host::transition(args, source, argument)]);
+        RECORDS.lock().unwrap_or_else(|e| e.into_inner()).push((label(), back));
+    }
+}
+
 /// The textures a listed frame's lines name: title memory, bytes of the
 /// first mip, size, the title's format and flags.
 static TEXTURES: std::sync::Mutex<std::collections::BTreeMap<u64, (u64, u64, u64, u32, u32, u32)>> =
@@ -149,6 +193,25 @@ pub(crate) fn save_frame_ops(frame: u64) {
             None => line,
         })
         .collect();
+    // Indirect draw records as the GPU read them.
+    let records = std::mem::take(&mut *RECORDS.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut lines = Vec::with_capacity(records.len());
+    for (label, back) in &records {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copies finished (every submission has run); 20 bytes
+        // of a 64-byte mapping.
+        unsafe {
+            if back.Map(0, None, Some(&mut data)).is_ok() {
+                let words = data.cast::<[u32; 5]>().read_unaligned();
+                back.Unmap(0, None);
+                lines.push(format!("{label} | on the GPU {words:?}"));
+            }
+        }
+    }
+    if !lines.is_empty() {
+        let path = folder.join(format!("frame-{frame}-records.txt"));
+        let _ = std::fs::write(&path, lines.join("\n") + "\n");
+    }
     // The textures those lines name, with the title memory each lies in:
     // two objects over the same memory are one texture to the title.
     let textures = std::mem::take(&mut *TEXTURES.lock().unwrap_or_else(|e| e.into_inner()));

@@ -1599,6 +1599,18 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        #[cfg(feature = "diagnostics")]
+        if matches!(kind, DRAW | INDEXED) {
+            crate::capture::note_record(list, &args.buffer, args.offset(arguments), || {
+                let mut title = [0u32; 5];
+                let read = crate::host::read(arguments as *const u8, title.as_mut_ptr().cast(), 20);
+                format!(
+                    "kind {kind} args={arguments:#x} {} | title memory at recording {}",
+                    crate::pipeline::describe(self.pipeline as This),
+                    if read { format!("{title:?}") } else { "unreadable".into() }
+                )
+            });
+        }
         // A rectangle draw counted by vertices, on a host that runs no such
         // indirect draw with a geometry shader: as an indexed one over the
         // numbers 0, 1, 2, ... (see `crate::rects::indexed`).
