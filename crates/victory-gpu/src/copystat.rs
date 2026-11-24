@@ -81,8 +81,12 @@ pub(crate) enum C {
     BackWriteUs,
     BackReads,
     BackWrites,
+    /// Of the pieces that differed: those merged straight into pages the
+    /// runtime mapped and held, and those with no pages there.
+    BackHeld,
+    BackAbsent,
 }
-const COUNTERS: usize = 45;
+const COUNTERS: usize = 47;
 
 /// `VICTORY_COPY_DIFF=1`: refreshes of host copies compare before they
 /// copy (twice the memory traffic), to count what changed.
@@ -262,12 +266,15 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "after submissions, per frame: {:.0} ranges declared as written by shaders, gone through \
          once per host copy: {:.1} ms comparing, {:.1} ms reading title memory ({:.0} pieces), \
-         {:.1} ms merging, {:.1} ms writing title memory ({:.0} pieces)",
+         {:.1} ms merging ({:.0} pieces in place in mapped pages, {:.0} without pages), \
+         {:.1} ms writing title memory ({:.0} pieces)",
         c[C::BackDeclared as usize],
         ms(c[C::BackCompareUs as usize]),
         ms(c[C::BackReadUs as usize]),
         c[C::BackReads as usize],
         ms(c[C::BackMergeUs as usize]),
+        c[C::BackHeld as usize],
+        c[C::BackAbsent as usize],
         ms(c[C::BackWriteUs as usize]),
         c[C::BackWrites as usize],
     );

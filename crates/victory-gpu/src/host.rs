@@ -2541,11 +2541,22 @@ pub(crate) fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
+///
+/// On a host that tracks no writes the copy is the one [`copy_mapped`]
+/// makes into title memory: a read of our memory into it, which checks the
+/// destination whole and copies in this process. `WriteProcessMemory` is
+/// not that everywhere: Wine has its server write the bytes, the process
+/// suspended meanwhile (60-94 us for 64 KiB in an idle process against 18,
+/// measured on a Mac).
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let here = !crate::watch::tracking();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
+        if here && read(from, at as *mut u8, n) {
+            return true;
+        }
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.

@@ -16,6 +16,10 @@
 //! and the copy asks the host as before. A copy that goes by an answer a
 //! mapping call has just overtaken is the copy made a moment earlier: a
 //! view gone meanwhile fails its read, which then asks the host.
+//!
+//! The runtime says a view is going before it unmaps it, and that call
+//! waits for whoever holds the views ([`hold`]): memory held as mapped
+//! stays readable and writable for as long, with no call into the host.
 
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -99,6 +103,58 @@ pub fn title_pages_unmapped(at: usize, len: usize) {
     cut(&mut map().views, at, at + len);
 }
 
+/// The ranges of `ranges` that reach into `[a, b)`, in order.
+fn within(ranges: &BTreeMap<usize, usize>, a: usize, b: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let before = ranges
+        .range(..=a)
+        .next_back()
+        .filter(|&(_, &end)| end > a)
+        .map(|(&s, &e)| (s, e));
+    before
+        .into_iter()
+        .chain(ranges.range(a + 1..b.max(a + 1)).map(|(&s, &e)| (s, e)))
+}
+
+/// Views that stay mapped while this lives: the runtime's unmapping waits
+/// for it. Not to be kept over anything that waits for the title.
+pub(crate) struct Held(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, Map>);
+
+/// What [`hold`] found.
+pub(crate) enum Hold {
+    /// All of it is views, read-write, until the hold is dropped.
+    Mapped(Held),
+    /// All of it is reserved for pages and has none.
+    Unmapped,
+    /// Something else, or we were told nothing of it: ask the host.
+    Unknown,
+}
+
+/// `[from, to)` held if it is all views.
+pub(crate) fn hold(from: usize, to: usize) -> Hold {
+    if from >= to {
+        return Hold::Unknown;
+    }
+    let m = MAP.read().unwrap_or_else(|e| e.into_inner());
+    let mut at = from;
+    let mut any = false;
+    for (start, end) in within(&m.views, from, to) {
+        any = true;
+        if start > at {
+            return Hold::Unknown;
+        }
+        at = at.max(end);
+    }
+    if at >= to {
+        return Hold::Mapped(Held(m));
+    }
+    let reserved = m
+        .reservations
+        .range(..=from)
+        .next_back()
+        .is_some_and(|(_, &end)| end >= to);
+    if !any && reserved { Hold::Unmapped } else { Hold::Unknown }
+}
+
 /// What is known of a piece of title memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum State {
@@ -131,21 +187,6 @@ pub(crate) fn pieces(from: usize, to: usize) -> Vec<(usize, usize, State)> {
             _ => out.push((start, end, state)),
         }
     };
-    // The ranges of `ranges` that reach into `[a, b)`, in order.
-    fn within(
-        ranges: &BTreeMap<usize, usize>,
-        a: usize,
-        b: usize,
-    ) -> impl Iterator<Item = (usize, usize)> + '_ {
-        let before = ranges
-            .range(..=a)
-            .next_back()
-            .filter(|&(_, &end)| end > a)
-            .map(|(&s, &e)| (s, e));
-        before
-            .into_iter()
-            .chain(ranges.range(a + 1..b.max(a + 1)).map(|(&s, &e)| (s, e)))
-    }
     // Views are mapped wherever they are; between them, what a reservation
     // holds is unmapped and the rest unknown.
     let gaps = |a: usize, b: usize, push: &mut dyn FnMut(usize, usize, State)| {
@@ -261,6 +302,41 @@ mod tests {
         );
         title_pages_unmapped(b + P, P);
         assert_eq!(pieces(b, b + 3 * P), []);
+    }
+
+    #[test]
+    fn views_are_held_and_unmapping_waits_for_the_hold() {
+        let b = base(5);
+        assert!(matches!(hold(b, b + P), Hold::Unknown));
+        title_pages_reserved(b, 8 * P);
+        assert!(matches!(hold(b, b + P), Hold::Unmapped));
+        title_pages_mapped(b + P, P);
+        title_pages_mapped(b + 2 * P, P);
+        // Two views side by side, and parts of them.
+        assert!(matches!(hold(b + P, b + 3 * P), Hold::Mapped(_)));
+        assert!(matches!(hold(b + P + 5, b + 2 * P + 9), Hold::Mapped(_)));
+        // Views and a hole, either way round: neither one nor the other.
+        assert!(matches!(hold(b, b + 2 * P), Hold::Unknown));
+        assert!(matches!(hold(b + 2 * P, b + 4 * P), Hold::Unknown));
+        // Past the reservation's end nothing is known.
+        assert!(matches!(hold(b + 7 * P, b + 9 * P), Hold::Unknown));
+        assert!(matches!(hold(b + 7 * P, b + 8 * P), Hold::Unmapped));
+
+        let held = hold(b + P, b + 2 * P);
+        let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unmapping = {
+            let gone = gone.clone();
+            std::thread::spawn(move || {
+                title_pages_unmapped(b + P, P);
+                gone.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!gone.load(std::sync::atomic::Ordering::SeqCst), "unmapped under a hold");
+        drop(held);
+        unmapping.join().unwrap();
+        assert!(matches!(hold(b + P, b + 2 * P), Hold::Unmapped));
+        title_pages_released(b);
     }
 
     #[test]

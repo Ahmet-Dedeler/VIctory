@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
+use crate::mapped::Hold;
 use crate::watch::PAGE;
 
 /// A title buffer's host copy.
@@ -227,6 +228,52 @@ fn merge(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
         host[i] = now;
     }
     changed != 0
+}
+
+/// [`merge`] with the title's bytes where they are: the bytes the GPU wrote
+/// are stored into title memory and nothing else is (a word of it is
+/// written only if a byte in it changes), then `host` takes the title's
+/// bytes. The title's threads write the same pages meanwhile: bytes of
+/// theirs next to the GPU's are not put back as they were read a moment ago.
+///
+/// # Safety
+/// `title` is readable and writable for the length of `host` and `old`.
+unsafe fn merge_into(title: *mut u8, host: &mut [u8], old: &[u8]) -> bool {
+    const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let n = host.len().min(old.len());
+    let mut changed = false;
+    for (i, (h, o)) in host.chunks_exact(8).zip(old.chunks_exact(8)).enumerate() {
+        let (h, o) = (
+            u64::from_ne_bytes(h.try_into().unwrap_or_default()),
+            u64::from_ne_bytes(o.try_into().unwrap_or_default()),
+        );
+        if h != o {
+            let x = h ^ o;
+            // 0xff in every byte the GPU wrote.
+            let wrote = (((((x & LOW) + LOW) | x) & !LOW) >> 7) * 0xff;
+            // SAFETY: inside the piece, as the caller vouches.
+            let at = unsafe { title.add(8 * i).cast::<u64>() };
+            // SAFETY: as above.
+            let t = unsafe { at.read_unaligned() };
+            let now = (h & wrote) | (t & !wrote);
+            if now != t {
+                // SAFETY: as above.
+                unsafe { at.write_unaligned(now) };
+                changed = true;
+            }
+        }
+    }
+    for i in n / 8 * 8..n {
+        // SAFETY: inside the piece.
+        if host[i] != old[i] && unsafe { title.add(i).read() } != host[i] {
+            // SAFETY: inside the piece.
+            unsafe { title.add(i).write(host[i]) };
+            changed = true;
+        }
+    }
+    // SAFETY: the piece, which does not overlap our copy of it.
+    unsafe { std::ptr::copy_nonoverlapping(title, host.as_mut_ptr(), n) };
+    changed
 }
 
 impl Shadow {
@@ -460,6 +507,40 @@ impl Shadow {
                 piece += 1;
                 #[cfg(feature = "diagnostics")]
                 let t0 = std::time::Instant::now();
+                // Where the runtime mapped the pages itself it keeps them
+                // there while we hold them: the GPU's bytes go straight
+                // into title memory. Asking the host instead cost a call
+                // to read the piece and one to write it, each waiting for
+                // the lock the title's page mappings hold while it
+                // streams, and under Wine the write is done by its server
+                // with every thread of the process suspended (0.3-2.4 s of
+                // a busy world frame for 10-50 MB written, on a Mac).
+                let held = if differs { crate::mapped::hold(start + at, start + at + n) } else { Hold::Unknown };
+                let differs = match held {
+                    Hold::Mapped(held) => {
+                        crate::watch::writing(start + at, n);
+                        // SAFETY: views the runtime mapped read-write and
+                        // does not unmap while `held` lives.
+                        if unsafe { merge_into((start + at) as *mut u8, host, old) } {
+                            written += n;
+                        }
+                        drop(held);
+                        synced.push((start + at) / PAGE);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            merging += since(t0);
+                            crate::copystat::add(crate::copystat::C::BackHeld, 1);
+                        }
+                        false
+                    }
+                    // Reserved for pages and none there: left alone.
+                    Hold::Unmapped => {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::BackAbsent, 1);
+                        false
+                    }
+                    Hold::Unknown => differs,
+                };
                 if differs
                     && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
                     && {
@@ -834,6 +915,37 @@ mod tests {
     }
 
     #[test]
+    fn merging_in_place_gives_what_merging_a_copy_gives() {
+        for n in [0usize, 1, 7, 8, 9, 63, 64, 1003] {
+            let old: Vec<u8> = (0..n).map(|i| (i % 7) as u8).collect();
+            let mut title = old.clone();
+            for i in (0..n).step_by(5) {
+                title[i] = 100 + (i % 50) as u8;
+            }
+            let mut host = old.clone();
+            for i in (0..n).step_by(3) {
+                host[i] = if i % 6 == 0 { title[i] } else { 200 };
+            }
+            let (mut title2, mut host2) = (title.clone(), host.clone());
+            let changed = merge(&mut title, &mut host, &old);
+            // SAFETY: `title2` is `n` bytes like the others.
+            let changed2 = unsafe { merge_into(title2.as_mut_ptr(), &mut host2, &old) };
+            assert_eq!((changed, &title, &host), (changed2, &title2, &host2), "{n} bytes");
+        }
+        // A byte the GPU wrote to the value the title has there: no write.
+        let old = [0u8; 16];
+        let mut host = old;
+        host[9] = 4;
+        let mut title = old;
+        title[9] = 4;
+        title[3] = 8;
+        // SAFETY: sixteen bytes each.
+        assert!(!unsafe { merge_into(title.as_mut_ptr(), &mut host, &old) });
+        assert_eq!(host, title);
+        assert_eq!(title[3], 8);
+    }
+
+    #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {
         let mut unchanged = UnchangedPages::default();
         let before = vec![0; PAGE];
@@ -1066,6 +1178,47 @@ mod tests {
             // SAFETY: allocated with VirtualAlloc in `new`.
             unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
         }
+    }
+
+    /// What shaders wrote goes straight into pages the runtime says it
+    /// mapped, beside what the title wrote there meanwhile; where it says
+    /// there are no pages, title memory is left alone.
+    #[test]
+    fn copy_back_writes_pages_the_runtime_mapped_and_no_others() {
+        let Some(t) = Watched::new() else {
+            return;
+        };
+        let title = t.base as *mut u8;
+        // SAFETY: the test's two pages.
+        unsafe { title.write_bytes(1, 2 * PAGE) };
+        assert_eq!(t.shadow.update(t.base, 2 * PAGE), 2 * PAGE);
+        crate::mapped::title_pages_reserved(t.base, 2 * PAGE);
+        crate::mapped::title_pages_mapped(t.base, PAGE);
+        t.shadow.writing(t.base, 2 * PAGE);
+        // SAFETY: inside the copy's mapping and the test's allocation.
+        unsafe {
+            // The GPU, in both pages; the title next to it in the first.
+            t.shadow.data.add(100).write(9);
+            t.shadow.data.add(PAGE + 100).write(9);
+            title.add(101).write(5);
+        }
+        assert_eq!(t.shadow.copy_back(t.base, 2 * PAGE), PAGE);
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!((title.add(100).read(), title.add(101).read()), (9, 5));
+            // The copy took the title's bytes of the page.
+            assert_eq!((t.shadow.data.add(100).read(), t.shadow.data.add(101).read()), (9, 5));
+            // No pages there, as far as the runtime said: not written.
+            assert_eq!(title.add(PAGE + 100).read(), 1);
+        }
+        crate::mapped::title_pages_released(t.base);
+        // Of memory the runtime said nothing about, the host is asked.
+        t.shadow.writing(t.base, 2 * PAGE);
+        // SAFETY: inside the copy's mapping.
+        unsafe { t.shadow.data.add(PAGE + 200).write(3) };
+        assert_eq!(t.shadow.copy_back(t.base, 2 * PAGE), PAGE);
+        // SAFETY: inside the test's allocation.
+        assert_eq!(unsafe { title.add(PAGE + 200).read() }, 3);
     }
 
     /// Small ranges in one page (as directly indexed SRVs ask for them): the
