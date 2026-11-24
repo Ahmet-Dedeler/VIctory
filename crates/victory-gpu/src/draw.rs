@@ -320,6 +320,17 @@ impl State {
         }
     }
 
+    pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
+        for slot in self
+            .vertex
+            .iter_mut()
+            .skip(start as usize)
+            .take(count as usize)
+        {
+            *slot = VertexView::default();
+        }
+    }
+
     pub(crate) fn set_index_buffer(&mut self, view: Option<&IndexView>) {
         self.index = view.copied().unwrap_or_default();
     }
@@ -1284,6 +1295,10 @@ impl State {
             },
             None => None,
         };
+        let counted = counter.as_ref().map(|(s, at)| crate::indirect::Count {
+            buffer: &s.buffer,
+            offset: s.offset(*at),
+        });
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()
@@ -1296,8 +1311,14 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+        if !crate::indirect::bound_counted(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max),
+            counted,
+        ) {
+            why("not bounded (no clamp, bad count, or arguments not 4-byte aligned)");
             return false;
         }
         self.host_pipeline = 0;
@@ -1315,7 +1336,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done_counted(list, &args.buffer, counted.map(|c| c.buffer));
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1345,7 +1366,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done_counted(list, &args.buffer, counted.map(|c| c.buffer));
         if crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.has_root_uavs())
         {
             emit_uav_barrier(list);
@@ -1692,9 +1713,10 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = victory_shader::ir::build(&native.code, false, 8).unwrap();
-        let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = victory_shader::io::raise(&p, &native).unwrap();
         let st = victory_shader::structure::structure(&p).unwrap();
+        let res =
+            victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
         let c = Container {
             digest: [0; 16],
             version: (1, 0),

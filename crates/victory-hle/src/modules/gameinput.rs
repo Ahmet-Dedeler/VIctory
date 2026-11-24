@@ -1111,6 +1111,9 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Media::Multimedia::{
+        JOYCAPSW, JOYINFOEX, JOYSTICKID1, joyGetDevCapsW, joyGetPosEx,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1149,6 +1152,23 @@ mod host {
         (XINPUT_GAMEPAD_RIGHT_THUMB, RIGHT_STICK),
     ];
 
+    /// DualSense and DualShock 4 buttons in the order the HID report lists
+    /// them (Square, Cross, Circle, Triangle, L1, R1, L2, R2, Create,
+    /// Options, L3, R3, PS, touchpad), as XInput buttons; L2 and R2 also
+    /// arrive as trigger axes.
+    const JOY_BUTTONS: [(u32, u16); 10] = [
+        (0, XINPUT_GAMEPAD_X),
+        (1, XINPUT_GAMEPAD_A),
+        (2, XINPUT_GAMEPAD_B),
+        (3, XINPUT_GAMEPAD_Y),
+        (4, XINPUT_GAMEPAD_LEFT_SHOULDER),
+        (5, XINPUT_GAMEPAD_RIGHT_SHOULDER),
+        (8, XINPUT_GAMEPAD_BACK),
+        (9, XINPUT_GAMEPAD_START),
+        (10, XINPUT_GAMEPAD_LEFT_THUMB),
+        (11, XINPUT_GAMEPAD_RIGHT_THUMB),
+    ];
+
     /// Raw values, no dead zone: titles apply their own.
     pub(super) fn convert(pad: &XINPUT_GAMEPAD) -> PadState {
         let stick = |v: i16| (f32::from(v) / 32767.0).max(-1.0);
@@ -1166,9 +1186,20 @@ mod host {
         }
     }
 
+    /// The driver's axis ranges for a winmm joystick.
+    #[derive(Clone, Copy, Default)]
+    struct JoyAxes {
+        min: [u32; 6],
+        max: [u32; 6],
+    }
+
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Caps of the joystick behind each title slot, once seen.
+        joy: [Option<JoyAxes>; PADS],
+        /// When to look for absent joysticks again.
+        joy_until: [Option<Instant>; PADS],
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1182,8 +1213,9 @@ mod host {
         }
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    impl Host {
+        /// The XInput pad in `slot`, if one is connected.
+        fn xinput(&mut self, slot: usize) -> Option<XINPUT_GAMEPAD> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1194,7 +1226,144 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            static SEEN: [std::sync::Once; PADS] = [const { std::sync::Once::new() }; PADS];
+            SEEN[slot].call_once(|| tracing::info!(slot, "XInput pad connected"));
+            Some(state.Gamepad)
+        }
+
+        /// A PlayStation pad (DualShock 4 or DualSense) as XInput. Wine's
+        /// XInput does not list them; its winmm joystick driver does, in the
+        /// HID report's button order.
+        fn joystick(&mut self, slot: usize) -> Option<PadState> {
+            let axes = match self.joy[slot] {
+                Some(axes) => axes,
+                None => {
+                    if self.joy_until[slot].is_some_and(|until| Instant::now() < until) {
+                        return None;
+                    }
+                    let mut caps = JOYCAPSW::default();
+                    // SAFETY: room for the caps of one joystick.
+                    let found = unsafe {
+                        joyGetDevCapsW(
+                            JOYSTICKID1 as usize + slot,
+                            &mut caps,
+                            std::mem::size_of::<JOYCAPSW>() as u32,
+                        )
+                    };
+                    if found != 0 {
+                        self.joy_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                        return None;
+                    }
+                    let min = [
+                        caps.wXmin, caps.wYmin, caps.wZmin, caps.wRmin, caps.wUmin, caps.wVmin,
+                    ];
+                    let max = [
+                        caps.wXmax, caps.wYmax, caps.wZmax, caps.wRmax, caps.wUmax, caps.wVmax,
+                    ];
+                    let axes = JoyAxes { min, max };
+                    self.joy[slot] = Some(axes);
+                    let (num_buttons, num_axes) = (caps.wNumButtons, caps.wNumAxes);
+                    tracing::info!(
+                        slot,
+                        buttons = num_buttons,
+                        axes = num_axes,
+                        "winmm joystick presented as an XInput pad"
+                    );
+                    axes
+                }
+            };
+            let mut info = JOYINFOEX {
+                dwSize: std::mem::size_of::<JOYINFOEX>() as u32,
+                // JOY_RETURNALL: axes, buttons and the point-of-view hat.
+                dwFlags: 0xFF,
+                ..Default::default()
+            };
+            // SAFETY: room for one position.
+            if unsafe { joyGetPosEx(JOYSTICKID1 + slot as u32, &mut info) } != 0 {
+                self.joy[slot] = None;
+                self.joy_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                return None;
+            }
+            Some(convert_joystick(&info, &axes))
+        }
+    }
+
+    /// The XInput view of a winmm joystick: X/Y is the left stick, Z/R the
+    /// right one, U/V the triggers (the driver's mapping of a DualSense),
+    /// and the hat its D-pad.
+    fn convert_joystick(info: &JOYINFOEX, axes: &JoyAxes) -> PadState {
+        let (x, y, z, r, u, v, buttons, pov) = (
+            info.dwXpos,
+            info.dwYpos,
+            info.dwZpos,
+            info.dwRpos,
+            info.dwUpos,
+            info.dwVpos,
+            info.dwButtons,
+            info.dwPOV,
+        );
+        let axis = |value: u32, i: usize| -> f32 {
+            let (min, max) = (axes.min[i], axes.max[i]);
+            if max <= min {
+                return 0.0;
+            }
+            let mid = (min + max) as f32 / 2.0;
+            let half = (max - min) as f32 / 2.0;
+            ((value as f32 - mid) / half).clamp(-1.0, 1.0)
+        };
+        let trigger = |value: u32, i: usize| -> u8 {
+            let (min, max) = (axes.min[i], axes.max[i]);
+            if max <= min {
+                return 0;
+            }
+            ((value.saturating_sub(min) as f32 / (max - min) as f32) * 255.0).clamp(0.0, 255.0)
+                as u8
+        };
+        let mut pad = XINPUT_GAMEPAD::default();
+        for &(index, bit) in &JOY_BUTTONS {
+            if buttons & (1 << index) != 0 {
+                pad.wButtons |= bit;
+            }
+        }
+        // L2 and R2 are buttons and analog triggers; either reaches the end.
+        pad.bLeftTrigger = if buttons & (1 << 6) != 0 {
+            255
+        } else {
+            trigger(u, 4)
+        };
+        pad.bRightTrigger = if buttons & (1 << 7) != 0 {
+            255
+        } else {
+            trigger(v, 5)
+        };
+        let to_i16 = |v: f32| (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        pad.sThumbLX = to_i16(axis(x, 0));
+        // Linux's Y grows downward; XInput's grows upward.
+        pad.sThumbLY = to_i16(-axis(y, 1));
+        pad.sThumbRX = to_i16(axis(z, 2));
+        pad.sThumbRY = to_i16(-axis(r, 3));
+        if pov != 0xFFFF && pov != u32::MAX {
+            let dir = ((pov as f32 / 100.0 / 45.0).round() as i32).rem_euclid(8);
+            for (hit, bit) in [
+                (dir == 0 || dir == 1 || dir == 7, XINPUT_GAMEPAD_DPAD_UP),
+                (dir == 1 || dir == 2 || dir == 3, XINPUT_GAMEPAD_DPAD_RIGHT),
+                (dir == 3 || dir == 4 || dir == 5, XINPUT_GAMEPAD_DPAD_DOWN),
+                (dir == 5 || dir == 6 || dir == 7, XINPUT_GAMEPAD_DPAD_LEFT),
+            ] {
+                if hit {
+                    pad.wButtons |= bit;
+                }
+            }
+        }
+        convert(&pad)
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            if let Some(pad) = self.xinput(slot) {
+                return Some(convert(&pad));
+            }
+            self.joystick(slot)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {

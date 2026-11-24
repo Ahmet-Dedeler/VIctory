@@ -865,6 +865,27 @@ mod tests {
         }
     }
 
+    /// A whole-resource transition, for a test that records its own list.
+    fn transition(
+        resource: &ID3D12Resource,
+        before: D3D12_RESOURCE_STATES,
+        after: D3D12_RESOURCE_STATES,
+    ) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    // SAFETY: a borrowed resource pointer; the barrier never releases it.
+                    pResource: unsafe { std::mem::transmute_copy(resource) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        }
+    }
+
     /// A mesh pipeline made once is loaded from the library the next time,
     /// not compiled again (a stream without a topology never loads).
     #[test]
@@ -891,5 +912,330 @@ mod tests {
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+
+    /// The production mesh pipeline draws its one triangle into an offscreen
+    /// target, and the result is read back: a smoke test of the mesh path
+    /// without any title data or console compiler.
+    ///
+    /// The triangle covers half of the upper-right quadrant (1/8 of the
+    /// target), with centroid at (2/3 width, 1/3 height). The test checks
+    /// that coverage is substantial but not a full-screen fill, that an
+    /// interior pixel and the coverage centroid are white, and that a pixel outside
+    /// the triangle stays black.
+    #[test]
+    fn mesh_pipeline_draws_a_triangle() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        use windows::core::Interface;
+
+        const W: u32 = 64;
+        const H: u32 = 64;
+
+        let Some(host) = host() else {
+            eprintln!("SKIP mesh_pipeline_draws_a_triangle: no host D3D12 device");
+            return;
+        };
+        if !host.mesh_shaders() {
+            eprintln!("SKIP mesh_pipeline_draws_a_triangle: no mesh shaders at SM 6.6");
+            return;
+        }
+        let Some(dxc) = dxc() else {
+            eprintln!(
+                "SKIP mesh_pipeline_draws_a_triangle: no PC dxc.exe (set VICTORY_PC_DXC, or install the Windows SDK)"
+            );
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // No depth target is bound below; no culling, so the triangle's
+        // winding cannot turn this into a coverage pass that draws nothing.
+        g.depth.DepthEnable = false.into();
+        g.depth.StencilEnable = false.into();
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        let name =
+            super::super::library::name("mesh draw smoke", &root_blob, &[&ms, &ps], &g.describe());
+        let pso = mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name)
+            .expect("host mesh pipeline created");
+
+        let device = &host.device;
+        // SAFETY: D3D12 calls with descriptions that outlive them; every
+        // resource and object stays alive until the fence below completes.
+        unsafe {
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("command queue");
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .expect("command allocator");
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .expect("command list");
+            let list6: ID3D12GraphicsCommandList6 = match list.cast() {
+                Ok(list) => list,
+                Err(_) => {
+                    eprintln!(
+                        "SKIP mesh_pipeline_draws_a_triangle: ID3D12GraphicsCommandList6 unavailable"
+                    );
+                    return;
+                }
+            };
+
+            let target_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: u64::from(W),
+                Height: H,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let clear = D3D12_CLEAR_VALUE {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                Anonymous: D3D12_CLEAR_VALUE_0 {
+                    Color: [0.0, 0.0, 0.0, 0.0],
+                },
+            };
+            let mut target: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &target_desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    Some(&clear as *const D3D12_CLEAR_VALUE),
+                    &mut target,
+                )
+                .expect("render target");
+            let target = target.expect("render target");
+
+            let rtv_heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })
+                .expect("render target view heap");
+            let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            device.CreateRenderTargetView(&target, None, rtv);
+
+            // The root signature allows directly indexed heaps; the shaders
+            // read none, but bind empty shader-visible heaps so the draw
+            // cannot depend on an unbound-heap validation rule.
+            let views: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .expect("view heap");
+            let samplers: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .expect("sampler heap");
+            list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
+            list.SetPipelineState(&pso);
+            list.SetGraphicsRootSignature(&root);
+            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.RSSetViewports(&[D3D12_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: W as f32,
+                Height: H as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]);
+            list.RSSetScissorRects(&[RECT {
+                left: 0,
+                top: 0,
+                right: W as i32,
+                bottom: H as i32,
+            }]);
+            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 0.0], None);
+            list6.DispatchMesh(1, 1, 1);
+            list.ResourceBarrier(&[transition(
+                &target,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0;
+            device.GetCopyableFootprints(
+                &target_desc,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut total),
+            );
+            let readback_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut readback: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_READBACK,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .expect("read-back buffer");
+            let readback = readback.expect("read-back buffer");
+
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed resource pointer; the location never releases it.
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed resource pointer; the location never releases it.
+                pResource: std::mem::transmute_copy(&target),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.Close().expect("close command list");
+
+            let submitted: ID3D12CommandList = list.cast().expect("command list");
+            queue.ExecuteCommandLists(&[Some(submitted)]);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            queue.Signal(&fence, 1).expect("signal fence");
+            let started = std::time::Instant::now();
+            while fence.GetCompletedValue() < 1 {
+                if let Err(e) = device.GetDeviceRemovedReason() {
+                    panic!("device removed while drawing the mesh triangle: {e}");
+                }
+                if started.elapsed() > std::time::Duration::from_secs(30) {
+                    panic!("mesh triangle draw did not complete within 30 s");
+                }
+                std::thread::yield_now();
+            }
+            if let Err(e) = device.GetDeviceRemovedReason() {
+                panic!("device removed after drawing the mesh triangle: {e}");
+            }
+
+            let mut data = std::ptr::null_mut();
+            readback
+                .Map(0, None, Some(&mut data))
+                .expect("map read-back");
+            let pitch = footprint.Footprint.RowPitch as usize;
+            let bytes = std::slice::from_raw_parts(data.cast::<u8>(), pitch * H as usize);
+            let pixel = |x: u32, y: u32| -> [u8; 4] {
+                let at = y as usize * pitch + x as usize * 4;
+                bytes[at..at + 4].try_into().unwrap()
+            };
+
+            let mut covered = 0usize;
+            let mut sum_x = 0u64;
+            let mut sum_y = 0u64;
+            for y in 0..H {
+                for x in 0..W {
+                    let p = pixel(x, y);
+                    if p[0].max(p[1]).max(p[2]) > 200 {
+                        covered += 1;
+                        sum_x += u64::from(x);
+                        sum_y += u64::from(y);
+                    }
+                }
+            }
+            let total_pixels = (W * H) as usize;
+            let center_x = if covered == 0 {
+                0
+            } else {
+                (sum_x as f32 / covered as f32).round() as u32
+            };
+            let center_y = if covered == 0 {
+                0
+            } else {
+                (sum_y as f32 / covered as f32).round() as u32
+            };
+            let center = pixel(center_x.min(W - 1), center_y.min(H - 1));
+            let middle = pixel(W * 5 / 8, H * 3 / 8);
+            let outside = pixel(W / 8, H * 7 / 8);
+            readback.Unmap(0, None);
+            eprintln!(
+                "mesh smoke: {covered}/{total_pixels} pixels covered, centre {center:?} at ({center_x}, {center_y}), middle {middle:?}, outside {outside:?}"
+            );
+
+            assert!(
+                covered >= total_pixels / 10,
+                "mesh triangle coverage too small: {covered} of {total_pixels} pixels"
+            );
+            assert!(
+                covered <= total_pixels * 3 / 20,
+                "mesh triangle covered too much (a full-screen fill?): {covered} of {total_pixels} pixels"
+            );
+            assert!(
+                middle[0] >= 250 && middle[1] >= 250 && middle[2] >= 250 && middle[3] >= 250,
+                "the interior pixel {middle:?} is not white"
+            );
+            assert!(
+                center[0] >= 250 && center[1] >= 250 && center[2] >= 250 && center[3] >= 250,
+                "the rendered triangle's centre {center:?} at ({center_x}, {center_y}) is not white"
+            );
+            assert!(
+                outside[0] < 10 && outside[1] < 10 && outside[2] < 10,
+                "a pixel outside the triangle is not black: {outside:?}"
+            );
+            if covered > 0 {
+                let cx = sum_x as f32 / covered as f32;
+                let cy = sum_y as f32 / covered as f32;
+                let expected = (W as f32 * 2.0 / 3.0, H as f32 / 3.0);
+                assert!(
+                    (cx - expected.0).abs() <= 4.0 && (cy - expected.1).abs() <= 4.0,
+                    "coverage centroid ({cx:.1}, {cy:.1}) is not the triangle's ({:.1}, {:.1})",
+                    expected.0,
+                    expected.1
+                );
+            }
+        }
     }
 }

@@ -404,16 +404,20 @@ const COPY_DEST: u32 = 0x400;
 const COPY_SOURCE: u32 = 0x800;
 
 /// `len` bytes at `offset` of a title buffer, if they are inside it.
-#[cfg(windows)]
 fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     let (data, size) = crate::resource::buffer_bytes(buffer)?;
-    let end = offset.checked_add(len)?;
-    if end > size {
-        tracing::warn!(offset, len, size, "copy outside its buffer");
+    let Some(offset_in_buffer) = checked_buffer_offset(size, offset, len) else {
+        tracing::warn!(offset, len, size, "range outside its buffer");
         return None;
-    }
+    };
     // SAFETY: inside the buffer, checked above.
-    Some(unsafe { data.add(offset as usize) })
+    Some(unsafe { data.add(offset_in_buffer) })
+}
+
+fn checked_buffer_offset(size: u64, offset: u64, len: u64) -> Option<usize> {
+    (offset.checked_add(len)? <= size)
+        .then(|| usize::try_from(offset).ok())
+        .flatten()
 }
 
 /// Buffer to buffer: both are host memory, copied at submission.
@@ -446,6 +450,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if crate::texture::title_written(from) {
+                crate::texture::upload(list, src, from);
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -538,6 +545,9 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::texture::title_written(texture) {
+                crate::texture::upload(list, src.resource, texture);
+            }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
@@ -1121,7 +1131,11 @@ mod state {
         views: *const VertexView,
     ) {
         with_state(this, |_, s| {
-            s.set_vertex_buffers(start, items(views, count))
+            if views.is_null() {
+                s.clear_vertex_buffers(start, count);
+            } else {
+                s.set_vertex_buffers(start, items(views, count));
+            }
         });
     }
     /// `(count, handles, one range, depth)`: with one range, the handles
@@ -1267,8 +1281,9 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let bytes = u64::from(stride) * u64::from(max.max(1));
+    let address = buffer_range(arguments, offset, bytes).map(|p| p as u64);
+    let counter = buffer_range(count, count_offset, 4).map(|p| p as u64);
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1513,6 +1528,16 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn indirect_buffer_ranges_stay_inside_the_named_resource() {
+        assert_eq!(checked_buffer_offset(64, 52, 12), Some(52));
+        assert_eq!(checked_buffer_offset(64, 60, 4), Some(60));
+        assert_eq!(checked_buffer_offset(64, 53, 12), None);
+        assert_eq!(checked_buffer_offset(64, 62, 4), None);
+        assert_eq!(checked_buffer_offset(64, u64::MAX, 4), None);
+        assert_eq!(checked_buffer_offset(64, 0, u64::MAX), None);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

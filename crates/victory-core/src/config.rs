@@ -198,6 +198,16 @@ mod tests {
     }
 
     #[test]
+    fn data_inside_repo_is_refused() {
+        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let cfg = Config {
+            data_dir: inside,
+            ..Default::default()
+        };
+        assert!(cfg.data_subdir("x").is_err());
+    }
+
+    #[test]
     fn xdg_data_home_used_for_data_dir() {
         let file = FilePaths::default();
         let env = |k: &str| match k {

@@ -233,6 +233,53 @@ extern "system" fn node_count(_: This) -> u32 {
     1
 }
 
+/// `0x330` `GetRaytracingAccelerationStructurePrebuildInfo`: the title's BVH
+/// builder asks before it sizes its buffers. The description is the PC one
+/// (the builder drops its console stream description before calling), so the
+/// host device can answer it.
+extern "system" fn raytracing_prebuild_info(
+    _: This,
+    desc: *const c_void,
+    out: *mut c_void,
+) {
+    if desc.is_null() || out.is_null() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS,
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO, ID3D12Device5,
+        };
+        use windows::core::Interface;
+        if let Some(host) = crate::host::host() {
+            if let Ok(device) = host.device.cast::<ID3D12Device5>() {
+                // SAFETY: plain data, filled by the host.
+                let mut info: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO =
+                    unsafe { std::mem::zeroed() };
+                // SAFETY: the title passes its inputs and room for the info;
+                // host GPU addresses are the title's CPU addresses here.
+                unsafe {
+                    device.GetRaytracingAccelerationStructurePrebuildInfo(
+                        desc.cast::<D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS>(),
+                        &mut info,
+                    );
+                    out.cast::<D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO>()
+                        .write_unaligned(info);
+                }
+                tracing::info!(
+                    result = info.ResultDataMaxSizeInBytes,
+                    scratch = info.ScratchDataSizeInBytes,
+                    update = info.UpdateScratchDataSizeInBytes,
+                    "raytracing prebuild info"
+                );
+                return;
+            }
+        }
+    }
+    tracing::warn!("raytracing prebuild info: no host device to ask");
+}
+
 /// Feature query 2: the highest of the requested feature levels we support.
 #[repr(C)]
 struct FeatureLevels {
@@ -398,6 +445,7 @@ static FUNCTIONS: Table<160> = {
     f[80] = frame::wait as *const (); // 0x280
     f[81] = frame::statistics as *const (); // 0x288
     f[86] = pipeline::create_stream as *const (); // 0x2b0
+    f[102] = raytracing_prebuild_info as *const (); // 0x330
     f[108] = resource::allocation_info2 as *const (); // 0x360
     f[127] = resource::create_committed3 as *const (); // 0x3f8
     f[133] = resource::create_at_address as *const (); // 0x428

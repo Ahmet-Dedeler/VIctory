@@ -97,6 +97,39 @@ slr runinprefix cmd.exe /d /c 'C:\victory-config.cmd'
 cat "$STEAM_COMPAT_DATA_PATH/pfx/drive_c/victory-config.txt"
 ```
 
+## Check mesh rendering without a title
+
+The GPU crate has a synthetic offscreen mesh test. It builds the production
+mesh pipeline, dispatches one triangle into a 64×64 target, and checks its
+readback for coverage, an interior white pixel, and an exterior black pixel.
+It does not require a game dump or the console shader compiler.
+
+Build the Windows test executable:
+
+```bash
+cargo +1.98.1 xwin test --locked --target "$target" -p victory-gpu --no-run
+```
+
+Cargo prints the test executable path under `target/$target/debug/deps/`.
+Set `test_exe` to that path. Obtain the public Windows DirectX Shader Compiler
+from Microsoft's DirectXShaderCompiler releases; keep `dxc.exe`,
+`dxcompiler.dll`, and `dxil.dll` together outside the checkout. Include that
+directory in `STEAM_COMPAT_MOUNTS`, then continue with the same Proton setup:
+
+```bash
+export VICTORY_PC_DXC='Z:\absolute\path\to\dxc\bin\x64\dxc.exe'
+slr runinprefix "$test_exe" mesh_pipeline_draws_a_triangle --nocapture --test-threads=1
+slr runinprefix "$test_exe" shader_cache::tests --nocapture --test-threads=1
+```
+
+`SKIP mesh_pipeline_draws_a_triangle: ...` means the render was **not tested**,
+even though Rust's test harness reports `ok`. A real pass prints pixel
+coverage and passes the pixel assertions. This test was exercised on
+Proton Experimental/RADV with 496 of 4096 pixels covered; the interior was
+white and the exterior black. It proves the host mesh pipeline works, not
+that console shader translation, title resource bindings, or world rendering
+are correct.
+
 ## Distinguish a white window from a world-loading crash
 
 With `runinprefix`, specifying the native DLL overrides above made the
