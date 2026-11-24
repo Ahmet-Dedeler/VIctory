@@ -1952,11 +1952,20 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+        let background = crate::background();
+        let hwnd = CreateWindowExW(
+            if background {
+                WS_EX_NOACTIVATE
+            } else {
+                WINDOW_EX_STYLE(0)
+            },
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            if background {
+                WS_OVERLAPPEDWINDOW
+            } else {
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE
+            },
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             rect.right - rect.left,
@@ -1965,7 +1974,12 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             None,
             Some(instance.into()),
             None,
-        )
+        )?;
+        if background {
+            // Shown behind what is in front, never the active window.
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        Ok(hwnd)
     }
 }
 
