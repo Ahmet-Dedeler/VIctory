@@ -34,6 +34,7 @@ mod indirect;
 #[cfg(windows)]
 mod rects;
 pub mod list;
+mod mapped;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
@@ -65,5 +66,6 @@ pub fn background() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_BACKGROUND").is_ok_and(|v| v.trim() == "1"))
 }
+pub use mapped::{title_pages_mapped, title_pages_released, title_pages_reserved, title_pages_unmapped};
 #[cfg(windows)]
 pub use watch::{title_memory_remapped, tracking as write_tracking, writing as kernel_will_write};

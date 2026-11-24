@@ -59,8 +59,28 @@ pub(crate) enum C {
     FlushUs,
     FallbackUs,
     FallbackQueries,
+    /// With `VICTORY_COPY_DIFF=1`: bytes of refreshes compared with what
+    /// the host copy held, and the 4 KiB pages and 64 KiB blocks of them
+    /// that differed (what write tracking would have had to report, and
+    /// each such page one write fault of the title's).
+    DiffCompared,
+    DiffPages,
+    DiffBlocks,
+    /// Of the time on the GPU: microseconds in the host's call that takes
+    /// the lists, and waiting for them after it; submissions whose
+    /// shaders may write host copies (their copy-back cannot be put off).
+    HostCallUs,
+    HostWaitUs,
+    WritingSubmissions,
 }
-const COUNTERS: usize = 33;
+const COUNTERS: usize = 39;
+
+/// `VICTORY_COPY_DIFF=1`: refreshes of host copies compare before they
+/// copy (twice the memory traffic), to count what changed.
+pub(crate) fn diff() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_COPY_DIFF").as_deref() == Ok("1"))
+}
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -190,6 +210,24 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::FallbackUs as usize]),
         c[C::FallbackQueries as usize],
     );
+    tracing::info!(
+        "host submissions per frame: {:.1} ms handing the lists over, {:.1} ms waiting for them; \
+         {:.1} of them with ranges shaders may write",
+        ms(c[C::HostCallUs as usize]),
+        ms(c[C::HostWaitUs as usize]),
+        c[C::WritingSubmissions as usize],
+    );
+    if diff() {
+        tracing::info!(
+            "copies per frame, what changed: of {:.1} MB compared, {:.0} pages of 4 KiB ({:.1} MB) \
+             in {:.0} blocks of 64 KiB ({:.1} MB) differed from the host copy",
+            mb(c[C::DiffCompared as usize]),
+            c[C::DiffPages as usize],
+            c[C::DiffPages as usize] * 4096.0 / 1e6,
+            c[C::DiffBlocks as usize],
+            c[C::DiffBlocks as usize] * 65536.0 / 1e6,
+        );
+    }
     tracing::info!(
         "texture refreshes per frame: {:.2} ms asking for committed memory, {:.2} ms hashing, {:.2} ms detiling",
         ms(c[C::TexQueryUs as usize]),

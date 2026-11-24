@@ -1313,12 +1313,15 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        // Of the time on the GPU, what the host's call itself took.
+        let mut call_us = 0u64;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                call_us += started.elapsed().as_micros() as u64;
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -1365,8 +1368,18 @@ impl Host {
             }
             let _ = (i, started);
         }
-        let _ = &firsts;
+        let _ = (&firsts, call_us);
         let gpu = prepared.elapsed();
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            let writing = runs
+                .iter()
+                .any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::GpuWrite(..))));
+            add(C::WritingSubmissions, u64::from(writing));
+            add(C::HostCallUs, call_us);
+            add(C::HostWaitUs, (gpu.as_micros() as u64).saturating_sub(call_us));
+        }
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
@@ -2287,8 +2300,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    if !title_dst && len >= PARALLEL_FROM {
-        copy_in_parts(dst, src, len);
+    if !title_dst {
+        copy_into_host(dst, src, len);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
         return;
@@ -2303,11 +2316,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     #[cfg(feature = "diagnostics")]
     let falling = std::time::Instant::now();
-    if !title_dst && len >= 64 << 10 {
-        read_sparse(src, dst, len);
-    } else {
-        read_pieces(src, dst, len);
-    }
+    read_pieces(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::FallbackUs, falling.elapsed().as_micros() as u64);
 }
@@ -2320,33 +2329,128 @@ pub(crate) const PARALLEL_FROM: usize = 8 << 20;
 /// Parts of such a copy: the detiling threads and the caller.
 pub(crate) const PARTS: usize = 8;
 
-/// [`copy_mapped`] into host memory in [`PARTS`] parts cut at 64 KiB, each
-/// read on its own, so a part with unmapped pages falls back alone.
-fn copy_in_parts(dst: *mut u8, src: *const u8, len: usize) {
-    let part = (len / PARTS).next_multiple_of(64 << 10);
+/// Title memory `[src, src + len)` into host memory at `dst`, zeros for
+/// what is not mapped. What the runtime told us of the range
+/// ([`crate::mapped`]) decides without a question to the host: views are
+/// read, holes between them zeroed. The rest is read whole, and asked
+/// about only if that fails. From [`PARALLEL_FROM`] on the work is done in
+/// [`PARTS`] parts of about the same size.
+fn copy_into_host(dst: *mut u8, src: *const u8, len: usize) {
+    use crate::mapped::State;
     let (dst, src) = (dst as usize, src as usize);
-    let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..len)
-        .step_by(part)
-        .map(|at| {
-            let n = part.min(len - at);
-            Box::new(move || {
-                let (from, to) = ((src + at) as *const u8, (dst + at) as *mut u8);
-                if !read(from, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-                    #[cfg(feature = "diagnostics")]
-                    let falling = std::time::Instant::now();
-                    read_sparse(from, to, n);
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(
-                        crate::copystat::C::FallbackUs,
-                        falling.elapsed().as_micros() as u64,
-                    );
-                }
-            }) as Box<dyn FnOnce() + Send>
-        })
-        .collect();
+    let known = crate::mapped::pieces(src, src + len);
+    let part = if len >= PARALLEL_FROM {
+        (len / PARTS).next_multiple_of(64 << 10)
+    } else {
+        usize::MAX
+    };
+    // What there is to do: (offset, bytes, state), nothing longer than a part.
+    let mut work: Vec<(usize, usize, State)> = Vec::new();
+    let mut add = |start: usize, end: usize, state: State| {
+        let mut at = start;
+        while at < end {
+            let n = part.min(end - at);
+            work.push((at, n, state));
+            at += n;
+        }
+    };
+    if known.is_empty() {
+        add(0, len, State::Unknown);
+    }
+    for (start, end, state) in known {
+        add(start - src, end - src, state);
+    }
+    let one = move |&(at, n, state): &(usize, usize, State)| {
+        let (from, to) = ((src + at) as *const u8, (dst + at) as *mut u8);
+        if state == State::Unmapped {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: inside the destination, which is mapped host memory.
+            unsafe { to.write_bytes(0, n) };
+        } else if {
+            #[cfg(feature = "diagnostics")]
+            if crate::copystat::diff() {
+                count_changed(from, to, n);
+            }
+            !read(from, to, n)
+        } {
+            // Unknown memory with a hole, or a view unmapped meanwhile.
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+            #[cfg(feature = "diagnostics")]
+            let falling = std::time::Instant::now();
+            if n >= 64 << 10 {
+                read_sparse(from, to, n);
+            } else {
+                read_pieces(from, to, n);
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::FallbackUs,
+                falling.elapsed().as_micros() as u64,
+            );
+        }
+    };
+    if len < PARALLEL_FROM || work.len() < 2 {
+        work.iter().for_each(one);
+        return;
+    }
+    // Runs of the work of about a part's bytes each (a pool mapped page by
+    // page is thousands of small pieces).
+    let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::with_capacity(PARTS + 1);
+    let mut rest = &work[..];
+    while !rest.is_empty() {
+        let mut bytes = 0;
+        let n = rest
+            .iter()
+            .take_while(|w| {
+                let take = bytes == 0 || bytes + w.1 <= part;
+                bytes += w.1;
+                take
+            })
+            .count();
+        let (run, after) = rest.split_at(n);
+        rest = after;
+        jobs.push(Box::new(move || run.iter().for_each(one)));
+    }
     victory_formats::texture::run_parallel(jobs);
+}
+
+/// Diagnostics (`VICTORY_COPY_DIFF=1`): how much of title memory `[src,
+/// src + n)` differs from the host copy at `dst` it is about to replace,
+/// in 4 KiB pages and 64 KiB blocks (title addresses), if it reads whole.
+#[cfg(feature = "diagnostics")]
+fn count_changed(src: *const u8, dst: *const u8, n: usize) {
+    use crate::copystat::{C, add};
+    thread_local! {
+        static NOW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    NOW.with_borrow_mut(|now| {
+        now.resize(n, 0);
+        if !read(src, now.as_mut_ptr(), n) {
+            return;
+        }
+        // SAFETY: the host copy's `n` bytes at `dst`.
+        let old = unsafe { std::slice::from_raw_parts(dst, n) };
+        let (mut pages, mut blocks, mut at) = (0u64, 0u64, 0);
+        while at < n {
+            let block = ((src as usize + at) / 65536 + 1) * 65536 - src as usize;
+            let end = block.min(n);
+            let mut any = false;
+            while at < end {
+                let page = (((src as usize + at) / 4096 + 1) * 4096 - src as usize).min(end);
+                if now[at..page] != old[at..page] {
+                    pages += 1;
+                    any = true;
+                }
+                at = page;
+            }
+            blocks += u64::from(any);
+        }
+        add(C::DiffCompared, n as u64);
+        add(C::DiffPages, pages);
+        add(C::DiffBlocks, blocks);
+    });
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never

@@ -21,8 +21,7 @@ use windows_sys::Win32::System::Memory::{
     MEM_PRESERVE_PLACEHOLDER, MEM_PRIVATE, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery,
-    VirtualQueryEx,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualQuery, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -163,7 +162,25 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    if placeholder && !at.is_null() {
+        // Only our own calls map pages into it or out of it from now on:
+        // the GPU side's copies go by what we tell it, not by asking the
+        // host about every view.
+        victory_gpu::title_pages_reserved(at as usize, size.next_multiple_of(PAGE));
+    }
     at
+}
+
+/// The host's `VirtualFree`, which the title calls itself: a reservation
+/// for physical pages that it releases is no longer one the GPU side knows
+/// the mappings of.
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+    // (Released with the placeholder kept is a title splitting one.)
+    if kind & MEM_RELEASE != 0 && kind & MEM_PRESERVE_PLACEHOLDER == 0 && !address.is_null() {
+        victory_gpu::title_pages_released(address as usize);
+    }
+    // SAFETY: the title's own arguments, to the host function of the name.
+    unsafe { windows_sys::Win32::System::Memory::VirtualFree(address, size, kind) }
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -319,7 +336,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            windows_sys::Win32::System::Memory::VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -728,6 +745,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     for (at, len, part) in made {
         // New contents, read-write: the GPU side's copies no longer guard it.
         victory_gpu::title_memory_remapped(at, len);
+        victory_gpu::title_pages_mapped(at, len);
         physical.views.insert(at, (len, part));
     }
     true
@@ -798,7 +816,7 @@ fn split_at(at: usize) {
         // fails the call on anything but a placeholder or memory that
         // replaced one, and then changes nothing.
         unsafe {
-            VirtualFree(
+            windows_sys::Win32::System::Memory::VirtualFree(
                 start as *mut c_void,
                 at - start,
                 MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
@@ -882,6 +900,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         victory_gpu::title_memory_remapped(at, size);
+        victory_gpu::title_pages_unmapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -972,7 +991,8 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
-        dlls: &["xmem.dll"],
+        // The title's own `VirtualFree` too (see there).
+        dlls: &["xmem.dll", "api-ms-win-core-memory-*", "kernel32.dll", "kernelbase.dll"],
         exports: vec![
             hle_export!(XMemAlloc),
             hle_export!(XMemFree),
@@ -987,6 +1007,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XMemVirtualQuery),
             hle_export!(XMemGetWorkingSetStatistics),
             hle_export!(XMemTransferMemory),
+            hle_export!(VirtualFree),
         ],
     }
 }
