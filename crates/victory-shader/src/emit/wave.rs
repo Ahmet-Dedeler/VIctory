@@ -677,3 +677,91 @@ mod tests {
         );
     }
 }
+
+/// Blocks every lane of a wave reaches together: those no per-lane branch
+/// decides about. A block is control dependent on a branch when it
+/// post-dominates one of the branch's successors but not the branch block;
+/// the blocks left are those depending (directly or through other
+/// branches) on uniform branches only, so all lanes of a wave run them the
+/// same number of times. Programs with several ends get a virtual one.
+pub(crate) fn uniform_blocks(p: &Program, st: &crate::structure::Structured) -> Vec<bool> {
+    use crate::structure::{Atom, LaneExit};
+    let n = p.blocks.len();
+    let succs: Vec<Vec<usize>> = p.blocks.iter().map(|b| b.exit.successors()).collect();
+    // Post-dominator sets, iterated to a fixed point (programs have a few
+    // hundred blocks at most); bit sets as vectors of words.
+    let words = n.div_ceil(64);
+    let full = vec![u64::MAX; words];
+    let mut pdom: Vec<Vec<u64>> = (0..n)
+        .map(|b| {
+            if succs[b].is_empty() {
+                let mut s = vec![0; words];
+                s[b / 64] |= 1 << (b % 64);
+                s
+            } else {
+                full.clone()
+            }
+        })
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            if succs[b].is_empty() {
+                continue;
+            }
+            let mut s = full.clone();
+            for &t in &succs[b] {
+                for (w, x) in s.iter_mut().zip(&pdom[t]) {
+                    *w &= x;
+                }
+            }
+            s[b / 64] |= 1 << (b % 64);
+            if s != pdom[b] {
+                pdom[b] = s;
+                changed = true;
+            }
+        }
+    }
+    let has = |set: &[u64], b: usize| set[b / 64] >> (b % 64) & 1 != 0;
+    let lane_branch: Vec<bool> = (0..n)
+        .map(|b| match st.exits.get(b) {
+            Some(&LaneExit::Branch { when, .. }) => st
+                .bools
+                .support(when)
+                .iter()
+                .any(|a| !matches!(a, Atom::Uniform(_))),
+            Some(LaneExit::Indirect) => true,
+            _ => false,
+        })
+        .collect();
+    // Blocks depending on a per-lane branch, then on anything that does.
+    let mut tainted = vec![false; n];
+    let mut work: Vec<usize> = Vec::new();
+    let depends = |b: usize, branch: usize| -> bool {
+        !(b != branch && has(&pdom[branch], b)) && succs[branch].iter().any(|&t| has(&pdom[t], b))
+    };
+    for branch in 0..n {
+        if !lane_branch[branch] {
+            continue;
+        }
+        for b in 0..n {
+            if !tainted[b] && depends(b, branch) {
+                tainted[b] = true;
+                work.push(b);
+            }
+        }
+    }
+    while let Some(branch) = work.pop() {
+        if succs[branch].len() < 2 {
+            continue;
+        }
+        for b in 0..n {
+            if !tainted[b] && depends(b, branch) {
+                tainted[b] = true;
+                work.push(b);
+            }
+        }
+    }
+    tainted.into_iter().map(|t| !t).collect()
+}

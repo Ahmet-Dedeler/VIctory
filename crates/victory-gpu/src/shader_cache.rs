@@ -71,10 +71,33 @@ fn build() -> &'static [u8; 32] {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // Translations for another wave width differ: the width is part of
+    // what identifies the build.
+    let mut key = *build();
+    key[0] ^= split_waves() as u8;
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &key, container, translate),
         None => translate(container),
     }
+}
+
+/// `VICTORY_SPLIT_WAVES=1`: compute programs of 64-lane console waves are
+/// translated for a host of 32-lane waves
+/// ([`victory_shader::emit::set_host_wave_lanes`]). Off by default: not
+/// yet run with a title.
+// shortcut: a switch; take the width from the host device
+// (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMax`, 32 on Apple GPUs)
+// once the 32-lane form has been checked in a title run.
+fn split_waves() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SPLIT_WAVES").is_some();
+        if on {
+            victory_shader::emit::set_host_wave_lanes(32);
+            tracing::info!("64-lane compute programs are translated for 32-lane host waves");
+        }
+        on
+    })
 }
 
 /// The cache entry's converter: the build and the container in, the

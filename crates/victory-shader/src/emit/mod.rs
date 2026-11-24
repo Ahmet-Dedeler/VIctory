@@ -2,7 +2,12 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it. A host that
+//! runs 32-lane waves only ([`set_host_wave_lanes`]) gets 64-lane programs
+//! in a 32-lane form: two host waves as the halves of a console wave,
+//! exchanging through group-shared memory what crosses the halves, where
+//! every such point is one all lanes reach together; else each host wave
+//! as a console wave of its own (`lower::Split`).
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -98,6 +103,25 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+
+/// The widest wave the host GPU runs (`WaveLaneCountMax`); see
+/// [`set_host_wave_lanes`].
+static HOST_WAVE_LANES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Tells the translator the widest wave the host GPU runs
+/// (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMax`). Compute
+/// programs of 64-lane console waves that depend on the lane layout are
+/// then translated for 32-lane waves (see `lower::Split`); without a call
+/// they declare the console's wave size. Set once, before the first
+/// translation: translations made for another width differ.
+pub fn set_host_wave_lanes(max: u32) {
+    HOST_WAVE_LANES.store(max, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The value last given to [`set_host_wave_lanes`] (`u32::MAX`: none).
+pub fn host_wave_lanes() -> u32 {
+    HOST_WAVE_LANES.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -212,6 +236,46 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// What a compute program does that depends on the lane layout, for
+/// surveys of a title's shaders: its thread group, the console wave size,
+/// its LDS size in bytes, then counted names (cross-lane instructions,
+/// `mask:<instruction>` for lane masks read as numbers, whole-wave
+/// sections; `u:<name>` counts those in blocks every lane of a wave
+/// reaches together).
+pub fn lane_census(container: &[u8]) -> Result<([u32; 3], u32, u32, Vec<(String, u32)>), ShaderError> {
+    let c = Container::parse(container)?;
+    let dxil = c
+        .part(FourCC::DXIL)
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Cs)
+        .ok_or(ShaderError::Unsupported {
+            offset: 0,
+            what: "a container without a compute program",
+        })?;
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return Err(ShaderError::Malformed("compute program without its settings"));
+    };
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, &native)?;
+    let st = st?;
+    let counts = lower::lane_census(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    Ok((cs.threads, if native.wave64 { 64 } else { 32 }, cs.lds_bytes(), counts))
 }
 
 /// Emits a program whose earlier stages already ran.
