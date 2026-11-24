@@ -295,6 +295,25 @@ pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 
     host::terminate_process(process, code)
 }
 
+/// A title that suspends a thread: logged with the thread and the caller
+/// (a thread suspended inside our runtime or the host's holds what it holds
+/// until it is resumed), then done by the host.
+#[cfg(windows)]
+pub extern "system" fn SuspendThread(thread: *mut c_void) -> u32 {
+    let (id, name) = host::thread_of(thread);
+    tracing::warn!(id, name, from = %host::callers(), "title suspends a thread");
+    host::suspend_thread(thread)
+}
+
+/// See [`SuspendThread`].
+#[cfg(windows)]
+pub extern "system" fn ResumeThread(thread: *mut c_void) -> u32 {
+    let (id, name) = host::thread_of(thread);
+    let count = host::resume_thread(thread);
+    tracing::warn!(id, name, count, from = %host::callers(), "title resumes a thread");
+    count
+}
+
 /// The pseudo handle of one of our modules: its address, never a real image.
 fn handle(m: &HleModule) -> *mut c_void {
     m as *const HleModule as *mut c_void
@@ -392,6 +411,10 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            #[cfg(windows)]
+            hle_export!(SuspendThread),
+            #[cfg(windows)]
+            hle_export!(ResumeThread),
         ],
     }
 }
@@ -494,6 +517,35 @@ mod host {
     pub(super) fn terminate_process(process: *mut c_void, code: u32) -> i32 {
         // SAFETY: see above.
         unsafe { TerminateProcess(process, code) }
+    }
+
+    pub(super) fn suspend_thread(thread: *mut c_void) -> u32 {
+        // SAFETY: see above.
+        unsafe { windows_sys::Win32::System::Threading::SuspendThread(thread) }
+    }
+
+    pub(super) fn resume_thread(thread: *mut c_void) -> u32 {
+        // SAFETY: see above.
+        unsafe { windows_sys::Win32::System::Threading::ResumeThread(thread) }
+    }
+
+    /// The id and description of the thread behind a handle.
+    pub(super) fn thread_of(thread: *mut c_void) -> (u32, String) {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::System::Threading::{GetThreadDescription, GetThreadId};
+        // SAFETY: queries on the title's handle; the system allocates the
+        // description, freed with LocalFree.
+        unsafe {
+            let id = GetThreadId(thread);
+            let mut name = std::ptr::null_mut();
+            if GetThreadDescription(thread, &mut name) < 0 || name.is_null() {
+                return (id, String::new());
+            }
+            let len = (0..).take_while(|&i| *name.add(i) != 0).count();
+            let text = String::from_utf16_lossy(std::slice::from_raw_parts(name, len));
+            LocalFree(name.cast());
+            (id, text)
+        }
     }
 
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
