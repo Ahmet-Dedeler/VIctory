@@ -45,6 +45,36 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
 });
 
+/// Whether writes to title memory are tracked at all (write watching and
+/// the guard on views, both of which make the title's first write to a
+/// page fault). Not under Wine by default: there write watching is page
+/// protection too, and a translator under it (Rosetta 2 on a Mac) cannot
+/// resume some vector stores (AVX2 masked stores) that fault. Untracked
+/// memory is copied whole and textures are hashed, as for memory that is
+/// neither watched nor a view. `VICTORY_WRITE_WATCH=0` or `1` overrides.
+pub fn tracking() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = match std::env::var("VICTORY_WRITE_WATCH").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => !under_wine(),
+        };
+        tracing::info!(on, "tracking of writes to title memory");
+        on
+    })
+}
+
+/// Wine's ntdll says so itself.
+fn under_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: NUL-terminated names; ntdll is always loaded.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
@@ -53,6 +83,9 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    if !tracking() {
+        return None;
+    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
