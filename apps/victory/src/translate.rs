@@ -325,6 +325,17 @@ fn translate(
         .as_ref()
         .map(|b| blake3::hash(b).to_hex()[..16].to_owned())
         .unwrap_or_default();
+    // `VICTORY_TRANSLATE_ONLY=<file>`: only the containers whose hashes the
+    // file lists (one per line), to try a change on the shaders a run needs.
+    static ONLY: std::sync::OnceLock<Option<HashSet<String>>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        let file = std::env::var_os("VICTORY_TRANSLATE_ONLY")?;
+        let text = std::fs::read_to_string(file).ok()?;
+        Some(text.split_whitespace().map(str::to_owned).collect())
+    });
+    if only.as_ref().is_some_and(|only| !only.contains(&hash)) {
+        return;
+    }
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     let Some(bytes) = bytes else {
         return t.fail("corrupt record".into(), example);
@@ -336,7 +347,9 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    // (A listed container is translated even if another one holds the same
+    // program: a run names it by its own hash.)
+    if !lock(seen).insert(blake3::hash(dxil)) && only.is_none() {
         t.duplicates += 1;
         return;
     }
