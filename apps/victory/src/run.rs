@@ -101,6 +101,23 @@ pub fn run(
         return Ok(());
     }
     victory_loader::report_crashes();
+    // Grand Theft Auto VI's stall watchdog would end a slow start;
+    // `VICTORY_TITLE_WATCHDOG=1` leaves it alone. After the reporter, so
+    // ahead of it: what is stepped over is no crash.
+    if std::env::var("VICTORY_TITLE_WATCHDOG").as_deref() != Ok("1") {
+        use victory_game::watchdog::{AT, BEFORE, resume};
+        victory_loader::resume_null_writes(
+            |before, at, callers| {
+                let callers: Vec<[u8; AT]> = callers
+                    .iter()
+                    .filter_map(|c| <[u8; AT]>::try_from(*c).ok())
+                    .collect();
+                resume(before, at, &callers).map(|r| (r.rip, r.copy))
+            },
+            BEFORE,
+            AT,
+        );
+    }
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     victory_hle::modules::audio::mute::start();

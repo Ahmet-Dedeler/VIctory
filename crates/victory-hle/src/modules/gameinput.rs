@@ -1415,37 +1415,82 @@ mod host {
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
+        fn key(name: &str) -> Option<u8> {
+            Some(match name.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            })
+        }
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let (at, name) = entry.split_once(':')?;
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
+                    key(name)?,
                 ))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        down.extend(from_file(key));
+        down
+    }
+
+    /// Debugging aid: `VICTORY_KEYS_FILE=<file>` presses keys as a run goes
+    /// (by whoever watches it): the file holds `<number>:<key>`, and each
+    /// time the number is higher than the last one seen, the key is held
+    /// for 0.5 s (a title at a few frames a second still sees it). Read at
+    /// most every 50 ms.
+    #[cfg(feature = "diagnostics")]
+    fn from_file(key: fn(&str) -> Option<u8>) -> Option<u8> {
+        struct Watch {
+            read: Instant,
+            last: u64,
+            held: Option<(Instant, u8)>,
+        }
+        static FILE: LazyLock<Option<std::path::PathBuf>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE").map(Into::into));
+        static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
+        let file = FILE.as_ref()?;
+        let mut watch = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let w = watch.get_or_insert_with(|| Watch {
+            read: now,
+            last: 0,
+            held: None,
+        });
+        if now.duration_since(w.read) >= Duration::from_millis(50) {
+            w.read = now;
+            let text = std::fs::read_to_string(file).unwrap_or_default();
+            if let Some((number, name)) = text.trim().split_once(':')
+                && let (Ok(number), Some(vk)) = (number.trim().parse::<u64>(), key(name))
+                && number > w.last
+            {
+                w.last = number;
+                w.held = Some((now, vk));
+                tracing::info!(number, key = name.trim(), "key pressed from the keys file");
+            }
+        }
+        w.held
+            .filter(|&(since, _)| now.duration_since(since) < Duration::from_millis(500))
+            .map(|(_, vk)| vk)
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
