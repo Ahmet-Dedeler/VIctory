@@ -646,6 +646,30 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
+            // With `VICTORY_GPU_TIMING`: every list as it finishes, to set
+            // beside the host's own log (Apple's reports a GPU error there
+            // by the millisecond and to us not at all).
+            #[cfg(feature = "diagnostics")]
+            if timing() {
+                let of = if groups.len() > 1 { &runs[i..=i] } else { runs };
+                let pipelines: std::collections::BTreeSet<String> = of
+                    .iter()
+                    .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                    .collect();
+                let commands: usize = of
+                    .iter()
+                    .map(|l| l.notes.lock().unwrap_or_else(|e| e.into_inner()).len())
+                    .sum();
+                tracing::info!(
+                    n = *submitted,
+                    list = i,
+                    of = groups.len(),
+                    us = started.elapsed().as_micros(),
+                    commands,
+                    ?pipelines,
+                    "host list ran"
+                );
+            }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
@@ -1661,7 +1685,18 @@ impl Meter {
         }
         let Some(caption) = &self.caption else { return };
         let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        // A background run does not read the real keyboard; the caption says
+        // so, or the window passes for one somebody can play in.
+        let label = if crate::background() {
+            "[background test run, keyboard off] "
+        } else {
+            ""
+        };
+        let mut text: Vec<u16> = label
+            .encode_utf16()
+            .chain(caption.iter().copied())
+            .chain(text.encode_utf16())
+            .collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
