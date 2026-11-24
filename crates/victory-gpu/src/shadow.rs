@@ -329,6 +329,65 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        let written = self.copy_back_range(address, len);
+        self.copied_back(&[(address, address + len)]);
+        written
+    }
+
+    /// [`Shadow::copy_back`] for all the ranges a submission declared on
+    /// this copy (`(address, length)` each, in any order, overlapping as
+    /// they like): what they cover is gone through once. The world's
+    /// passes declare hundreds of views of one heap a submission, each
+    /// from its own address to the heap's end; going through each on its
+    /// own compared the pages shaders had written, and read title memory
+    /// there, once per view (0.4-4 s of a busy frame on a Mac for 20-40 MB
+    /// written).
+    pub(crate) fn copy_back_all(&self, declared: &[(usize, usize)]) -> usize {
+        let mut ranges: Vec<(usize, usize)> =
+            declared.iter().map(|&(address, len)| (address, address + len)).collect();
+        ranges.sort_unstable();
+        let mut written = 0;
+        let mut merged: Option<(usize, usize)> = None;
+        for &(from, to) in &ranges {
+            match &mut merged {
+                Some((_, end)) if from <= *end => *end = (*end).max(to),
+                _ => {
+                    if let Some((a, e)) = merged.replace((from, to)) {
+                        written += self.copy_back_range(a, e - a);
+                    }
+                }
+            }
+        }
+        if let Some((a, e)) = merged {
+            written += self.copy_back_range(a, e - a);
+        }
+        self.copied_back(&ranges);
+        written
+    }
+
+    /// The submission is done with the declared ranges `done` (start and
+    /// end): they are no longer pending, and the snapshot goes with the
+    /// last of them.
+    fn copied_back(&self, done: &[(usize, usize)]) {
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match done {
+            [one] => pending.retain(|r| r != one),
+            _ => {
+                let done: std::collections::HashSet<(usize, usize)> = done.iter().copied().collect();
+                pending.retain(|r| !done.contains(r));
+            }
+        }
+        if pending.is_empty()
+            && let Some((_, bytes)) = before.snapshot.take()
+        {
+            before.unchanged.clear();
+            give_back(bytes);
+        }
+    }
+
+    /// The comparing and copying of [`Shadow::copy_back`] for one range.
+    fn copy_back_range(&self, address: usize, len: usize) -> usize {
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Before {
             snapshot,
@@ -411,16 +470,6 @@ impl Shadow {
                     copied[page - base] = now;
                 }
             }
-        }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            unchanged.clear();
-            give_back(bytes);
         }
         written
     }

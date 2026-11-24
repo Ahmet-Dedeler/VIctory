@@ -1406,22 +1406,29 @@ impl Host {
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
         // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        // Per host copy, the ranges declared on it.
+        type Declared = (std::sync::Arc<crate::shadow::Shadow>, std::collections::HashSet<(usize, usize)>);
+        let mut back: Vec<Declared> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
+                if let Step::GpuWrite(shadow, address, len) = step {
+                    let at = match back.iter().position(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                        Some(at) => at,
+                        None => {
+                            back.push((shadow.clone(), Default::default()));
+                            back.len() - 1
+                        }
+                    };
+                    back[at].1.insert((*address, *len));
                 }
             }
         }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+        for (shadow, declared) in &back {
+            let declared: Vec<(usize, usize)> = declared.iter().copied().collect();
+            let written = shadow.copy_back_all(&declared);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BackDeclared, declared.len() as u64);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Host timestamps the lists resolved, on the title's GPU clock.

@@ -251,12 +251,9 @@ pub(crate) fn log(frames: f64) {
         per(T::Prepare),
     );
     tracing::info!(
-        "after submissions, per frame: {:.1} MB copied back into title memory ({:.1} MB declared \
-         as written) in {:.1} ms; {:.1} ms in the title's GPU writes and host messages",
-        mb(c[C::BackBytes as usize]),
-        mb(c[C::BackDeclared as usize]),
-        ms(c[C::BackUs as usize]),
-        ms(c[C::AfterUs as usize]),
+        "after submissions, per frame: {:.0} ranges declared as written by shaders, gone through \
+         once per host copy",
+        c[C::BackDeclared as usize],
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
