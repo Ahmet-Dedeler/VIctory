@@ -212,18 +212,22 @@ pub(crate) fn geometry_shader(vs: &[u8]) -> Option<Arc<[u8]>> {
 }
 
 /// Whether indirect rectangle draws counted by vertices run as indexed
-/// ones on this host. D3DMetal draws nothing for a non-indexed
-/// `ExecuteIndirect` with a geometry shader pipeline (measured: the same
-/// pipeline and record as a direct draw, or an indexed indirect draw with
-/// such a pipeline, fill their targets), and the title's tiled lighting is
-/// exactly that. `VICTORY_RECTS_INDEXED=0|1` overrides it.
+/// ones (`VICTORY_RECTS_INDEXED=1`; off by default). D3DMetal draws
+/// nothing for the title's tiled lighting, a non-indexed `ExecuteIndirect`
+/// with a geometry shader pipeline: the same pipelines and records as
+/// direct draws fill their targets, and so does the frame's indexed
+/// indirect rectangle draw. This conversion is the intended way round it
+/// and does not work there yet: the record it copies on the GPU
+/// (`CopyBufferRegion` out of the host copy of title memory) arrives as
+/// zeros on D3DMetal, as does a read-back of any indirect record made the
+/// same way, so the converted draw runs with no vertices.
+/// shortcut: until the record is built by a compute pass (as the argument
+/// clamp reads and writes it), the lighting's draws do not reach the scene
+/// on D3DMetal; `VICTORY_RECTS_DIRECT` (diagnostics) runs them as direct
+/// draws with the record title memory holds.
 pub(crate) fn by_indices() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_RECTS_INDEXED").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => crate::host::host().is_some_and(|h| h.mesh_output_limit().is_some()),
-    })
+    *ON.get_or_init(|| std::env::var("VICTORY_RECTS_INDEXED").as_deref() == Ok("1"))
 }
 
 /// How many vertex numbers [`indexed`]'s index buffer holds.
