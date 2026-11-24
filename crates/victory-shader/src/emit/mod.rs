@@ -735,7 +735,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).unwrap();
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -1302,6 +1302,8 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                stride_table: l.stride_table,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
