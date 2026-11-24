@@ -47,9 +47,9 @@ impl Gpu {
         let bytes = crate::dxbc::build(&[]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
         let mut shader = emit(&c, &native, &p, &st, &io, &res)
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         if let Some(v) = &mut self.validator {
