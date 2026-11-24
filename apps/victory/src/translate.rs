@@ -183,6 +183,7 @@ pub fn run(
         );
     }
     let mut target = emit::Target::ANY;
+    #[cfg(windows)]
     if pipelines {
         target = Host::new(false).map_err(anyhow::Error::msg)?.target();
     }
