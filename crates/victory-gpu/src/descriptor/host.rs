@@ -209,7 +209,6 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             dynamic: extra,
             next: Mutex::new((0, vec![false; extra as usize])),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             strides,
         };
         // A slot never written is undefined: shaders reading one (a slot

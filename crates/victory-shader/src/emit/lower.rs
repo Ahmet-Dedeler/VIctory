@@ -4129,6 +4129,8 @@ impl<'a> Lower<'a> {
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+    }
+
     /// The view-heap slot of `src` when it comes from a descriptor table or
     /// heap (`Loaded` or `Phi` of `Loaded`).
     fn heap_slot(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
