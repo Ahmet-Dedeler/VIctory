@@ -39,7 +39,7 @@ What each part does today and what it still needs:
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
+| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk; occlusion, pipeline statistics and timestamp queries run on the host GPU | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; depth bounds, HDR and scaling are missing; console-only query types get stand-in results |
 | Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
@@ -50,6 +50,12 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+On Windows 10 the in-box D3D12 runtime stops at shader model 6.5, so the host
+refuses every translated pipeline. `cargo xtask agility` fetches Microsoft's
+D3D12 Agility SDK runtime (a pinned, hash-checked NuGet package) into
+`target\<profile>\D3D12\`, where `victory.exe` makes D3D12 load it. Windows 11
+needs nothing.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
@@ -58,6 +64,7 @@ the Windows paging file size, then retry.
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
+cargo xtask agility                      # Windows 10 only: newer D3D12 runtime
 cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```

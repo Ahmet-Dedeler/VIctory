@@ -37,6 +37,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    caps: HostCaps,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -60,6 +61,52 @@ pub(crate) struct Host {
 unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
+
+/// A host resource waiting to be dropped after in-flight GPU work finishes.
+struct Retired {
+    frame: u64,
+    #[allow(dead_code)]
+    resource: ID3D12Resource,
+}
+
+// SAFETY: D3D12 resources are free-threaded and may be released on any thread.
+unsafe impl Send for Retired {}
+
+/// Host resources retired on worker threads (for example when a descriptor
+/// slot is overwritten or a title resource is released while a submission is
+/// executing on the GPU). Kept alive for several presented frames because a
+/// single title frame spans many submissions and worker threads may record
+/// lists ahead of presentation.
+static RETIRED: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
+
+/// Holds `resource` alive until several full frames have completed on the GPU.
+pub(crate) fn retire(resource: ID3D12Resource) {
+    let frame = crate::queue::presented();
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Retired { frame, resource });
+}
+
+/// Ages are in frames presented to the host (not the title's 60 Hz clock, which
+/// ticks many times per frame while the host runs at 1-2 fps).
+/// Takes retired resources old enough to drop once the current submission
+/// finishes on the GPU.
+fn take_retired() -> Vec<Retired> {
+    const KEEP_FRAMES: u64 = 4;
+    let now = crate::queue::presented();
+    let mut guard = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ready = Vec::new();
+    let mut i = 0;
+    while i < guard.len() {
+        if now.saturating_sub(guard[i].frame) >= KEEP_FRAMES {
+            ready.push(guard.swap_remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    ready
+}
 
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
@@ -172,18 +219,8 @@ fn create() -> windows::core::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
-        let mut device: Option<ID3D12Device> = None;
-        // Diagnostics: the software adapter, on which a shader's wild access
-        // is an access violation in this process (a crash report with the
-        // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
-            let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            tracing::info!("host device on the software adapter (WARP)");
-        } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-        }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+        let (device, adapter_desc) = create_device()?;
+        let caps = probe_caps(&device, &adapter_desc);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -207,9 +244,10 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        tracing::info!("host D3D12 device ready");
+        tracing::info!("host D3D12 device ready: {}", caps.summary());
         Ok(Host {
             device,
+            caps,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -226,6 +264,429 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// Optional adapter override parsed from `VICTORY_D3D12_ADAPTER`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AdapterFilter {
+    /// 0-based index into the enumerated hardware adapter list.
+    Index(usize),
+    /// Lowercased substring matched case-insensitively against adapter name.
+    Name(String),
+}
+
+impl AdapterFilter {
+    fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(index) = trimmed.parse::<usize>()
+        {
+            return Some(Self::Index(index));
+        }
+        Some(Self::Name(trimmed.to_lowercase()))
+    }
+
+    fn matches(&self, index: usize, description: &str) -> bool {
+        match self {
+            Self::Index(wanted) => index == *wanted,
+            Self::Name(needle) => description.to_lowercase().contains(needle),
+        }
+    }
+}
+
+/// Probed capabilities of the selected host D3D12 adapter and device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct HostCaps {
+    pub(crate) adapter_description: String,
+    pub(crate) vendor_id: u32,
+    pub(crate) device_id: u32,
+    pub(crate) dedicated_vram_mb: u64,
+    pub(crate) is_software: bool,
+    pub(crate) resource_binding_tier: D3D12_RESOURCE_BINDING_TIER,
+    pub(crate) tiled_resources_tier: D3D12_TILED_RESOURCES_TIER,
+    pub(crate) wave_ops: bool,
+    pub(crate) wave_lane_count_min: u32,
+    pub(crate) wave_lane_count_max: u32,
+    pub(crate) mesh_shader_tier: D3D12_MESH_SHADER_TIER,
+    pub(crate) highest_shader_model: D3D_SHADER_MODEL,
+    pub(crate) atomic_int64_typed: bool,
+    pub(crate) atomic_int64_group_shared: bool,
+    pub(crate) atomic_int64_descriptor_heap: bool,
+    pub(crate) raytracing_tier: D3D12_RAYTRACING_TIER,
+}
+
+#[allow(dead_code)]
+impl HostCaps {
+    /// Whether the host supports 64-lane wave operations (console shaders
+    /// natively execute in 64-lane wavefronts).
+    pub(crate) fn supports_wave64(&self) -> bool {
+        self.wave_ops
+            && self.wave_lane_count_min > 0
+            && self.wave_lane_count_min <= 64
+            && self.wave_lane_count_max >= 64
+    }
+
+    pub(crate) fn wave_lane_count_min(&self) -> u32 {
+        self.wave_lane_count_min
+    }
+
+    pub(crate) fn wave_lane_count_max(&self) -> u32 {
+        self.wave_lane_count_max
+    }
+
+    pub(crate) fn supports_atomic_int64_typed(&self) -> bool {
+        self.atomic_int64_typed
+    }
+
+    pub(crate) fn supports_atomic_int64_group_shared(&self) -> bool {
+        self.atomic_int64_group_shared
+    }
+
+    pub(crate) fn supports_atomic_int64_descriptor_heap(&self) -> bool {
+        self.atomic_int64_descriptor_heap
+    }
+
+    pub(crate) fn resource_binding_tier(&self) -> D3D12_RESOURCE_BINDING_TIER {
+        self.resource_binding_tier
+    }
+
+    pub(crate) fn tiled_resources_tier(&self) -> D3D12_TILED_RESOURCES_TIER {
+        self.tiled_resources_tier
+    }
+
+    pub(crate) fn raytracing_tier(&self) -> D3D12_RAYTRACING_TIER {
+        self.raytracing_tier
+    }
+
+    pub(crate) fn mesh_shader_tier(&self) -> D3D12_MESH_SHADER_TIER {
+        self.mesh_shader_tier
+    }
+
+    pub(crate) fn highest_shader_model(&self) -> D3D_SHADER_MODEL {
+        self.highest_shader_model
+    }
+
+    /// Whether the host supports mesh shaders at shader model 6.6 or newer.
+    pub(crate) fn supports_mesh_shaders(&self) -> bool {
+        self.mesh_shader_tier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+            && self.highest_shader_model.0 >= D3D_SHADER_MODEL_6_6.0
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "{} (vendor={:#06x} device={:#06x}{}) | VRAM={} MB | SM={} | Wave={}..{} (ops={}) | BindingTier={} | TiledTier={} | Mesh={} | RT={} | AtomicI64(typed={}, shared={}, heap={})",
+            self.adapter_description,
+            self.vendor_id,
+            self.device_id,
+            if self.is_software { ", WARP" } else { "" },
+            self.dedicated_vram_mb,
+            format_shader_model(self.highest_shader_model),
+            self.wave_lane_count_min,
+            self.wave_lane_count_max,
+            self.wave_ops,
+            self.resource_binding_tier.0,
+            tiled_tier_label(self.tiled_resources_tier),
+            mesh_tier_label(self.mesh_shader_tier),
+            raytracing_tier_label(self.raytracing_tier),
+            self.atomic_int64_typed,
+            self.atomic_int64_group_shared,
+            self.atomic_int64_descriptor_heap,
+        )
+    }
+}
+
+fn decode_utf16_z(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len]).trim().to_owned()
+}
+
+fn is_software_adapter(desc: &DXGI_ADAPTER_DESC1) -> bool {
+    desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+}
+
+fn format_shader_model(sm: D3D_SHADER_MODEL) -> String {
+    if sm == D3D_SHADER_MODEL_NONE {
+        "none".to_owned()
+    } else {
+        format!("{}.{}", sm.0 >> 4, sm.0 & 0xf)
+    }
+}
+
+fn tiled_tier_label(tier: D3D12_TILED_RESOURCES_TIER) -> &'static str {
+    match tier {
+        D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED => "none",
+        D3D12_TILED_RESOURCES_TIER_1 => "1",
+        D3D12_TILED_RESOURCES_TIER_2 => "2",
+        D3D12_TILED_RESOURCES_TIER_3 => "3",
+        D3D12_TILED_RESOURCES_TIER_4 => "4",
+        _ => "unknown",
+    }
+}
+
+fn mesh_tier_label(tier: D3D12_MESH_SHADER_TIER) -> &'static str {
+    match tier {
+        D3D12_MESH_SHADER_TIER_NOT_SUPPORTED => "none",
+        D3D12_MESH_SHADER_TIER_1 => "1.0",
+        _ => "unknown",
+    }
+}
+
+fn raytracing_tier_label(tier: D3D12_RAYTRACING_TIER) -> &'static str {
+    match tier {
+        D3D12_RAYTRACING_TIER_NOT_SUPPORTED => "none",
+        D3D12_RAYTRACING_TIER_1_0 => "1.0",
+        D3D12_RAYTRACING_TIER_1_1 => "1.1",
+        _ => "unknown",
+    }
+}
+
+/// Returns candidate indices matching `filter` (or all indices in preference
+/// order when `filter` is `None`).
+fn matching_adapter_indices(names: &[&str], filter: Option<&AdapterFilter>) -> Vec<usize> {
+    names
+        .iter()
+        .enumerate()
+        .filter(|&(index, name)| filter.is_none_or(|f| f.matches(index, name)))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Selects a DXGI adapter and creates a Feature Level 12.0 D3D12 device.
+///
+/// Honors `VICTORY_D3D12_WARP` (diagnostics builds only, verified software)
+/// and `VICTORY_D3D12_ADAPTER` (0-based hardware adapter index or
+/// case-insensitive name substring). Defaults to `IDXGIFactory6`
+/// high-performance ordering with `IDXGIFactory1` fallback, skipping software
+/// adapters.
+fn create_device() -> windows::core::Result<(ID3D12Device, DXGI_ADAPTER_DESC1)> {
+    // Diagnostics: the software adapter, on which a shader's wild access
+    // is an access violation in this process (a crash report with the
+    // address and instruction) instead of a GPU fault and driver reset.
+    if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        let adapter = warp_adapter()?;
+        // SAFETY: `adapter` is a valid COM adapter returned by `warp_adapter`.
+        unsafe {
+            let desc = adapter.cast::<IDXGIAdapter1>()?.GetDesc1()?;
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let device = device.ok_or_else(windows::core::Error::empty)?;
+            return Ok((device, desc));
+        }
+    }
+
+    let raw_override = std::env::var_os("VICTORY_D3D12_ADAPTER");
+    let filter = raw_override
+        .as_deref()
+        .and_then(|v| AdapterFilter::parse(&v.to_string_lossy()));
+
+    // SAFETY: plain DXGI factory creation and adapter enumeration.
+    let candidates = unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        enumerate_hardware_adapters(&factory)?
+    };
+    let names: Vec<&str> = candidates
+        .iter()
+        .map(|(_, _, name)| name.as_str())
+        .collect();
+    let indices = matching_adapter_indices(&names, filter.as_ref());
+
+    let mut last_err = None;
+    for idx in indices {
+        let (adapter, desc, name) = &candidates[idx];
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: `adapter` is a live DXGI adapter enumerated from the factory.
+        match unsafe { D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device) } {
+            Ok(()) => {
+                if let Some(device) = device {
+                    return Ok((device, *desc));
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    index = idx,
+                    adapter = %name,
+                    error = %e,
+                    "skipping adapter: D3D12 feature level 12.0 creation failed"
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+
+    let available: Vec<String> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, (_, desc, name))| format!("{i}: {name} ({} MB)", desc.DedicatedVideoMemory >> 20))
+        .collect();
+    if let Some(raw) = raw_override.filter(|_| filter.is_some()) {
+        tracing::warn!(
+            requested = %raw.to_string_lossy(),
+            available = ?available,
+            "no hardware D3D12 adapter matched VICTORY_D3D12_ADAPTER"
+        );
+    } else {
+        tracing::warn!(
+            available = ?available,
+            "no hardware D3D12 adapter supported feature level 12.0"
+        );
+    }
+    Err(last_err.unwrap_or_else(|| windows::core::Error::from_hresult(DXGI_ERROR_NOT_FOUND)))
+}
+
+/// Enumerates non-software DXGI adapters in high-performance order using
+/// `IDXGIFactory6::EnumAdapterByGpuPreference` when available, falling back
+/// to `IDXGIFactory1::EnumAdapters1`.
+unsafe fn enumerate_hardware_adapters(
+    factory: &IDXGIFactory1,
+) -> windows::core::Result<Vec<(IDXGIAdapter1, DXGI_ADAPTER_DESC1, String)>> {
+    let mut raw_adapters: Vec<IDXGIAdapter1> = Vec::new();
+    let mut used_factory6 = false;
+
+    if let Ok(factory6) = factory.cast::<IDXGIFactory6>() {
+        let mut i = 0u32;
+        loop {
+            // SAFETY: `factory6` is a valid `IDXGIFactory6` COM interface.
+            match unsafe {
+                factory6.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                    i,
+                    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                )
+            } {
+                Ok(adapter) => {
+                    used_factory6 = true;
+                    raw_adapters.push(adapter);
+                    i += 1;
+                }
+                Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => {
+                    used_factory6 = true;
+                    break;
+                }
+                Err(e) if i == 0 => {
+                    tracing::debug!(
+                        error = %e,
+                        "EnumAdapterByGpuPreference unavailable; falling back to EnumAdapters1"
+                    );
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    if !used_factory6 {
+        let mut i = 0u32;
+        loop {
+            // SAFETY: `factory` is a valid `IDXGIFactory1` COM interface.
+            match unsafe { factory.EnumAdapters1(i) } {
+                Ok(adapter) => {
+                    raw_adapters.push(adapter);
+                    i += 1;
+                }
+                Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    let mut hardware = Vec::with_capacity(raw_adapters.len());
+    for adapter in raw_adapters {
+        // SAFETY: `adapter` is a live `IDXGIAdapter1`.
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        if is_software_adapter(&desc) {
+            continue;
+        }
+        let name = decode_utf16_z(&desc.Description);
+        hardware.push((adapter, desc, name));
+    }
+    Ok(hardware)
+}
+
+/// Queries a D3D12 feature support struct on `device`.
+///
+/// # Safety
+/// `T` must be the exact `D3D12_FEATURE_DATA_*` struct corresponding to
+/// `feature`.
+unsafe fn check_feature<T>(device: &ID3D12Device, feature: D3D12_FEATURE, data: &mut T) -> bool {
+    // SAFETY: caller guarantees `data` matches `feature`'s ABI layout and size.
+    unsafe {
+        device
+            .CheckFeatureSupport(feature, (data as *mut T).cast(), size_of::<T>() as u32)
+            .is_ok()
+    }
+}
+
+/// Probes host D3D12 device capabilities once at device creation.
+fn probe_caps(device: &ID3D12Device, desc: &DXGI_ADAPTER_DESC1) -> HostCaps {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    let mut options1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    let mut options5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+    let mut options7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    let mut options9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+    let mut options11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+
+    // SAFETY: each feature enum matches its corresponding `D3D12_FEATURE_DATA_*` struct.
+    unsafe {
+        let _ = check_feature(device, D3D12_FEATURE_D3D12_OPTIONS, &mut options);
+        let _ = check_feature(device, D3D12_FEATURE_D3D12_OPTIONS1, &mut options1);
+        let _ = check_feature(device, D3D12_FEATURE_D3D12_OPTIONS5, &mut options5);
+        let _ = check_feature(device, D3D12_FEATURE_D3D12_OPTIONS7, &mut options7);
+        let _ = check_feature(device, D3D12_FEATURE_D3D12_OPTIONS9, &mut options9);
+        let _ = check_feature(device, D3D12_FEATURE_D3D12_OPTIONS11, &mut options11);
+    }
+
+    // D3D12 returns E_INVALIDARG if the requested shader model is newer than
+    // what the installed runtime recognizes, so probe downward.
+    const SHADER_MODELS: &[D3D_SHADER_MODEL] = &[
+        D3D_SHADER_MODEL_6_9,
+        D3D_SHADER_MODEL_6_8,
+        D3D_SHADER_MODEL_6_7,
+        D3D_SHADER_MODEL_6_6,
+        D3D_SHADER_MODEL_6_5,
+        D3D_SHADER_MODEL_6_4,
+        D3D_SHADER_MODEL_6_3,
+        D3D_SHADER_MODEL_6_2,
+        D3D_SHADER_MODEL_6_1,
+        D3D_SHADER_MODEL_6_0,
+        D3D_SHADER_MODEL_5_1,
+    ];
+    let mut highest_shader_model = D3D_SHADER_MODEL_NONE;
+    for &candidate in SHADER_MODELS {
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: candidate,
+        };
+        // SAFETY: `D3D12_FEATURE_DATA_SHADER_MODEL` matches `D3D12_FEATURE_SHADER_MODEL`.
+        if unsafe { check_feature(device, D3D12_FEATURE_SHADER_MODEL, &mut sm) } {
+            highest_shader_model = sm.HighestShaderModel;
+            break;
+        }
+    }
+
+    HostCaps {
+        adapter_description: decode_utf16_z(&desc.Description),
+        vendor_id: desc.VendorId,
+        device_id: desc.DeviceId,
+        dedicated_vram_mb: (desc.DedicatedVideoMemory as u64) >> 20,
+        is_software: is_software_adapter(desc),
+        resource_binding_tier: options.ResourceBindingTier,
+        tiled_resources_tier: options.TiledResourcesTier,
+        wave_ops: options1.WaveOps.as_bool(),
+        wave_lane_count_min: options1.WaveLaneCountMin,
+        wave_lane_count_max: options1.WaveLaneCountMax,
+        mesh_shader_tier: options7.MeshShaderTier,
+        highest_shader_model,
+        atomic_int64_typed: options9.AtomicInt64OnTypedResourceSupported.as_bool(),
+        atomic_int64_group_shared: options9.AtomicInt64OnGroupSharedSupported.as_bool(),
+        atomic_int64_descriptor_heap: options11
+            .AtomicInt64OnDescriptorHeapResourceSupported
+            .as_bool(),
+        raytracing_tier: options5.RaytracingTier,
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -234,7 +695,7 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
         let adapter: IDXGIAdapter = factory.EnumWarpAdapter()?;
         let desc = adapter.cast::<IDXGIAdapter1>()?.GetDesc1()?;
-        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+        if !is_software_adapter(&desc) {
             tracing::warn!(
                 vendor = format_args!("{:#x}", desc.VendorId),
                 flags = format_args!("{:#x}", desc.Flags),
@@ -250,7 +711,201 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_copies_preserve_islands_and_observe_remaps() {
+        use windows_sys::Win32::System::Memory::*;
+        const N: usize = 5 << 16;
+        // SAFETY: we reserve a private region, commit selected pages inside it,
+        // and only directly access the pages while they are writable.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let mut expected = vec![0; N];
+            for (offset, value) in [(0, 9), (2 << 16, 37), (N - 4096, 85)] {
+                let at = base.add(offset);
+                assert_eq!(VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                at.write_bytes(value, 4096);
+                expected[offset..offset + 4096].fill(value);
+            }
+            for remap in [false, true] {
+                if remap {
+                    let mut old = 0;
+                    assert_ne!(VirtualProtect(base.cast(), 4096, PAGE_NOACCESS, &mut old), 0);
+                    expected[..4096].fill(0);
+                    let at = base.add(1 << 16);
+                    assert_eq!(VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                    at.write_bytes(0xc7, 4096);
+                    expected[1 << 16..(1 << 16) + 4096].fill(0xc7);
+                }
+                let mut out = vec![0xee; N];
+                super::copy_mapped(out.as_mut_ptr().add(27), base.add(27), N - 54, false);
+                assert_eq!(out[27..N - 27], expected[27..N - 27]);
+                assert!(out[..27].iter().chain(&out[N - 27..]).all(|&v| v == 0xee));
+            }
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn adapter_filter_parses_index_and_name() {
+        assert_eq!(AdapterFilter::parse(""), None);
+        assert_eq!(AdapterFilter::parse("   "), None);
+        assert_eq!(AdapterFilter::parse("0"), Some(AdapterFilter::Index(0)));
+        assert_eq!(AdapterFilter::parse(" 2 "), Some(AdapterFilter::Index(2)));
+        assert_eq!(
+            AdapterFilter::parse("RTX 5090"),
+            Some(AdapterFilter::Name("rtx 5090".to_owned()))
+        );
+        assert_eq!(
+            AdapterFilter::parse("  AMD  "),
+            Some(AdapterFilter::Name("amd".to_owned()))
+        );
+        // Signed strings are treated as name substrings, not indices.
+        assert_eq!(
+            AdapterFilter::parse("+1"),
+            Some(AdapterFilter::Name("+1".to_owned()))
+        );
+        assert_eq!(
+            AdapterFilter::parse("-1"),
+            Some(AdapterFilter::Name("-1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn adapter_filter_matches_index_and_case_insensitive_substring() {
+        let adapters = ["NVIDIA GeForce RTX 5090", "AMD Radeon(TM) Graphics"];
+
+        assert_eq!(matching_adapter_indices(&adapters, None), vec![0, 1]);
+
+        let by_idx = AdapterFilter::parse("1").unwrap();
+        assert_eq!(matching_adapter_indices(&adapters, Some(&by_idx)), vec![1]);
+
+        let oob_idx = AdapterFilter::parse("5").unwrap();
+        assert!(matching_adapter_indices(&adapters, Some(&oob_idx)).is_empty());
+
+        let by_vendor = AdapterFilter::parse("nvidia").unwrap();
+        assert_eq!(
+            matching_adapter_indices(&adapters, Some(&by_vendor)),
+            vec![0]
+        );
+
+        let by_model = AdapterFilter::parse("RADEON").unwrap();
+        assert_eq!(
+            matching_adapter_indices(&adapters, Some(&by_model)),
+            vec![1]
+        );
+
+        let missing = AdapterFilter::parse("Intel Arc").unwrap();
+        assert!(matching_adapter_indices(&adapters, Some(&missing)).is_empty());
+    }
+
+    #[test]
+    fn decode_utf16_z_handles_nul_and_unterminated() {
+        let mut buf = [0u16; 16];
+        for (slot, ch) in buf.iter_mut().zip("Test GPU  ".encode_utf16()) {
+            *slot = ch;
+        }
+        assert_eq!(decode_utf16_z(&buf), "Test GPU");
+
+        let full: Vec<u16> = "NoNull".encode_utf16().collect();
+        assert_eq!(decode_utf16_z(&full), "NoNull");
+
+        assert_eq!(decode_utf16_z(&[]), "");
+        assert_eq!(decode_utf16_z(&[0, b'A' as u16]), "");
+    }
+
+    #[test]
+    fn is_software_adapter_checks_flag() {
+        let mut desc = DXGI_ADAPTER_DESC1::default();
+        assert!(!is_software_adapter(&desc));
+        desc.Flags = DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32;
+        assert!(is_software_adapter(&desc));
+        desc.Flags |= DXGI_ADAPTER_FLAG_REMOTE.0 as u32;
+        assert!(is_software_adapter(&desc));
+    }
+
+    #[test]
+    fn format_shader_model_renders_versions() {
+        assert_eq!(format_shader_model(D3D_SHADER_MODEL_NONE), "none");
+        assert_eq!(format_shader_model(D3D_SHADER_MODEL_5_1), "5.1");
+        assert_eq!(format_shader_model(D3D_SHADER_MODEL_6_0), "6.0");
+        assert_eq!(format_shader_model(D3D_SHADER_MODEL_6_6), "6.6");
+        assert_eq!(format_shader_model(D3D_SHADER_MODEL_6_8), "6.8");
+    }
+
+    #[test]
+    fn host_caps_helpers_cover_gpu_profiles() {
+        let wave32 = HostCaps {
+            adapter_description: "Discrete Wave32 GPU".to_owned(),
+            vendor_id: 0x10de,
+            device_id: 0x2b85,
+            dedicated_vram_mb: 32607,
+            is_software: false,
+            resource_binding_tier: D3D12_RESOURCE_BINDING_TIER_3,
+            tiled_resources_tier: D3D12_TILED_RESOURCES_TIER_3,
+            wave_ops: true,
+            wave_lane_count_min: 32,
+            wave_lane_count_max: 32,
+            mesh_shader_tier: D3D12_MESH_SHADER_TIER_1,
+            highest_shader_model: D3D_SHADER_MODEL_6_7,
+            atomic_int64_typed: true,
+            atomic_int64_group_shared: true,
+            atomic_int64_descriptor_heap: true,
+            raytracing_tier: D3D12_RAYTRACING_TIER_1_1,
+        };
+        assert!(!wave32.supports_wave64());
+        assert_eq!(wave32.wave_lane_count_min(), 32);
+        assert_eq!(wave32.wave_lane_count_max(), 32);
+        assert!(wave32.supports_atomic_int64_typed());
+        assert!(wave32.supports_atomic_int64_group_shared());
+        assert!(wave32.supports_atomic_int64_descriptor_heap());
+        assert_eq!(
+            wave32.resource_binding_tier(),
+            D3D12_RESOURCE_BINDING_TIER_3
+        );
+        assert!(wave32.supports_mesh_shaders());
+        let summary = wave32.summary();
+        assert!(summary.contains("Discrete Wave32 GPU"));
+        assert!(summary.contains("VRAM=32607 MB"));
+        assert!(summary.contains("SM=6.7"));
+        assert!(summary.contains("Wave=32..32"));
+        assert!(summary.contains("BindingTier=3"));
+        assert!(summary.contains("Mesh=1.0"));
+        assert!(summary.contains("RT=1.1"));
+        assert!(summary.contains("AtomicI64(typed=true"));
+
+        // Wave32/Wave64 dual-mode GPU (e.g. RDNA) supports wave64.
+        let mut wave32_64 = wave32.clone();
+        wave32_64.wave_lane_count_min = 32;
+        wave32_64.wave_lane_count_max = 64;
+        assert!(wave32_64.supports_wave64());
+
+        // Fixed Wave64 GPU supports wave64.
+        let mut wave64_only = wave32.clone();
+        wave64_only.wave_lane_count_min = 64;
+        wave64_only.wave_lane_count_max = 64;
+        assert!(wave64_only.supports_wave64());
+
+        // Wave ops disabled or zero min lane count must not claim wave64.
+        let mut no_wave_ops = wave64_only.clone();
+        no_wave_ops.wave_ops = false;
+        assert!(!no_wave_ops.supports_wave64());
+
+        let mut zero_min = wave64_only.clone();
+        zero_min.wave_lane_count_min = 0;
+        assert!(!zero_min.supports_wave64());
+
+        // Mesh shaders require both tier support and SM 6.6+.
+        let mut old_sm = wave32.clone();
+        old_sm.highest_shader_model = D3D_SHADER_MODEL_6_5;
+        assert!(!old_sm.supports_mesh_shaders());
+
+        let mut no_mesh = wave32.clone();
+        no_mesh.mesh_shader_tier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+        assert!(!no_mesh.supports_mesh_shaders());
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -274,6 +929,28 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    #[test]
+    fn warp_device_creation_and_caps_probe() {
+        let Ok(adapter) = warp_adapter() else {
+            return;
+        };
+        // SAFETY: `adapter` is a verified software WARP adapter.
+        let (device, desc) = unsafe {
+            let desc = adapter.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap();
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                return;
+            }
+            (device.unwrap(), desc)
+        };
+        let caps = probe_caps(&device, &desc);
+        assert!(caps.is_software);
+        assert!(!caps.adapter_description.is_empty());
+        assert!(caps.resource_binding_tier.0 >= D3D12_RESOURCE_BINDING_TIER_1.0);
+        assert_ne!(caps.highest_shader_model, D3D_SHADER_MODEL_NONE);
+        assert!(caps.summary().contains("WARP"));
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -296,6 +973,9 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// Queries begun in the list and not ended yet: host heap, type, index,
+    /// and whether a draw since was not run on the host (`missed_draw`).
+    queries: Mutex<Vec<(ID3D12QueryHeap, D3D12_QUERY_TYPE, u32, bool)>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -412,39 +1092,40 @@ struct Deferred {
 }
 
 impl Host {
+    /// Probed capabilities of the selected host GPU.
+    #[allow(dead_code)]
+    pub(crate) fn caps(&self) -> &HostCaps {
+        &self.caps
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
-    /// mesh shaders need both); logged once.
+    /// mesh shaders need both).
     pub(crate) fn mesh_shaders(&self) -> bool {
-        static MESH: OnceLock<bool> = OnceLock::new();
-        *MESH.get_or_init(|| {
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
-            let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS7,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
-                        .CheckFeatureSupport(
-                            D3D12_FEATURE_SHADER_MODEL,
-                            (&raw mut model).cast(),
-                            size_of_val(&model) as u32,
-                        )
-                        .is_ok()
-            };
-            let mesh = ok
-                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
-            tracing::info!(mesh, "host mesh shader support");
-            mesh
-        })
+        self.caps.supports_mesh_shaders()
+    }
+
+    /// Whether the host supports 64-lane wave operations.
+    #[allow(dead_code)]
+    pub(crate) fn supports_wave64(&self) -> bool {
+        self.caps.supports_wave64()
+    }
+
+    /// Maximum wave lane count supported by the host GPU.
+    #[allow(dead_code)]
+    pub(crate) fn wave_lane_count_max(&self) -> u32 {
+        self.caps.wave_lane_count_max()
+    }
+
+    /// Whether the host supports 64-bit integer atomics on typed resources.
+    #[allow(dead_code)]
+    pub(crate) fn supports_atomic_int64_typed(&self) -> bool {
+        self.caps.supports_atomic_int64_typed()
+    }
+
+    /// Host D3D12 resource binding tier.
+    #[allow(dead_code)]
+    pub(crate) fn resource_binding_tier(&self) -> D3D12_RESOURCE_BINDING_TIER {
+        self.caps.resource_binding_tier()
     }
 
     /// A new list, open for recording.
@@ -478,6 +1159,7 @@ impl Host {
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
+                queries: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -508,6 +1190,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        let retired = take_retired();
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -572,6 +1255,7 @@ impl Host {
                 last_notes(runs)
             ));
         }
+        drop(retired);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -596,12 +1280,45 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // Host timestamps the lists resolved, on the title's GPU clock.
+        let mut clock = None;
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
+                let what = match what {
+                    crate::queue::Written::HostTimestamp(raw) => match clock.get_or_insert_with(|| self.clock()) {
+                        // SAFETY: the list's mapped read-back memory, which
+                        // the submission that ran resolved into.
+                        Some(c) => crate::queue::Written::Value(c.convert(unsafe { (raw as *const u64).read_volatile() })),
+                        None => crate::queue::Written::GpuTimestamp,
+                    },
+                    what => what,
+                };
                 what.write(at as *mut u8, bytes);
             }
         }
         self.log_messages();
+    }
+
+    /// How host GPU timestamps map onto the title's GPU clock
+    /// ([`crate::queue::Written::GpuTimestamp`]): the queue's calibration
+    /// of its timestamps against the CPU's performance counter, which
+    /// `Instant` reads too.
+    fn clock(&self) -> Option<Clock> {
+        use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+        let (mut gpu, mut cpu, mut now, mut cpu_frequency) = (0, 0, 0, 0);
+        // SAFETY: plain queries into our locals.
+        let frequency = unsafe {
+            let frequency = self.queue.GetTimestampFrequency().ok()?;
+            self.queue.GetClockCalibration(&mut gpu, &mut cpu).ok()?;
+            QueryPerformanceCounter(&mut now);
+            QueryPerformanceFrequency(&mut cpu_frequency);
+            frequency
+        };
+        let title_now = crate::queue::gpu_clock();
+        let ticks = i128::from(crate::queue::TIMESTAMP_FREQUENCY);
+        // The title's clock when the host GPU's read `gpu`.
+        let since = (i128::from(now) - i128::from(cpu)) * ticks / i128::from(cpu_frequency.max(1));
+        (frequency > 0).then_some(Clock { gpu, at: i128::from(title_now) - since, frequency, now: title_now })
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -780,6 +1497,25 @@ impl Host {
     }
 }
 
+/// A host GPU timestamp `gpu` taken when the title's GPU clock read `at`,
+/// the host's ticks per second, and the title's clock when taken.
+struct Clock {
+    gpu: u64,
+    at: i128,
+    frequency: u64,
+    now: u64,
+}
+
+impl Clock {
+    /// A host GPU timestamp on the title's clock: never past the time it
+    /// was read, so bottom-of-pipe timestamps written after stay later.
+    fn convert(&self, raw: u64) -> u64 {
+        let ticks = i128::from(crate::queue::TIMESTAMP_FREQUENCY);
+        let since = (i128::from(raw) - i128::from(self.gpu)) * ticks / i128::from(self.frequency);
+        (self.at + since).clamp(0, i128::from(self.now)) as u64
+    }
+}
+
 impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
@@ -858,6 +1594,12 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // The host closes no list with queries running; their title ends,
+        // in a later list, are dropped (`end_query`).
+        for (heap, kind, index, _) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            // SAFETY: an open list and a query begun in it.
+            unsafe { self.list.EndQuery(&heap, kind, index) };
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -881,6 +1623,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.queries.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -998,6 +1741,53 @@ impl HostList {
         }
     }
 
+    /// Begins query `index` of `heap` (occlusion or statistics, never a
+    /// timestamp) unless it is running in the list already. Whether it
+    /// began.
+    pub(crate) fn begin_query(&self, heap: &ID3D12QueryHeap, kind: u32, index: u32) -> bool {
+        let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
+        if kind == crate::query::TIMESTAMP || queries.iter().any(|(h, _, i, _)| h == heap && *i == index) {
+            return false;
+        }
+        let kind = D3D12_QUERY_TYPE(kind as i32);
+        // SAFETY: an open list and a live heap, kept until the list is reset.
+        unsafe { self.list.BeginQuery(heap, kind, index) };
+        queries.push((heap.clone(), kind, index, false));
+        drop(queries);
+        self.keep(heap);
+        true
+    }
+
+    /// Ends query `index` of `heap`: a timestamp is taken; another query
+    /// ends only if it began in this list, as the type it began as. The
+    /// type it ended as, if it did and its result is the host's to give: an
+    /// occlusion query with a draw inside that the host did not run counts
+    /// too few samples, and a title would cull by it what the draw shows.
+    pub(crate) fn end_query(&self, heap: &ID3D12QueryHeap, kind: u32, index: u32) -> Option<u32> {
+        let (kind, missed) = if kind == crate::query::TIMESTAMP {
+            (D3D12_QUERY_TYPE(kind as i32), false)
+        } else {
+            let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
+            let at = queries.iter().position(|(h, _, i, _)| h == heap && *i == index)?;
+            let (_, kind, _, missed) = queries.swap_remove(at);
+            (kind, missed)
+        };
+        // SAFETY: an open list and a live heap, kept until the list is reset.
+        unsafe { self.list.EndQuery(heap, kind, index) };
+        self.keep(heap);
+        let occlusion = matches!(kind.0 as u32, crate::query::OCCLUSION | crate::query::BINARY_OCCLUSION);
+        (!(missed && occlusion)).then_some(kind.0 as u32)
+    }
+
+    /// A draw the title recorded was not run on the host (no pipeline yet,
+    /// a shader that does not translate, ...): the queries running around
+    /// it did not see it.
+    pub(crate) fn missed_draw(&self) {
+        for q in self.queries.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+            q.3 = true;
+        }
+    }
+
     /// Notes a pipeline the list binds.
     pub(crate) fn used_pipeline(&self, name: &str) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
@@ -1072,6 +1862,42 @@ impl HostList {
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
+    }
+
+    /// A mapped read-back buffer of `size` bytes, alive until the list is
+    /// reset.
+    pub(crate) fn readback(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a read-back buffer.
+        let made = unsafe {
+            host()?
+                .device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        if let Err(e) = made {
+            tracing::warn!(error = %e, size, "no read-back buffer");
+            return None;
+        }
+        let buffer = buffer?;
+        name(&buffer, || format!("list read-back {size:#x}"));
+        self.deferred().uploads.push(buffer.clone());
+        Some((buffer, data.cast()))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
@@ -1318,6 +2144,47 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+    if !title_dst && len >= 64 << 10 {
+        read_sparse(src, dst, len);
+    } else {
+        read_pieces(src, dst, len);
+    }
+}
+
+/// After a failed bulk read into host memory, skip contiguous holes. Never
+/// cache the query across copies: the title may remap the same address.
+fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+    };
+    let mut offset = 0;
+    while offset < len {
+        let at = src.wrapping_add(offset);
+        let to = dst.wrapping_add(offset);
+        let remaining = len - offset;
+        // SAFETY: the query inspects an address and fills a local structure.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+        let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
+            .saturating_sub(at as usize).min(remaining);
+        if size != size_of_val(&info) || n == 0 {
+            read_pieces(at, to, remaining);
+            break;
+        }
+        if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: this path is only used with a writable host destination.
+            unsafe { to.write_bytes(0, n) };
+        } else if !read(at, to, n) {
+            // A mapping may change between query and read.
+            read_pieces(at, to, n);
+        }
+        offset += n;
+    }
+}
+
+fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
@@ -1451,14 +2318,104 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+/// Luminance bounds of the host display when HDR (HDR10 / PQ) is active on
+/// Windows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HdrDisplayInfo {
+    pub min_luminance: f32,
+    pub max_luminance: f32,
+    pub max_full_frame_luminance: f32,
+}
+
+/// Queries the host display outputs for an active HDR10 (`G2084_NONE_P2020`)
+/// desktop mode. Returns `None` when HDR is disabled or unsupported.
+pub fn display_hdr_info() -> Option<HdrDisplayInfo> {
+    // SAFETY: plain DXGI factory, adapter and output enumeration.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = if let Some(host) = host() {
+            let luid = host.device.GetAdapterLuid();
+            factory
+                .EnumAdapterByLuid::<IDXGIAdapter1>(luid)
+                .or_else(|_| factory.EnumAdapters1(0))
+                .ok()?
+        } else {
+            factory.EnumAdapters1(0).ok()?
+        };
+        let mut i = 0u32;
+        while let Ok(output) = adapter.EnumOutputs(i) {
+            i += 1;
+            let Ok(output6) = output.cast::<IDXGIOutput6>() else {
+                continue;
+            };
+            let Ok(desc) = output6.GetDesc1() else {
+                continue;
+            };
+            if desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 {
+                return Some(HdrDisplayInfo {
+                    min_luminance: desc.MinLuminance,
+                    max_luminance: desc.MaxLuminance,
+                    max_full_frame_luminance: desc.MaxFullFrameLuminance,
+                });
+            }
+        }
+        None
+    }
+}
+
+fn desired_color_space(format: DXGI_FORMAT, hdr_active: bool) -> DXGI_COLOR_SPACE_TYPE {
+    if !hdr_active {
+        return DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    }
+    match format {
+        DXGI_FORMAT_R10G10B10A2_UNORM => DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+        DXGI_FORMAT_R16G16B16A16_FLOAT => DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+        _ => DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+    }
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    color_space: DXGI_COLOR_SPACE_TYPE,
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+}
+
+impl Presenter {
+    fn sync_color_space(&mut self, hdr_active: bool) {
+        let wanted = desired_color_space(self.format, hdr_active);
+        if self.color_space == wanted {
+            return;
+        }
+        // SAFETY: `self.swap_chain` is a live `IDXGISwapChain3`.
+        let supported = unsafe { self.swap_chain.CheckColorSpaceSupport(wanted) }.unwrap_or(0);
+        if supported & (DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32) == 0 {
+            tracing::debug!(
+                color_space = wanted.0,
+                supported,
+                "swap chain color space unsupported on host output"
+            );
+            return;
+        }
+        // SAFETY: `wanted` is supported for presentation on `self.swap_chain`.
+        match unsafe { self.swap_chain.SetColorSpace1(wanted) } {
+            Ok(()) => {
+                self.color_space = wanted;
+                tracing::info!(
+                    format = self.format.0,
+                    color_space = wanted.0,
+                    "swap chain color space set"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, color_space = wanted.0, "SetColorSpace1 failed");
+            }
+        }
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -1610,6 +2567,14 @@ impl Host {
                 }
             }
         }
+        if matches!(
+            format,
+            DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R16G16B16A16_FLOAT
+        ) {
+            p.sync_color_space(display_hdr_info().is_some());
+        } else {
+            p.sync_color_space(false);
+        }
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
@@ -1691,15 +2656,18 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
-            Ok(Presenter {
+            let mut p = Presenter {
                 swap_chain,
                 width,
                 height,
                 format,
+                color_space: DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
                 copy,
                 hwnd,
                 meter: Meter::new(),
-            })
+            };
+            p.sync_color_space(display_hdr_info().is_some());
+            Ok(p)
         }
     }
 }

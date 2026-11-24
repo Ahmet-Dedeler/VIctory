@@ -82,6 +82,10 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(test)]
+mod opcode_audit;
+#[cfg(all(test, windows))]
+mod opcode_tests;
 mod sampler;
 mod shader;
 #[cfg(windows)]
@@ -228,11 +232,17 @@ pub fn emit(
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
-    // read get the mode their barycentrics say.
+    // read get the mode their barycentrics say. Conservative depth outputs
+    // (`SV_DepthGreaterEqual`/`SV_DepthLessEqual`) require centroid or sample
+    // interpolation on `SV_Position`.
+    let conservative_depth = pixel && outputs.iter().any(|o| matches!(o.kind, 18 | 19));
+    let psv_modes = c
+        .part(FourCC::PSV0)
+        .and_then(|p| psv_interp(p.data, pixel));
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
-    for e in interpolated {
+    for e in interpolated.iter_mut() {
         e.interp = match (e.kind, e.comp) {
-            (3, _) => 4,
+            (3, _) => if conservative_depth { 5 } else { 4 },
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
             (13, _) => 1,
@@ -240,6 +250,17 @@ pub fn emit(
             (0, _) => 1,
             _ => 0,
         };
+        if let Some(modes) = &psv_modes
+            && let Some(&(_, _, _, m)) = modes
+                .iter()
+                .find(|&&(row, col, kind, m)| row == e.row && col == e.col && kind == e.kind && m != 0)
+        {
+            e.interp = if e.kind == 3 && conservative_depth && m == 4 {
+                5
+            } else {
+                m
+            };
+        }
     }
     // Per-primitive outputs are constant. The console never exports a
     // primitive id or cull flag a mesh shader writes (it culls with the
@@ -299,6 +320,49 @@ pub fn emit(
     })
 }
 
+/// Interpolation modes of the input (for pixel) or output (for vertex/mesh)
+/// signature elements carried in a container's `PSV0` part: `(row, col, kind,
+/// interp)`.
+fn psv_interp(part: &[u8], pixel: bool) -> Option<Vec<(Option<u32>, u8, u8, u8)>> {
+    use crate::dxbc::u32_at;
+    let info_sz = u32_at(part, 0).ok()? as usize;
+    if info_sz < 32 {
+        return None;
+    }
+    let info = part.get(4..4 + info_sz)?;
+    let (n_in, n_out, n_prim) = (info[28] as usize, info[29] as usize, info[30] as usize);
+    let mut pos = 4 + info_sz;
+    let n_bind = u32_at(part, pos).ok()? as usize;
+    pos += 4;
+    if n_bind > 0 {
+        let bsz = u32_at(part, pos).ok()? as usize;
+        pos = pos.checked_add(4)?.checked_add(n_bind.checked_mul(bsz)?)?;
+    }
+    let str_sz = u32_at(part, pos).ok()? as usize;
+    pos = pos.checked_add(4)?.checked_add(str_sz)?;
+    let idx_cnt = u32_at(part, pos).ok()? as usize;
+    pos = pos.checked_add(4)?.checked_add(idx_cnt.checked_mul(4)?)?;
+    if n_in + n_out + n_prim == 0 {
+        return Some(Vec::new());
+    }
+    let esz = u32_at(part, pos).ok()? as usize;
+    pos += 4;
+    if esz < 14 {
+        return None;
+    }
+    let (start_i, count) = if pixel { (0, n_in) } else { (n_in, n_out) };
+    let mut out = Vec::with_capacity(count);
+    for i in start_i..start_i + count {
+        let off = pos.checked_add(i.checked_mul(esz)?)?;
+        let e = part.get(off..off + esz)?;
+        let alloc = e[10] & 0x40 != 0;
+        let row = alloc.then_some(u32::from(e[9]));
+        let col = if alloc { (e[10] >> 4) & 3 } else { 0 };
+        out.push((row, col, e[11], e[13]));
+    }
+    Some(out)
+}
+
 /// The rows of an `ISG1`/`OSG1` part.
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
@@ -346,6 +410,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             68 => 18,
             69 => 20,
             70 => 15,
+            23 => 28, // barycentrics
             25 => 30, // cull primitive
             _ => {
                 return Err(ShaderError::Unsupported {
@@ -593,5 +658,166 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    #[test]
+    fn valu_div_f32_sequence_executes_on_gpu() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0x340E_0083, // v_lshlrev_b32 v7, 3, v0
+            0xE034_1000,
+            0x8002_0107, // buffer_load_dwordx2 v[1:2], v7, s[8:11], 0 offen
+            0xD56D_6A03,
+            0x040A_0302, // v_div_scale_f32 v3, vcc_lo, v2, v1, v2
+            0xD56D_1001,
+            0x040A_0301, // v_div_scale_f32 v1, s16, v1, v1, v2
+            0x7E08_5503, // v_rcp_f32 v4, v3
+            0xD54B_0005,
+            0x23CA_0903, // v_fma_f32 v5, -v3, v4, 1.0
+            0xD54B_0004,
+            0x0412_0905, // v_fma_f32 v4, v5, v4, v4
+            0x100A_0901, // v_mul_f32 v5, v1, v4
+            0xD54B_0006,
+            0x2406_0B03, // v_fma_f32 v6, -v3, v5, v1
+            0xD56F_0004,
+            0x0416_0906, // v_div_fmas_f32 v4, v6, v4, v5
+            0xD55F_0001,
+            0x0406_0504, // v_div_fixup_f32 v1, v4, v2, v1
+            0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+            0xE070_1000,
+            0x8003_0107, // buffer_store_dword v1, v7, s[12:15], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                crate::UsedResource {
+                    kind: crate::ResourceType::Srv,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                crate::UsedResource {
+                    kind: crate::ResourceType::Uav,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [6, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap();
+        }
+        #[cfg(windows)]
+        if let Ok(host) = super::host::Host::new(false) {
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let inputs: Vec<u32> = [
+                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0,
+            ]
+            .into_iter()
+            .map(f32::to_bits)
+            .collect();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![(0, super::host::Root::Constants(vec![0, 0, 0, 0, 0]))],
+                        views: &[
+                            super::host::View::Buffer {
+                                data: &inputs,
+                                stride: super::host::Stride::Raw,
+                            },
+                            super::host::View::RawUav(64),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let got: Vec<f32> = out[0][..6].iter().copied().map(f32::from_bits).collect();
+            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "got {:?}", got);
+            assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits());
+            assert!(
+                (got[2] - 1e-35).abs() <= 1e-40,
+                "lane 2 got {:?} ({:#x})",
+                got[2],
+                out[0][2]
+            );
+            assert!(
+                (got[3] - 10.0).abs() < 1e-5,
+                "lane 3 got {:?} ({:#x})",
+                got[3],
+                out[0][3]
+            );
+            assert_eq!(out[0][4], 0xFFC0_0000);
+            assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits());
+        }
     }
 }
