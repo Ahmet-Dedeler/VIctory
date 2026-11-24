@@ -1295,6 +1295,10 @@ impl State {
             },
             None => None,
         };
+        let counted = counter.as_ref().map(|(s, at)| crate::indirect::Count {
+            buffer: &s.buffer,
+            offset: s.offset(*at),
+        });
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()
@@ -1307,8 +1311,14 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+        if !crate::indirect::bound_counted(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max),
+            counted,
+        ) {
+            why("not bounded (no clamp, bad count, or arguments not 4-byte aligned)");
             return false;
         }
         self.host_pipeline = 0;
@@ -1326,7 +1336,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done_counted(list, &args.buffer, counted.map(|c| c.buffer));
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1356,7 +1366,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done_counted(list, &args.buffer, counted.map(|c| c.buffer));
         if crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.has_root_uavs())
         {
             emit_uav_barrier(list);
