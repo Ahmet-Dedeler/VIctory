@@ -131,7 +131,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -267,8 +267,12 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
-    let stride_table = r.word()? != 0;
     let root_uavs = r.list()?;
+    let stride_table = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -331,7 +335,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH2 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -362,5 +366,17 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    #[test]
+    fn uav_roots_and_stride_flag_round_trip_independently() {
+        for roots in [vec![], vec![0], vec![1, 3, 7]] {
+            for stride_table in [false, true] {
+                let mut shader = shader();
+                shader.root_uavs = roots.clone();
+                shader.stride_table = stride_table;
+                assert_eq!(decode(&encode(&shader)), Some(shader));
+            }
+        }
     }
 }
