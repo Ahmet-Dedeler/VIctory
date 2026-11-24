@@ -286,6 +286,46 @@ extern "system" fn present(
         if crate::capture::listed(frame) {
             crate::capture::save_frame_ops(frame);
             crate::capture::dump_targets(frame);
+            // Every plane the title presents (the first one is shown): its
+            // resources as the target dumps name them, with their sizes.
+            // A plane description is 0x48 bytes
+            // (D3D12XBOX_PRESENT_PLANE_PARAMETERS), which starts as `Plane`.
+            for i in 0..planes.min(8) as usize {
+                if plane_parameters.is_null() {
+                    break;
+                }
+                // SAFETY: the title passes `planes` plane descriptions of
+                // 0x48 bytes each.
+                let (plane, rest) = unsafe {
+                    let at = plane_parameters.cast::<u8>().add(i * 0x48);
+                    (
+                        at.cast::<Plane>().read_unaligned(),
+                        at.add(24).cast::<[u64; 6]>().read_unaligned(),
+                    )
+                };
+                for k in 0..plane.count.min(4) as usize {
+                    if plane.resources.is_null() {
+                        break;
+                    }
+                    // SAFETY: the plane lists `count` resources.
+                    let resource = unsafe { *plane.resources.add(k) };
+                    let desc = crate::resource::host_resource(resource).map(|t| {
+                        // SAFETY: a live resource.
+                        let d = unsafe { t.GetDesc() };
+                        (d.Width, d.Height, d.Format.0)
+                    });
+                    tracing::info!(
+                        frame,
+                        planes,
+                        plane = i,
+                        of = plane.count,
+                        ?resource,
+                        ?desc,
+                        rest = format_args!("{rest:x?}"),
+                        "present plane"
+                    );
+                }
+            }
         }
         crate::capture::busy_frame(frame);
     }
