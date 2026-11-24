@@ -685,10 +685,17 @@ fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
         .get(MS_INFO..MS_INFO + 8)
         .ok_or(Malformed("stage data out of bounds"))?;
     let half = |at: usize| u32::from(u16::from_le_bytes([info[at], info[at + 1]]));
+    // The group's lanes become the DXIL `numthreads` x and, for containers
+    // without the HLSL count, the stride of the group id: an empty group
+    // would emit `numthreads(0, 1, 1)` and give every group id 0.
+    let threads = half(0);
+    if threads == 0 {
+        return Err(Malformed("implausible thread-group size"));
+    }
     Ok(StageIo::Ms(MeshIo {
         outputs,
         clip_cntl: u32_at(data, MS_CLIP_CNTL)?,
-        threads: half(0),
+        threads,
         max_vertices: half(2),
         max_primitives: half(4),
         topology: info[7],
@@ -758,11 +765,14 @@ mod tests {
             payload.resize(record as usize + RECORD_REGS, 0);
             payload.extend_from_slice(&(VGPRS | 31 << 20).to_le_bytes());
             let mut data = empty_stage_data();
+            // numthreads(1, 1, 1): a compute or mesh group is never empty.
             if stage == HwStage::Cs {
-                // numthreads(1, 1, 1): a compute group is never empty.
                 for k in 0..3 {
                     data[CS_THREADS + 4 * k..][..4].copy_from_slice(&1u32.to_le_bytes());
                 }
+            }
+            if stage == HwStage::Ms {
+                data[MS_INFO..][..2].copy_from_slice(&1u16.to_le_bytes());
             }
             payload.extend_from_slice(&data);
             payload.extend_from_slice(code);
@@ -1284,5 +1294,14 @@ mod tests {
                 "{bad:?}"
             );
         }
+
+        // A mesh group of one lane fits; an empty one does not.
+        let ms = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&ms, HwStage::Ms);
+        let p = native_programs(&part(&[(KIND_NATIVE, &xbch(&ms))])).unwrap();
+        assert!(matches!(&p[0].io, StageIo::Ms(m) if m.threads == 1));
+        let mut blob = ms.clone();
+        blob[e + MS_INFO..][..2].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(refused_blob(&xbch(&blob)), "implausible thread-group size");
     }
 }
