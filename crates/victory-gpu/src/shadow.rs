@@ -69,24 +69,97 @@ impl UnchangedPages {
     }
 
     fn differs(&mut self, address: usize, current: &[u8], before: &[u8]) -> bool {
+        if self.known(address) {
+            return false;
+        }
+        self.compared(address, current.len(), current != before)
+    }
+
+    /// Whether the page of `address` was compared in full already and
+    /// found as it was.
+    fn known(&self, address: usize) -> bool {
+        self.pages[address / PAGE - self.start / PAGE]
+    }
+
+    /// Notes the comparison of `len` bytes at `address` (inside one page)
+    /// with the snapshot, which found them different or not; returns
+    /// whether they differ and the page was not known unchanged.
+    fn compared(&mut self, address: usize, len: usize, differs: bool) -> bool {
         let page = address / PAGE;
         let unchanged = &mut self.pages[page - self.start / PAGE];
         if *unchanged {
             return false;
         }
-        if current != before {
+        if differs {
             return true;
         }
         // A later range can touch bytes a partial comparison missed. At
         // the edges, only bytes covered by the snapshot can be compared.
         *unchanged = address == (page * PAGE).max(self.start)
-            && address + current.len() == ((page + 1) * PAGE).min(self.end);
+            && address + len == ((page + 1) * PAGE).min(self.end);
         false
     }
 
     fn clear(&mut self) {
         self.pages.clear();
     }
+}
+
+/// For [`Shadow::copy_back`]: `host` is the copy's bytes from title address
+/// `address` on and `before` the same bytes before the submission. Per
+/// 64 KiB piece, in the order copy-back goes through them, whether the two
+/// differ there (false for pages already known unchanged, which are not
+/// compared again). Compared in parts on the pool.
+fn compare_ahead(host: &[u8], address: usize, before: &[u8], unchanged: &UnchangedPages) -> Vec<bool> {
+    let mut pieces = Vec::with_capacity(host.len() / PAGE + 2);
+    let mut at = 0;
+    while at < host.len() {
+        let n = (PAGE - (address + at) % PAGE).min(host.len() - at);
+        pieces.push((at, n));
+        at += n;
+    }
+    let mut found = vec![false; pieces.len()];
+    let per = pieces.len().div_ceil(crate::host::PARTS).max(1);
+    let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = pieces
+        .chunks(per)
+        .zip(found.chunks_mut(per))
+        .map(|(pieces, found)| {
+            Box::new(move || {
+                for (&(at, n), found) in pieces.iter().zip(found) {
+                    *found = !unchanged.known(address + at) && host[at..at + n] != before[at..at + n];
+                }
+            }) as Box<dyn FnOnce() + Send + '_>
+        })
+        .collect();
+    victory_formats::texture::run_parallel(jobs);
+    found
+}
+
+/// Appends `bytes` to a snapshot that has room for them (see [`pooled`]),
+/// big ones in parts on the pool.
+fn extend(to: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() < crate::host::PARALLEL_FROM || to.capacity() - to.len() < bytes.len() {
+        to.extend_from_slice(bytes);
+        return;
+    }
+    let at = to.len();
+    let dst = to.as_mut_ptr() as usize + at;
+    let part = bytes.len().div_ceil(crate::host::PARTS);
+    let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = bytes
+        .chunks(part)
+        .enumerate()
+        .map(|(i, piece)| {
+            Box::new(move || {
+                // SAFETY: the vector's spare room, each part its own bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(piece.as_ptr(), (dst + i * part) as *mut u8, piece.len());
+                }
+            }) as Box<dyn FnOnce() + Send + '_>
+        })
+        .collect();
+    victory_formats::texture::run_parallel(jobs);
+    // SAFETY: the parts wrote exactly these bytes, within the capacity.
+    unsafe { to.set_len(at + bytes.len()) };
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -230,12 +303,12 @@ impl Shadow {
         let mut grown = pooled(end - start);
         match before.take() {
             Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
+                extend(&mut grown, host(start, at));
+                extend(&mut grown, &bytes);
+                extend(&mut grown, host(at + bytes.len(), end));
                 give_back(bytes);
             }
-            None => grown.extend_from_slice(host(start, end)),
+            None => extend(&mut grown, host(start, end)),
         }
         *before = Some((start, grown));
     }
@@ -269,6 +342,15 @@ impl Shadow {
             // overlapping ranges can skip it for the rest of the submission.
             let mut title = None;
             let mut synced = Vec::new();
+            // A big range is compared ahead on several threads (the world
+            // declares 100-170 MB a submission and its shaders write a
+            // tenth of that); the pieces are then gone through in order.
+            let ahead = (to - from >= crate::host::PARALLEL_FROM).then(|| {
+                // SAFETY: inside the mapping, which only this thread writes.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
+                compare_ahead(host, start + from, before, unchanged)
+            });
+            let mut piece = 0;
             let mut at = from;
             while at < to {
                 let n = (PAGE - (start + at) % PAGE).min(to - at);
@@ -276,7 +358,12 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                if unchanged.differs(start + at, host, old)
+                let differs = match &ahead {
+                    Some(found) => unchanged.compared(start + at, n, found[piece]),
+                    None => unchanged.differs(start + at, host, old),
+                };
+                piece += 1;
+                if differs
                     && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
                     && crate::host::read_into((start + at) as *const u8, title)
                 {
@@ -682,6 +769,65 @@ mod tests {
         assert_eq!(uncached, 6);
         assert_eq!(cached, uncached);
         assert_eq!(unchanged.pages, [false, false, true, false]);
+    }
+
+    #[test]
+    fn comparing_ahead_finds_what_piece_by_piece_finds() {
+        // A range that starts and ends inside pages, changes in some
+        // pieces, and one page known unchanged from an earlier range.
+        let (address, len) = (5 * PAGE + 123, 200 * PAGE + 4567);
+        let before: Vec<u8> = (0..len).map(|i| (i / 7) as u8).collect();
+        let mut host = before.clone();
+        for at in [0, 5, PAGE - 124, PAGE - 123, 17 * PAGE, 100 * PAGE + 1, len - 1] {
+            host[at] ^= 0x40;
+        }
+        let fresh = || {
+            let mut unchanged = UnchangedPages::default();
+            unchanged.begin(address, address + len);
+            // The page 30 pages in was compared in full by an earlier range.
+            let at = 30 * PAGE - 123;
+            assert!(!unchanged.differs(address + at, &before[at..at + PAGE], &before[at..at + PAGE]));
+            unchanged
+        };
+        let mut one = fresh();
+        let mut expected = Vec::new();
+        let mut at = 0;
+        while at < len {
+            let n = (PAGE - (address + at) % PAGE).min(len - at);
+            expected.push(one.differs(address + at, &host[at..at + n], &before[at..at + n]));
+            at += n;
+        }
+        let mut other = fresh();
+        let ahead = compare_ahead(&host, address, &before, &other);
+        assert_eq!(ahead.len(), expected.len());
+        let mut at = 0;
+        let got: Vec<bool> = ahead
+            .iter()
+            .map(|&found| {
+                let n = (PAGE - (address + at) % PAGE).min(len - at);
+                let differs = other.compared(address + at, n, found);
+                at += n;
+                differs
+            })
+            .collect();
+        assert_eq!(got, expected);
+        // Five pieces hold the seven changed bytes (three are in the first).
+        assert_eq!(got.iter().filter(|&&d| d).count(), 5);
+        assert_eq!(other.pages, one.pages);
+    }
+
+    #[test]
+    fn big_snapshots_are_appended_whole() {
+        let bytes: Vec<u8> = (0..crate::host::PARALLEL_FROM + 12_345).map(|i| (i * 31 >> 3) as u8).collect();
+        let mut to = Vec::with_capacity(bytes.len() + 10);
+        to.extend_from_slice(b"head");
+        extend(&mut to, &bytes);
+        assert_eq!(&to[..4], b"head");
+        assert!(to[4..] == bytes[..]);
+        // No room: the plain way.
+        let mut small = Vec::new();
+        extend(&mut small, &bytes);
+        assert!(small == bytes);
     }
 
     // cargo test --release -p victory-gpu benchmark_overlapping_copy_back -- --ignored --nocapture

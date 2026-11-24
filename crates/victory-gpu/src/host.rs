@@ -2292,9 +2292,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// thread moves 35 GB/s through the kernel's guarded read, eight 90 GB/s
 /// (measured under Wine on an Apple M5 Max), and a world submission of a
 /// host without write tracking copies the title's 174 MB heap whole.
-const PARALLEL_FROM: usize = 8 << 20;
+pub(crate) const PARALLEL_FROM: usize = 8 << 20;
 /// Parts of such a copy: the detiling threads and the caller.
-const PARTS: usize = 8;
+pub(crate) const PARTS: usize = 8;
 
 /// [`copy_mapped`] into host memory in [`PARTS`] parts cut at 64 KiB, each
 /// read on its own, so a part with unmapped pages falls back alone.
