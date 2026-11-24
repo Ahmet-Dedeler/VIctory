@@ -337,6 +337,16 @@ pub(crate) fn dred_on() -> bool {
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
 #[cfg(feature = "diagnostics")]
+fn one_by_one() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| timing() || std::env::var_os("VICTORY_SUBMIT_ONE_BY_ONE").is_some())
+}
+
+/// `VICTORY_GPU_TIMING`: see [`one_by_one`], which also holds for
+/// `VICTORY_SUBMIT_ONE_BY_ONE`: each list a submission of its own and
+/// logged as it finishes, without the timestamp queries (a host without
+/// them, Apple's D3DMetal, stopped presenting with them on).
+#[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
@@ -619,7 +629,7 @@ impl Host {
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if one_by_one() {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -650,7 +660,7 @@ impl Host {
             // beside the host's own log (Apple's reports a GPU error there
             // by the millisecond and to us not at all).
             #[cfg(feature = "diagnostics")]
-            if timing() {
+            if one_by_one() {
                 let of = if groups.len() > 1 { &runs[i..=i] } else { runs };
                 let pipelines: std::collections::BTreeSet<String> = of
                     .iter()
