@@ -8464,6 +8464,254 @@ impl Host {
     }
 }
 
+
+/// Full-screen triangle corners and texture coordinates for the present
+/// scale pass.
+const SCALE_CORNERS: &str = r#"
+struct Corner {
+    float4 p : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+Corner corner(uint i : SV_VertexID) {
+    Corner o;
+    o.p = float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0);
+    o.uv = float2(float(i & 1) * 2.0, float(i >> 1) * 2.0);
+    return o;
+}
+"#;
+
+/// Bilinear scale of the whole presented texture into the swap chain.
+/// Needed under D3DMetal on a Retina window: a swap-chain buffer smaller
+/// than the window's backing pixels is put at the top left, not scaled.
+const SCALE_PIXEL: &str = r#"
+#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), " \
+    "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, " \
+    "addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
+Texture2D<float4> input : register(t0);
+SamplerState linear_clamp : register(s0);
+[RootSignature(RS)]
+float4 scale(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    return input.Sample(linear_clamp, uv);
+}
+"#;
+
+type ScalePipeline = (ID3D12RootSignature, ID3D12PipelineState);
+
+/// Scale pipelines by output format (`None`: the host refused one).
+struct ScalePipelines {
+    made: Mutex<Vec<(i32, Option<ScalePipeline>)>>,
+}
+
+// SAFETY: the immutable D3D12 objects are free-threaded; the vector is mutexed.
+unsafe impl Send for ScalePipelines {}
+// SAFETY: as above.
+unsafe impl Sync for ScalePipelines {}
+
+fn scale_pipelines() -> &'static ScalePipelines {
+    static PIPELINES: OnceLock<ScalePipelines> = OnceLock::new();
+    PIPELINES.get_or_init(|| ScalePipelines { made: Mutex::new(Vec::new()) })
+}
+
+/// The bilinear upscale pipeline for output `format`.
+fn scale_pipeline(format: DXGI_FORMAT) -> Option<ScalePipeline> {
+    let pipelines = scale_pipelines();
+    let mut made = pipelines.made.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, pipeline)) = made.iter().find(|(f, _)| *f == format.0) {
+        return pipeline.clone();
+    }
+    let pipeline = make_scale_pipeline(format)
+        .map_err(|e| {
+            tracing::warn!(error = %e, format = format.0, "no present scale pipeline");
+            e
+        })
+        .ok();
+    made.push((format.0, pipeline.clone()));
+    pipeline
+}
+
+fn make_scale_pipeline(format: DXGI_FORMAT) -> windows::core::Result<ScalePipeline> {
+    use windows::core::s;
+    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    let vs = compile(SCALE_CORNERS, s!("corner"), s!("vs_5_1"))?;
+    let ps = compile(SCALE_PIXEL, s!("scale"), s!("ps_5_1"))?;
+    let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+        pShaderBytecode: bytes.as_ptr().cast(),
+        BytecodeLength: bytes.len(),
+    };
+    // SAFETY: the pixel shader carries the root signature; the descriptions
+    // point at the live blobs for the creation calls.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+        let mut targets = [DXGI_FORMAT_UNKNOWN; 8];
+        targets[0] = format;
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            VS: code(&vs[..]),
+            PS: code(&ps[..]),
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+            DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: false.into(),
+                ..Default::default()
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            RTVFormats: targets,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
+        Ok((root, pipeline))
+    }
+}
+
+/// Whether smaller frames are scaled for presentation. CrossOver/D3DMetal
+/// needs it on a Retina window; `VICTORY_PRESENT_SCALE=0` restores the old
+/// direct copy, and `=1` enables it away from Darwin.
+fn present_scaling() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = match std::env::var("VICTORY_PRESENT_SCALE") {
+            Ok(v) => v.trim() != "0",
+            Err(_) => is_darwin(),
+        };
+        if on {
+            tracing::info!("presenting smaller frames scaled to the window backing (VICTORY_PRESENT_SCALE=0: direct copy)");
+        }
+        on
+    })
+}
+
+/// Logical client units per backing pixel. Wine does not reliably expose
+/// CoreAnimation's backing scale as Win32 DPI, so Darwin falls back to the
+/// Retina scale of 2; `VICTORY_PRESENT_SCALE_FACTOR` overrides it.
+fn present_scale_factor(hwnd: HWND) -> f64 {
+    static FACTOR: OnceLock<f64> = OnceLock::new();
+    *FACTOR.get_or_init(|| {
+        if let Ok(v) = std::env::var("VICTORY_PRESENT_SCALE_FACTOR") {
+            if let Ok(f) = v.trim().parse::<f64>() {
+                if f > 0.0 {
+                    tracing::info!(factor = f, "present backing scale factor from VICTORY_PRESENT_SCALE_FACTOR");
+                    return f;
+                }
+            }
+            tracing::warn!(value = v, "VICTORY_PRESENT_SCALE_FACTOR wants a positive number");
+        }
+        // SAFETY: a live window handle.
+        let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+        let factor = if dpi > 96 {
+            f64::from(dpi) / 96.0
+        } else if is_darwin() {
+            2.0
+        } else {
+            1.0
+        };
+        tracing::info!(dpi, factor, "present backing scale factor");
+        factor
+    })
+}
+
+/// The output size the window backing can show, never below the presented
+/// size. Bigger presented frames stay on the old direct-copy path (the
+/// compositor already scales those down correctly); smaller ones are scaled
+/// by us because D3DMetal does not scale them up in a Retina window.
+fn present_output_size(hwnd: HWND, width: u32, height: u32) -> (u32, u32) {
+    if !present_scaling() {
+        return (width, height);
+    }
+    let mut client = RECT::default();
+    // SAFETY: a live window handle; `client` receives its rectangle.
+    if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
+        return (width, height);
+    }
+    let (cw, ch) = (client.right - client.left, client.bottom - client.top);
+    if cw <= 0 || ch <= 0 {
+        return (width, height);
+    }
+    let factor = present_scale_factor(hwnd);
+    let w = (f64::from(cw) * factor).round() as u32;
+    let h = (f64::from(ch) * factor).round() as u32;
+    (width.max(w), height.max(h))
+}
+
+/// Records the scale of `texture` into `back` through the pass above, both
+/// already in shader-resource and render-target states. One descriptor heap
+/// per present is simple and enough here; it is kept by the command list.
+fn record_present_scale(
+    host: &Host,
+    copy: &HostList,
+    texture: &ID3D12Resource,
+    back: &ID3D12Resource,
+    format: DXGI_FORMAT,
+    input_format: DXGI_FORMAT,
+    width: u32,
+    height: u32,
+) -> Option<()> {
+    let (root, pipeline) = scale_pipeline(format)?;
+    let list = &copy.list;
+    // SAFETY: plain object creation and view creation on live textures.
+    unsafe {
+        let heap: ID3D12DescriptorHeap = host
+            .device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            })
+            .ok()?;
+        let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: input_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        host.device.CreateShaderResourceView(
+            texture,
+            Some(&view),
+            heap.GetCPUDescriptorHandleForHeapStart(),
+        );
+        let target = host.rtv(Some(back), None);
+        list.SetDescriptorHeaps(&[Some(heap.clone())]);
+        list.SetGraphicsRootSignature(&root);
+        list.SetPipelineState(&pipeline);
+        list.SetGraphicsRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+        list.OMSetRenderTargets(1, Some(&target), false, None);
+        list.RSSetViewports(&[D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]);
+        list.RSSetScissorRects(&[RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        }]);
+        list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4));
+        list.DrawInstanced(3, 1, 0, 0);
+        copy.keep(&heap);
+    }
+    Some(())
+}
+
 /// The swap chain formats a presented texture can be copied into: its own
 /// family's.
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
@@ -8834,20 +9082,23 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
-        if (p.width, p.height, p.format) != (width, height, format) {
+        let (out_width, out_height) = present_output_size(p.hwnd, width, height);
+        if (p.width, p.height, p.format) != (out_width, out_height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, out_width, out_height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
                 Ok(()) => {
-                    (p.width, p.height, p.format) = (width, height, format);
+                    (p.width, p.height, p.format) = (out_width, out_height, format);
                     tracing::info!(
-                        width,
-                        height,
+                        width = out_width,
+                        height = out_height,
+                        source_width = width,
+                        source_height = height,
                         format = format.0,
                         frame,
                         "the swap chain's buffers were made again for another size or format"
@@ -8855,7 +9106,7 @@ impl Host {
                     self.log_video_memory("right after the swap chain's buffers were made again");
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    tracing::warn!(error = %e, width = out_width, height = out_height, "swap chain not resized");
                     return None;
                 }
             }
@@ -8891,18 +9142,71 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
+            let scaled = (width, height) != (p.width, p.height);
+            let source_state = if scaled {
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+            } else {
+                D3D12_RESOURCE_STATE_COPY_SOURCE
+            };
+            let back_state = if scaled {
+                D3D12_RESOURCE_STATE_RENDER_TARGET
+            } else {
+                D3D12_RESOURCE_STATE_COPY_DEST
+            };
             list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
+                transition(texture, state, source_state),
+                transition(&back, D3D12_RESOURCE_STATE_PRESENT, back_state),
             ]);
-            list.CopyResource(&back, texture);
+            if scaled {
+                if record_present_scale(
+                    self,
+                    copy,
+                    texture,
+                    &back,
+                    format,
+                    format,
+                    p.width,
+                    p.height,
+                )
+                .is_none()
+                {
+                    static TOLD: std::sync::Once = std::sync::Once::new();
+                    TOLD.call_once(|| {
+                        tracing::warn!(width, height, "present scale not recorded: the frame stays empty")
+                    });
+                }
+                // The lines below expect the back buffer in the copy state,
+                // as in the unscaled path.
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+            } else {
+                list.CopyResource(&back, texture);
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| {
+                    if scaled {
+                        // What is shown, not only the unscaled input: the
+                        // counter is part of it, as on the screen.
+                        list.ResourceBarrier(&[transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        )]);
+                        let read = crate::capture::read_back(&self.device, list, &back);
+                        list.ResourceBarrier(&[transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )]);
+                        read
+                    } else {
+                        crate::capture::read_back(&self.device, list, texture)
+                    }
+                })
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
@@ -8913,7 +9217,7 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                transition(texture, source_state, state),
                 transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
@@ -8968,13 +9272,14 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        let (out_width, out_height) = present_output_size(hwnd, width, height);
         self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: width,
-                Height: height,
+                Width: out_width,
+                Height: out_height,
                 Format: format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
@@ -8990,12 +9295,12 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(width = out_width, height = out_height, source_width = width, source_height = height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
-                width,
-                height,
+                width: out_width,
+                height: out_height,
                 format,
                 copy,
                 ahead: Vec::new(),
