@@ -48,10 +48,15 @@ impl Cache {
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
         let path = self.path_for(&key);
-        // Open without `is_file()` / `metadata()` so Wine doesn't call into
-        // the mount manager (`NtQueryVolumeInformationFile`), which deadlocks
-        // when the title suspends threads.
-        if std::fs::File::open(&path).is_ok() {
+        // On Windows/Wine, open without `is_file()` / `metadata()` so Wine
+        // doesn't call into the mount manager (`NtQueryVolumeInformationFile`),
+        // which deadlocks under Rosetta; on Windows `File::open` fails on
+        // directories. On Unix keep `is_file()` because `open()` succeeds on dirs.
+        #[cfg(windows)]
+        let exists = std::fs::File::open(&path).is_ok();
+        #[cfg(not(windows))]
+        let exists = path.is_file();
+        if exists {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
         }
