@@ -165,6 +165,7 @@ fn build_cs(body: &[u32], lds_bytes: u32) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
         stride_table: lowered.stride_table,
     };
 

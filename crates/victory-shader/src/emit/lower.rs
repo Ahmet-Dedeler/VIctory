@@ -10227,7 +10227,7 @@ mod tests {
             words.extend(ds(0x0d, 0, 5, 3, 4 + 4 * i as u32));
         }
         words.push(S_ENDPGM);
-        lowers(&words, LDS_512).unwrap();
+        lowers_rsrc2(&words, LDS_512).unwrap();
     }
 
     #[test]
@@ -10236,7 +10236,7 @@ mod tests {
         words.extend(ds(0xa6, 3, 5, 0, 2)); // ds_read_u16_d16 v3, v5 offset:2
         words.extend(ds(0x0d, 0, 5, 3, 4)); // ds_write_b32 v5, v3 offset:4
         words.push(S_ENDPGM);
-        match lowers(&words, LDS_512) {
+        match lowers_rsrc2(&words, LDS_512) {
             Err(crate::ShaderError::Unsupported { what, .. }) => {
                 assert_eq!(what, "an LDS read into half a register");
             }
