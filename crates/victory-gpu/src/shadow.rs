@@ -934,6 +934,7 @@ static PREPARED: AtomicU64 = AtomicU64::new(0);
 /// A submission's preparing begins (`crate::host`, under the submission
 /// lock).
 pub(crate) fn preparing(number: u64) {
+    crate::machalias::submission_starts();
     PREPARED.store(number, Ordering::Relaxed);
 }
 
@@ -3023,6 +3024,11 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            // Aliased (macOS): other host copies of these bytes (textures, guarded blocks) are
+            // told, as a copy-back would have told them (`crate::machalias::declared_in_place`).
+            if self.place.as_ref().is_some_and(|p| p.0.is_none()) {
+                crate::machalias::declared_in_place(address as usize, len.min(self.left(address)) as usize);
+            }
             return;
         }
         self.written.store(true, Ordering::Relaxed);

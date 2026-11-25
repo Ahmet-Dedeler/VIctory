@@ -236,6 +236,38 @@ pub(crate) fn report() -> Option<String> {
     ))
 }
 
+// Shader writes into aliased memory.
+
+/// `VICTORY_ALIAS_NOTIFY` (default on; `0` off): shader writes into aliased title memory are told
+/// to the write watching and the texture passes (`crate::watch::writing`: guarded blocks open,
+/// textures over those bytes are looked at again), as the copy-back told them for the bytes that
+/// changed. In place nobody knows which bytes changed, so a declared range is told whole, once per
+/// range between two submissions' starts. (After skakwy/victory-mac `zerocopy.rs`.)
+fn notify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_NOTIFY").is_none_or(|v| v != "0"))
+}
+
+static DECLARED: Mutex<std::collections::BTreeSet<(usize, usize)>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Shaders of a list being recorded may write aliased title memory `[address, address + len)`.
+pub(crate) fn declared_in_place(address: usize, len: usize) {
+    if !notify() || len == 0 {
+        return;
+    }
+    if !DECLARED.lock().unwrap_or_else(|e| e.into_inner()).insert((address, len)) {
+        return;
+    }
+    crate::watch::writing(address, len);
+}
+
+/// A submission's preparing begins: declared ranges are told again from now on.
+pub(crate) fn submission_starts() {
+    if enabled() {
+        DECLARED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
 // The Mach calls.
 
 use core::arch::asm;
