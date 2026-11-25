@@ -3736,20 +3736,7 @@ impl<'a> Lower<'a> {
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
-                    Some(h) => Some(self.get(h)?),
-                    None => None,
-                };
-                let lo = self.get(v)?;
-                let word = |w: Val| match w {
-                    Val::I32(x) => Ok(x),
-                    _ => Err("an opaque lane mask"),
-                };
-                let lo = word(lo)?;
-                let hi = hi.map(word).transpose()?;
-                Ok(self.lane_bit(at, lo, hi))
-            }
+            Atom::Opaque(v) if self.console_lanes => self.numbered_lane_bit(at, v),
             Atom::Constant(k) if self.console_lanes => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
@@ -4004,6 +3991,24 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bin(at, Bin::LShr, word, sh);
         let t = self.s.m.bin(at, Bin::And, t, one);
         self.s.m.cmp(at, pred::NE, t, z)
+    }
+
+    /// This lane's bit of a lane mask held as the number `v` (with its high
+    /// dword in wave64), as `Atom::Opaque` reads one.
+    fn numbered_lane_bit(&mut self, at: usize, v: Value) -> Result<V, Why> {
+        let pair = self.pair_high(v);
+        let hi = match pair {
+            Some(h) => Some(self.get(h)?),
+            None => None,
+        };
+        let lo = self.get(v)?;
+        let word = |w: Val| match w {
+            Val::I32(x) => Ok(x),
+            _ => Err("an opaque lane mask"),
+        };
+        let lo = word(lo)?;
+        let hi = hi.map(word).transpose()?;
+        Ok(self.lane_bit(at, lo, hi))
     }
 
     /// The value of the high dword of the wave64 register pair whose low
@@ -6787,7 +6792,12 @@ impl<'a> Lower<'a> {
             }
             return r;
         }
-        let mut guard = self.guard(b, i)?;
+        // A scalar result (`v_readlane`, `v_readfirstlane`) is written
+        // whatever EXEC holds.
+        let mut guard = match v.dst {
+            Some(Operand::Scalar { .. }) => None,
+            _ => self.guard(b, i)?,
+        };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d)?;
             guard = match (guard, enable) {
@@ -11342,6 +11352,63 @@ impl<'a> Lower<'a> {
         a
     }
 
+    /// What holds in a lane that goes from IR block `q` to `b`.
+    fn lane_edge(&self, q: usize, b: usize) -> Vec<(Bool, bool)> {
+        let st = self.x.st;
+        let mut all = vec![(st.reach[q], true)];
+        if let LaneExit::Branch { when, taken, not_taken } = st.exits[q]
+            && taken != not_taken
+        {
+            all.push((when, taken == b));
+        }
+        all
+    }
+
+    /// Whether every lane enters IR block `b` along the edge the console's
+    /// wave takes, so that an SGPR joined there holds what that edge
+    /// brought: every branch into it is uniform (SCC values). The wave runs
+    /// one path; a per-lane branch into the join (an EXEC skip, a loop's
+    /// per-lane exit) is where lanes would take edges the wave did not, and
+    /// the console compiler's if/else always skips into its join that way.
+    /// Lanes that left EXEC inside a uniform loop (the BVH walks) take no
+    /// edge into its header; the others take the wave's.
+    fn uniform_join(&self, b: usize) -> bool {
+        let st = self.x.st;
+        let preds = &self.x.p.blocks[b].preds;
+        preds.iter().filter(|&&q| self.block[q].is_some()).all(|&q| match st.exits[q] {
+            LaneExit::Branch { when, taken, not_taken } if taken != not_taken => {
+                st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
+            }
+            _ => true,
+        })
+    }
+
+    /// Whether, at a per-lane join `b` of a lane mask whose register holds
+    /// data along edge `n`, some edge brings a mask and no lane taking edge
+    /// `n` is in any of them (a compare inside a region those lanes skip).
+    /// The console wave runs one path: on a mask edge, the lanes of edge `n`
+    /// read their bit of that mask, 0. The compiler merges no value for them,
+    /// so it holds none for them either where the whole wave skips (the data
+    /// there is a reused register): 0 is theirs.
+    fn no_mask_lane_on_edge(&self, b: usize, args: &[Value], n: usize) -> bool {
+        let st = self.x.st;
+        let preds = &self.x.p.blocks[b].preds;
+        let on_n = self.lane_edge(preds[n], b);
+        let mut some = false;
+        for (k, arg) in args.iter().enumerate() {
+            let Some(&m) = st.masks.get(arg).filter(|_| k != n) else {
+                continue;
+            };
+            some = true;
+            let mut lanes = on_n.clone();
+            lanes.push((m, true));
+            if st.bools.meet(&lanes) {
+                return false;
+            }
+        }
+        some
+    }
+
     /// The DXIL block a branch from IR block `from` to `to` goes to.
     fn edge(&mut self, from: usize, to: usize) -> usize {
         let target = self.block[to].expect("reachable");
@@ -11373,11 +11440,30 @@ impl<'a> Lower<'a> {
                 .phi_masks
                 .get(&phi.value)
                 .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
+            let uniform = self.uniform_join(b);
+            // Data joined with masks where the wave takes one edge (the BVH
+            // walks pop masks from memory): with console lanes the lane's
+            // own bit of the number, as `Atom::Opaque`.
+            let number = self.console_lanes && uniform;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
+                let arg = phi.args[n];
+                let x = match (st.masks.get(&arg), self.vals.get(&arg)) {
+                    // Data on a uniform edge is the mask's number. (Often
+                    // structurisation has the same value as an opaque mask;
+                    // this case pins it to the value the edge brings.)
+                    (None, Some(&Val::I32(_))) if number => self
+                        .numbered_lane_bit(qb, arg)
+                        .map_err(|w| unsupported(offset, w))?,
+                    // A compare inside a region the lanes of this edge skip:
+                    // their bit of its mask is 0, whatever the reused register held.
+                    (None, _) if !uniform && self.no_mask_lane_on_edge(b, &phi.args, n) => {
+                        self.s.m.bool(false)
+                    }
+                    _ => self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?,
+                };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
@@ -11451,7 +11537,8 @@ impl<'a> Lower<'a> {
                     (Some(Val::Missing(_)) | None, false)
                         if self.read_phis.contains(&phi.value)
                             && self.mask_data == MaskData::Console
-                            && (st.masks.contains_key(&arg) || st.highs.contains_key(&arg)) =>
+                            && (st.masks.contains_key(&arg) || st.highs.contains_key(&arg))
+                            && self.uniform_join(b) =>
                     {
                         match self.mask_dword(arg) {
                             Ok(x) => x,
@@ -12001,6 +12088,95 @@ mod tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
             lowers(&words, 0).unwrap();
         }
+    }
+
+    #[test]
+    fn a_mask_joined_with_data_needs_a_uniform_join() {
+        // s6: lanes below 24, then shifted (data) on each back edge; read
+        // after the loop. Lanes leaving the loop at different iterations
+        // (per lane) see different numbers than the console's register:
+        // refused. The uniform loop is the same mask shifted through a VGPR,
+        // read as data and as a mask.
+        let mut words = [
+            0x7D88_0098, // v_cmp_gt_u32 vcc_lo, 24, v0
+            0x8706_7E6A, // s_and_b32 s6, vcc_lo, exec_lo
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0x9006_8406, // header: s_lshr_b32 s6, s6, 4
+            0x8007_8107, // s_add_u32 s7, s7, 1
+            0x7D88_0007, // v_cmp_gt_u32 vcc_lo, s7, v0
+            0x8A7E_6A7E, // s_andn2_b32 exec_lo, exec_lo, vcc_lo
+            0xBF89_FFFB, // s_cbranch_execnz header
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let Err(crate::ShaderError::Unsupported { what, .. }) = lowers(&words, 1 << 7) else {
+            panic!("a per-lane loop's mask join translated");
+        };
+        assert!(what.contains("lane mask"), "{what}");
+        // Leaving on a uniform condition instead: the mask's number.
+        words[5] = 0xBF0A_8207; // s_cmp_lt_u32 s7, 2
+        words[6] = 0xBF80_0000; // s_nop 0
+        words[7] = 0xBF85_FFFB; // s_cbranch_scc1 header
+        lowers(&words, 1 << 7).expect("a uniform loop's mask join");
+    }
+
+    #[test]
+    fn a_scalar_result_needs_no_exec() {
+        // s6 is 0 where every lane skips and the saved EXEC where some run:
+        // no lane mask at the per-lane join. EXEC taken from it guards only
+        // a `v_readlane` (written whatever EXEC holds) before it is restored.
+        let words = [
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
+            0xBF88_0001, // s_cbranch_execz +1
+            0xBE86_0304, // s_mov_b32 s6, s4
+            0xBEFE_0306, // s_mov_b32 exec_lo, s6
+            0xD760_0002, // v_readlane_b32 s2, v0, 3
+            0x0001_0700,
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            S_ENDPGM,
+        ];
+        lowers(&words, 1 << 7).expect("a lane read under an EXEC with no mask");
+    }
+
+    #[test]
+    fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
+        // s6 starts as data (5). Lanes below 16 enter the region, where a
+        // compare writes the same register as a lane mask; the join behind
+        // it is read as a mask. The lanes that skipped the compare read 0,
+        // their bit of the compare, not the data the register held.
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0xBF88_0002, // s_cbranch_execz +2
+            0xD4C4_0006,
+            0x0002_0088, // v_cmp_gt_u32 s6, 8, v0
+            0xBEFE_0308, // s_mov_b32 exec_lo, s8
+            0xD501_0003,
+            0x0019_0280, // v_cndmask_b32 v3, 0, 1, s6
+            0xE070_1000,
+            0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_and_uav_tables();
+        lower_with(&words, layout.clone(), used.clone()).expect("a skipped compare's mask join");
+        // The saved EXEC instead (every lane): the skipping lanes' bit would
+        // be 1 on the console, so data on the skip edge is no answer.
+        words[10..12].copy_from_slice(&[0xBE86_0308, 0xBF80_0000]); // s_mov_b32 s6, s8; s_nop 0
+        let Err(crate::ShaderError::Unsupported { what, .. }) = lower_with(&words, layout, used) else {
+            panic!("a mask holding lanes off its edge joined with data translated");
+        };
+        assert!(what.contains("lane mask"), "{what}");
     }
 
     #[test]
