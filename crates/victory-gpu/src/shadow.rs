@@ -2532,12 +2532,14 @@ impl Shadow {
                 };
                 let at = at + first;
                 crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
+                // Opened once for the stretch, which covers every run:
+                // `write_mapped_opened` does not open each run again.
                 crate::watch::writing(start + at, n);
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
                 // there since stays.
                 for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                    crate::host::write_mapped_opened((start + at + off) as *mut u8, title[off..].as_ptr(), len);
                     written += len;
                 }
             }
@@ -2634,7 +2636,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::write_mapped_opened((start + at) as *mut u8, title.as_ptr(), n);
         n
     }
 
@@ -3306,7 +3308,7 @@ impl Shadow {
                 crate::host::shaders_write(start + at, &title[..]);
                 crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                crate::host::write_mapped_opened((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
             }
         } else {
@@ -3389,7 +3391,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::write_mapped_opened((start + at) as *mut u8, title.as_ptr(), n);
         n
     }
 }
