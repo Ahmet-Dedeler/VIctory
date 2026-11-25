@@ -2468,26 +2468,27 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     if len == 0 {
         return None;
     }
-    // A view off its buffer's elements is made on a copy of its own bytes
-    // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
-    // of the copy they find, so that the copy brought up to date is the
-    // one the slot shows.
-    if let Some((base, width)) = buffer_extent(view)
-        && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
-        && let Some(whole) = crate::shadow::find(base, width)
-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
-        && let Some(own) = crate::shadow::exact(start, bytes)
-    {
-        return Some((own, start, bytes));
-    }
-    if view_extent()
-        && let Some((base, width)) = buffer_extent(view)
+    // Choose the same backing as `buffer_srv` and `buffer_uav`, including
+    // a copy of the view's own bytes when it starts off an element.
+    if let Some((base, width)) = buffer_extent(view) {
+        let backing = buffer_fields(view).and_then(|(first, count, element, stride, unknown)| {
+            crate::shadow::find_or_exact(base, width, |offset| {
+                own_bytes(offset, base, first, count, element, stride, unknown)
+            })
+        });
+        if let Some((shadow, true)) = backing {
+            let (start, bytes) = shadow.span();
+            return Some((shadow, start, bytes));
+        }
         // (The console is lax: a view may begin past its buffer's end.)
-        && address >= base
-        && address - base < width.max(1)
-        && let Some(shadow) = crate::shadow::find(base, width)
-    {
-        return Some((shadow, address, len));
+        if view_extent()
+            && address >= base
+            && address - base < width.max(1)
+            && let Some(shadow) = backing.map(|(shadow, _)| shadow)
+                .or_else(|| crate::shadow::find(base, width))
+        {
+            return Some((shadow, address, len));
+        }
     }
     crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
 }
@@ -2682,23 +2683,19 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
-    let offset = shadow.offset(address);
     // Off the elements of that copy: on a copy of its own bytes, from its
     // element 0 (`own_bytes`).
-    let (shadow, offset) = {
-        // SAFETY: a buffer view's union member.
-        let b = unsafe { desc.Anonymous.Buffer };
-        let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
-        match own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown)
-            .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
-        {
-            Some(own) => {
-                desc.Anonymous.Buffer.FirstElement = 0;
-                (own, 0)
-            }
-            None => (shadow, offset),
-        }
+    // SAFETY: a buffer view's union member.
+    let b = unsafe { desc.Anonymous.Buffer };
+    let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
+    let (shadow, own) = crate::shadow::find_or_exact(address, len, |offset| {
+        own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown)
+    })?;
+    let offset = if own {
+        desc.Anonymous.Buffer.FirstElement = 0;
+        0
+    } else {
+        shadow.offset(address)
     };
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
@@ -2770,30 +2767,24 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
     // Off the elements of that copy: on a copy of its own bytes, from its
     // element 0 (`own_bytes`).
-    let (shadow, own) = {
-        // SAFETY: a buffer view's union member.
-        let b = unsafe { desc.Anonymous.Buffer };
-        let element = if b.StructureByteStride > 0 {
-            u64::from(b.StructureByteStride)
-        } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-            4
-        } else {
-            crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-        };
-        let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
-        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown)
-            .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
-        {
-            Some(own) => {
-                desc.Anonymous.Buffer.FirstElement = 0;
-                (own, true)
-            }
-            None => (shadow, false),
-        }
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    let element = if buffer.StructureByteStride > 0 {
+        u64::from(buffer.StructureByteStride)
+    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        4
+    } else {
+        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
+    let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
+    let (shadow, own) = crate::shadow::find_or_exact(address, len, |offset| {
+        own_bytes(offset, address, buffer.FirstElement, buffer.NumElements, element, buffer.StructureByteStride, unknown)
+    })?;
+    if own {
+        desc.Anonymous.Buffer.FirstElement = 0;
+    }
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -2802,13 +2793,6 @@ fn buffer_uav(
     }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
-        u64::from(buffer.StructureByteStride)
-    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-        4
-    } else {
-        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-    };
     let offset = if own { 0 } else { shadow.offset(address) };
     // A structured view as a raw view of the same bytes (see `raw_window`).
     let window = (desc.Format == DXGI_FORMAT_UNKNOWN)
@@ -4227,6 +4211,44 @@ mod record_print_tests {
 #[cfg(test)]
 mod own_copy_tests {
     use super::own_bytes_if;
+
+    #[test]
+    fn an_exact_placed_view_does_not_make_an_unused_window() {
+        use super::{HostHeap, View, buffer_copy, make};
+
+        if crate::inplace::level() != 0 || !super::own_copy_on() {
+            return;
+        }
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let address = 0x72_4130_0008u64;
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        resource[4] = 64 << 10;
+
+        for unordered in [false, true] {
+            let mut words = [0; 16];
+            words[1] = 1;
+            if unordered {
+                words[2] = 2; // FirstElement
+                words[4] = 4; // NumElements
+                words[5] = 32; // StructureByteStride
+            } else {
+                words[4] = 2;
+                words[6] = 4;
+                words[7] = 32;
+            }
+            words[10] = address as u32;
+            words[11] = (address >> 32) as u32;
+            let view = View::Placed(unordered, resource, words);
+            let buffer = make(&view, heap.cpu(u32::from(unordered))).flatten().unwrap();
+            let (shadow, start, bytes) = buffer_copy(&view).unwrap();
+            assert_eq!(buffer, shadow.buffer);
+            assert_eq!((start, bytes), (address + 64, 128));
+        }
+        assert!(!crate::shadow::spans().iter().any(|&(start, bytes, window)| {
+            window && start <= address && address < start + bytes
+        }));
+    }
 
     /// A buffer view gets a copy of its own bytes only when it has no host
     /// view on its buffer's copy: off that copy's elements, and not a
