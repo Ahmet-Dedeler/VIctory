@@ -110,7 +110,8 @@ fn title_output() -> String {
 
 /// The title's breakpoints a thread goes on behind
 /// (`VICTORY_STEP_OVER=<hex offset>[,<hex offset>...]`, offsets into a title
-/// image; off unless set), with how often each was met.
+/// image; off unless set), with how often each was met. The word `pool` in
+/// the list is [`STEP_OVER_POOLS`].
 ///
 /// The title asserts with `int3`, which ends it without a debugger. Some of
 /// those traps sit on a function's own way out: the allocate of a
@@ -122,18 +123,48 @@ fn title_output() -> String {
 /// goes on.
 static STEP_OVER: std::sync::OnceLock<Vec<(usize, std::sync::atomic::AtomicU64)>> = std::sync::OnceLock::new();
 
+/// `VICTORY_STEP_OVER=pool`: every breakpoint of a title image that is
+/// followed by an instruction that zeroes a register (`xor r, r`) is
+/// stepped over, without a list of places: that is the shape of the pool
+/// allocators' "no free element" trap, whose next instruction makes the
+/// NULL the function returns (the handler alexodee describes in
+/// fxceless/victory-fork#378). A caller that does not expect NULL may
+/// still fault later; without this the title has stopped already.
+static STEP_OVER_POOLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How often [`STEP_OVER_POOLS`] stepped over a trap.
+static POOL_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the bytes behind an `int3` are `xor r, r` of one register with
+/// itself (`31 /r` or `33 /r` with both fields the same, under any REX
+/// prefix that extends both or neither).
+fn zeroes_a_register(behind: &[u8]) -> bool {
+    let (rex, rest) = match behind {
+        [rex @ 0x40..=0x4f, rest @ ..] => (*rex, rest),
+        rest => (0, rest),
+    };
+    // REX.R and REX.B must agree for the two fields to name one register.
+    if (rex >> 2 & 1) != (rex & 1) {
+        return false;
+    }
+    matches!(rest, [0x31 | 0x33, modrm, ..] if modrm >> 6 == 3 && (modrm >> 3 & 7) == (modrm & 7))
+}
+
 /// Where title images are mapped, for [`STEP_OVER`]'s offsets: read by the
 /// exception handler, which takes no lock. 0 is an empty place.
 static IMAGE_BASES: [std::sync::atomic::AtomicUsize; 32] = [const { std::sync::atomic::AtomicUsize::new(0) }; 32];
 
-/// A title image was mapped at `base`.
-pub(crate) fn note_image(base: usize) {
+/// The ends of the images of [`IMAGE_BASES`], place by place.
+static IMAGE_ENDS: [std::sync::atomic::AtomicUsize; 32] = [const { std::sync::atomic::AtomicUsize::new(0) }; 32];
+
+/// A title image of `size` bytes was mapped at `base`.
+pub(crate) fn note_image(base: usize, size: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     if IMAGE_BASES.iter().any(|b| b.load(Relaxed) == base) {
         return;
     }
-    for place in &IMAGE_BASES {
+    for (place, end) in IMAGE_BASES.iter().zip(&IMAGE_ENDS) {
         if place.compare_exchange(0, base, Relaxed, Relaxed).is_ok() {
+            end.store(base + size, Relaxed);
             return;
         }
     }
@@ -146,7 +177,7 @@ pub(crate) fn note_image(base: usize) {
 /// `info` comes from the system, for an exception being dispatched.
 unsafe fn step_over(info: *mut EXCEPTION_POINTERS) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    let Some(list) = STEP_OVER.get().filter(|l| !l.is_empty()) else {
+    let Some(list) = STEP_OVER.get().filter(|l| !l.is_empty() || STEP_OVER_POOLS.load(Relaxed)) else {
         return false;
     };
     // SAFETY: the system passes valid exception pointers.
@@ -155,17 +186,37 @@ unsafe fn step_over(info: *mut EXCEPTION_POINTERS) -> bool {
         return false;
     }
     let at = record.ExceptionAddress as usize;
-    let Some((offset, count)) = list.iter().find(|(offset, _)| {
+    let named = list.iter().find(|(offset, _)| {
         at.checked_sub(*offset).is_some_and(|base| base != 0 && IMAGE_BASES.iter().any(|b| b.load(Relaxed) == base))
-    }) else {
-        return false;
+    });
+    let (offset, n) = if let Some((offset, count)) = named {
+        (*offset, count.fetch_add(1, Relaxed) + 1)
+    } else {
+        if !STEP_OVER_POOLS.load(Relaxed) {
+            return false;
+        }
+        // In a title image, with the bytes behind it in the same image.
+        let Some(base) = IMAGE_BASES
+            .iter()
+            .zip(&IMAGE_ENDS)
+            .map(|(b, e)| (b.load(Relaxed), e.load(Relaxed)))
+            .find(|&(b, e)| b != 0 && at >= b && at + 4 <= e)
+            .map(|(b, _)| b)
+        else {
+            return false;
+        };
+        // SAFETY: four bytes of a mapped image's code, where the thread just ran.
+        let code = unsafe { std::slice::from_raw_parts(at as *const u8, 4) };
+        if code[0] != 0xcc || !zeroes_a_register(&code[1..]) {
+            return false;
+        }
+        (at - base, POOL_STEPS.fetch_add(1, Relaxed) + 1)
     };
     // SAFETY: the faulting thread's context, for the exception being dispatched.
     let ctx = unsafe { &mut *(*info).ContextRecord };
     if ctx.Rip as usize == at {
         ctx.Rip += 1;
     }
-    let n = count.fetch_add(1, Relaxed) + 1;
     if n <= 3 || n.is_power_of_two() {
         tracing::warn!(
             offset = format_args!("{offset:#x}"),
@@ -179,8 +230,11 @@ unsafe fn step_over(info: *mut EXCEPTION_POINTERS) -> bool {
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
     STEP_OVER.get_or_init(|| {
-        std::env::var("VICTORY_STEP_OVER")
-            .unwrap_or_default()
+        let asked = std::env::var("VICTORY_STEP_OVER").unwrap_or_default();
+        if asked.split(',').any(|o| o.trim().eq_ignore_ascii_case("pool")) {
+            STEP_OVER_POOLS.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        asked
             .split(',')
             .filter_map(|o| usize::from_str_radix(o.trim().trim_start_matches("0x"), 16).ok())
             .filter(|&o| o != 0)
