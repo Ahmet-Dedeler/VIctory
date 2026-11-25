@@ -60,6 +60,7 @@ pub mod root;
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
+mod mapped;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
@@ -72,6 +73,7 @@ mod texture;
 #[cfg(windows)]
 mod watch;
 
+pub use mapped::{title_pages_mapped, title_pages_released, title_pages_reserved, title_pages_unmapped};
 #[cfg(windows)]
 pub use host::{background, is_darwin, on_failure};
 #[cfg(windows)]

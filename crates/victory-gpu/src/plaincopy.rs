@@ -101,7 +101,9 @@ pub(crate) fn on() -> bool {
 
 /// Read stats [0..5]: copies, bytes, faults, skipped-lately, skipped-small.
 /// Write stats [5..8]: writes, write-bytes, write-faults.
-static COUNT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// [8]: faults of [`probe`] (apart from the copies'), [9]: copies not tried
+/// because the runtime says the memory has no pages ([`crate::mapped`]).
+static COUNT: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// The fewest bytes copied in place. A read of a byte or a word is how the
 /// layer ASKS whether a page is there (a texture's first page, a record):
@@ -270,10 +272,34 @@ pub(crate) fn probe(addr: usize) -> bool {
         COUNT[0].fetch_add(1, Relaxed);
         true
     } else {
-        COUNT[2].fetch_add(1, Relaxed);
+        COUNT[8].fetch_add(1, Relaxed);
         note_fault(addr, 1);
         false
     }
+}
+
+/// With [`on`] under Wine on a Mac: copies `len` bytes from `from` to `to`
+/// in place whichever side is title memory, with no way round through the
+/// kernel (there the kernel's copy is a request to `wineserver`, which
+/// suspends every thread of the process for it). False if a page of either
+/// side was not there, or the runtime says the source has none
+/// ([`crate::mapped`]: no fault is taken to learn it).
+pub(crate) fn either(to: *mut u8, from: *const u8, len: usize) -> bool {
+    if !on() {
+        return false;
+    }
+    if crate::mapped::state(from as usize, (from as usize).saturating_add(len.max(1))) == crate::mapped::State::Unmapped {
+        COUNT[9].fetch_add(1, Relaxed);
+        return false;
+    }
+    let whole = guarded_write(to, from, len);
+    if whole {
+        COUNT[0].fetch_add(1, Relaxed);
+        COUNT[1].fetch_add(len as u64, Relaxed);
+    } else {
+        COUNT[2].fetch_add(1, Relaxed);
+    }
+    whole
 }
 
 /// With [`on`]: copies title memory at `from` into host memory at `to`;
@@ -283,13 +309,24 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     if !on() {
         return false;
     }
-    if !crate::host::is_darwin() && len < LEAST {
-        COUNT[4].fetch_add(1, Relaxed);
-        return false;
-    }
-    if faulted_lately(from as usize, len) {
-        COUNT[3].fetch_add(1, Relaxed);
-        return false;
+    if crate::host::is_darwin() {
+        // Under Wine on a Mac there is no cheaper copy to leave a hole to
+        // (the kernel's is a `wineserver` request that suspends every
+        // thread): what the runtime mapped says where the holes are, and
+        // memory it told nothing of is tried whatever faulted there lately.
+        if crate::mapped::state(from as usize, (from as usize).saturating_add(len.max(1))) == crate::mapped::State::Unmapped {
+            COUNT[9].fetch_add(1, Relaxed);
+            return false;
+        }
+    } else {
+        if len < LEAST {
+            COUNT[4].fetch_add(1, Relaxed);
+            return false;
+        }
+        if faulted_lately(from as usize, len) {
+            COUNT[3].fetch_add(1, Relaxed);
+            return false;
+        }
     }
     let whole = guarded(to, from, len);
     if whole {
@@ -307,11 +344,11 @@ pub(crate) fn line(frames: f64) {
     if !on() {
         return;
     }
-    let [copies, bytes, gone, lately, small, writes, wbytes, wfaults] =
-        [0, 1, 2, 3, 4, 5, 6, 7].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
+    let [copies, bytes, gone, lately, small, writes, wbytes, wfaults, asked, known] =
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
-        "in-place title copies/frame: reads {copies:.0} ({:.1} MB, {gone:.1} faults, {lately:.0} lately, {small:.0} <{LEAST}B); \
-         writes {writes:.0} ({:.1} MB, {wfaults:.1} faults)",
+        "in-place title copies/frame: reads {copies:.0} ({:.1} MB, {gone:.1} faults, {lately:.0} lately, {small:.0} <{LEAST}B, \
+         {known:.0} known to have no pages, {asked:.1} faults asking for a page); writes {writes:.0} ({:.1} MB, {wfaults:.1} faults)",
         bytes / 1e6,
         wbytes / 1e6
     );

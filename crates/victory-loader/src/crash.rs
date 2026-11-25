@@ -108,8 +108,85 @@ fn title_output() -> String {
     said.iter().map(|l| format!("  title said: {l}\n")).collect()
 }
 
+/// The title's breakpoints a thread goes on behind
+/// (`VICTORY_STEP_OVER=<hex offset>[,<hex offset>...]`, offsets into a title
+/// image; off unless set), with how often each was met.
+///
+/// The title asserts with `int3`, which ends it without a debugger. Some of
+/// those traps sit on a function's own way out: the allocate of a
+/// fixed-size pool that is full traps and then returns NULL (retail
+/// 1.0.2.1: `5149aec` and `63966f`, the instance lists' pool, which fills
+/// about six minutes into the opening when frames take seconds; reported
+/// in Marvisak/VIctory#698). Stepping over that one byte lets the caller
+/// have its NULL: what asked for the element is not drawn, and the run
+/// goes on.
+static STEP_OVER: std::sync::OnceLock<Vec<(usize, std::sync::atomic::AtomicU64)>> = std::sync::OnceLock::new();
+
+/// Where title images are mapped, for [`STEP_OVER`]'s offsets: read by the
+/// exception handler, which takes no lock. 0 is an empty place.
+static IMAGE_BASES: [std::sync::atomic::AtomicUsize; 32] = [const { std::sync::atomic::AtomicUsize::new(0) }; 32];
+
+/// A title image was mapped at `base`.
+pub(crate) fn note_image(base: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if IMAGE_BASES.iter().any(|b| b.load(Relaxed) == base) {
+        return;
+    }
+    for place in &IMAGE_BASES {
+        if place.compare_exchange(0, base, Relaxed, Relaxed).is_ok() {
+            return;
+        }
+    }
+}
+
+/// Whether the exception is a breakpoint of [`STEP_OVER`]: then the thread
+/// continues behind it.
+///
+/// # Safety
+/// `info` comes from the system, for an exception being dispatched.
+unsafe fn step_over(info: *mut EXCEPTION_POINTERS) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(list) = STEP_OVER.get().filter(|l| !l.is_empty()) else {
+        return false;
+    };
+    // SAFETY: the system passes valid exception pointers.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    if record.ExceptionCode != EXCEPTION_BREAKPOINT {
+        return false;
+    }
+    let at = record.ExceptionAddress as usize;
+    let Some((offset, count)) = list.iter().find(|(offset, _)| {
+        at.checked_sub(*offset).is_some_and(|base| base != 0 && IMAGE_BASES.iter().any(|b| b.load(Relaxed) == base))
+    }) else {
+        return false;
+    };
+    // SAFETY: the faulting thread's context, for the exception being dispatched.
+    let ctx = unsafe { &mut *(*info).ContextRecord };
+    if ctx.Rip as usize == at {
+        ctx.Rip += 1;
+    }
+    let n = count.fetch_add(1, Relaxed) + 1;
+    if n <= 3 || n.is_power_of_two() {
+        tracing::warn!(
+            offset = format_args!("{offset:#x}"),
+            n,
+            "stepped over the title's breakpoint (VICTORY_STEP_OVER): the code behind the trap goes on"
+        );
+    }
+    true
+}
+
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
+    STEP_OVER.get_or_init(|| {
+        std::env::var("VICTORY_STEP_OVER")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|o| usize::from_str_radix(o.trim().trim_start_matches("0x"), 16).ok())
+            .filter(|&o| o != 0)
+            .map(|o| (o, std::sync::atomic::AtomicU64::new(0)))
+            .collect()
+    });
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         unsafe { report_unhandled(info) };
@@ -368,6 +445,10 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // SAFETY: as above.
+    if unsafe { step_over(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.

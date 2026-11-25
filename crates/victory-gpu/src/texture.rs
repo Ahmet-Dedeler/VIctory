@@ -1314,14 +1314,35 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     // Probe in place via plaincopy instead.
     if crate::host::is_darwin() && crate::plaincopy::on() {
         let mut there = 0;
-        for page in first..=last {
-            if crate::plaincopy::probe(page * KERNEL_PAGE) {
-                there += 1;
-            } else if all {
-                return (there, of);
+        // What the runtime mapped answers first, with no touch of the
+        // memory: a probe of a page that is not there is a fault, about
+        // 0.2 ms each through Wine and Rosetta, and a world frame asked
+        // about 8,000 to 26,000 such pages (textures streaming in).
+        let (from, to) = (first * KERNEL_PAGE, (last + 1) * KERNEL_PAGE);
+        let mut known = crate::mapped::pieces(from, to);
+        if known.is_empty() {
+            known.push((from, to, crate::mapped::State::Unknown));
+        }
+        for (start, end, state) in known {
+            match state {
+                crate::mapped::State::Mapped => there += (end - start).div_ceil(KERNEL_PAGE),
+                crate::mapped::State::Unmapped => {
+                    if all {
+                        return (there, of);
+                    }
+                }
+                crate::mapped::State::Unknown => {
+                    for page in start / KERNEL_PAGE..end.div_ceil(KERNEL_PAGE) {
+                        if crate::plaincopy::probe(page * KERNEL_PAGE) {
+                            there += 1;
+                        } else if all {
+                            return (there, of);
+                        }
+                    }
+                }
             }
         }
-        return (there, of);
+        return (there.min(of), of);
     }
     let mut there = 0;
     // SAFETY: plain data.

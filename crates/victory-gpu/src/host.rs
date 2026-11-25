@@ -7300,9 +7300,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // wineserver `task_suspend` RPCs); through the kernel if off or a page is
     // not there.
     let whole = if title_dst {
-        crate::plaincopy::write(dst, src, len) || read(src, dst, len)
+        crate::plaincopy::write(dst, src, len) || (!in_place_only() && read(src, dst, len))
     } else {
-        crate::plaincopy::copy(dst, src, len) || read(src, dst, len)
+        crate::plaincopy::copy(dst, src, len) || (!in_place_only() && read(src, dst, len))
     };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
@@ -7319,7 +7319,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     #[cfg(feature = "diagnostics")]
     let sparse = std::time::Instant::now();
-    if !title_dst && len >= 64 << 10 {
+    if in_place_only() {
+        read_known(src, dst, len);
+    } else if !title_dst && len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
         read_pieces(src, dst, len);
@@ -7353,11 +7355,41 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !(crate::plaincopy::copy(to, at, n) || read(at, to, n)) {
+        } else if !(crate::plaincopy::copy(to, at, n) || (!in_place_only() && read(at, to, n))) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
         }
         offset += n;
+    }
+}
+
+/// Whether copies of title memory never go through the kernel: under Wine
+/// on a Mac with [`crate::plaincopy`], where the kernel's copy of our own
+/// process's memory is a request to `wineserver` that suspends every
+/// thread of the process while it copies.
+fn in_place_only() -> bool {
+    is_darwin() && crate::plaincopy::on()
+}
+
+/// After a failed copy with [`in_place_only`]: by what the runtime mapped
+/// ([`crate::mapped`]). Holes of its reservations are zeros without a
+/// touch; the rest is read in place, in pieces where a piece fails.
+fn read_known(src: *const u8, dst: *mut u8, len: usize) {
+    let mut known = crate::mapped::pieces(src as usize, src as usize + len);
+    if known.is_empty() {
+        known.push((src as usize, src as usize + len, crate::mapped::State::Unknown));
+    }
+    for (start, end, state) in known {
+        let (to, n) = (dst.wrapping_add(start - src as usize), end - start);
+        if state == crate::mapped::State::Unmapped {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: inside the destination; where that is title memory the
+            // caller found all of it mapped.
+            unsafe { to.write_bytes(0, n) };
+        } else if !read(start as *const u8, to, n) {
+            read_pieces(start as *const u8, to, n);
+        }
     }
 }
 
@@ -7385,7 +7417,7 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     // In place first, if asked for (`crate::plaincopy`): the destination is
     // memory of ours, as in `copy_mapped`.
-    crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
+    crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || (!in_place_only() && read(src, dst.as_mut_ptr(), dst.len()))
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
@@ -7393,6 +7425,9 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if in_place_only() {
+        return crate::plaincopy::either(dst, src, len);
+    }
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.

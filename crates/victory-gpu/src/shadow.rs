@@ -653,7 +653,13 @@ pub(crate) fn relay() -> bool {
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
+    // Under Wine on a Mac it is off unless asked for: with stage 2 the
+    // characters' skin is missing (eyes and teeth on a black face, as in
+    // fxceless/victory-fork#89) and under Wine it costs more processor time
+    // than it saves (#6); without it the opening scene draws faces and skin.
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_RELAY").map_or(!cfg!(test) && !crate::host::is_darwin(), |v| v == "1" || v == "2") && !keeps()
+    })
 }
 
 /// The submission being prepared (its number among those started): what

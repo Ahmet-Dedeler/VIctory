@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Memory::{
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -162,7 +162,25 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    if placeholder && !at.is_null() {
+        // Only our own calls map pages into it or out of it from now on:
+        // the GPU side goes by what we tell it instead of touching (and
+        // faulting on) pages that are not there.
+        victory_gpu::title_pages_reserved(at as usize, size.next_multiple_of(PAGE));
+    }
     at
+}
+
+/// The host's `VirtualFree`, which the title calls itself: a reservation
+/// for physical pages that it releases is no longer one the GPU side knows
+/// the mappings of.
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+    // (Released with the placeholder kept is a title splitting one.)
+    if kind & MEM_RELEASE != 0 && kind & MEM_PRESERVE_PLACEHOLDER == 0 && !address.is_null() {
+        victory_gpu::title_pages_released(address as usize);
+    }
+    // SAFETY: the title's own arguments, to the host function of the name.
+    unsafe { windows_sys::Win32::System::Memory::VirtualFree(address, size, kind) }
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -318,7 +336,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            windows_sys::Win32::System::Memory::VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -869,7 +887,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
     let view = unsafe {
-        VirtualFree(
+        windows_sys::Win32::System::Memory::VirtualFree(
             base as *mut c_void,
             len,
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
@@ -904,6 +922,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_pages_mapped(base, len);
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
@@ -995,6 +1014,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
         }
         victory_gpu::title_memory_remapped(at, size);
+        victory_gpu::title_pages_unmapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -1104,7 +1124,8 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
-        dlls: &["xmem.dll"],
+        // The title's own `VirtualFree` too (see there).
+        dlls: &["xmem.dll", "api-ms-win-core-memory-*", "kernel32.dll", "kernelbase.dll"],
         exports: vec![
             hle_export!(XMemAlloc),
             hle_export!(XMemFree),
@@ -1119,6 +1140,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XMemVirtualQuery),
             hle_export!(XMemGetWorkingSetStatistics),
             hle_export!(XMemTransferMemory),
+            hle_export!(VirtualFree),
         ],
     }
 }
@@ -1184,7 +1206,7 @@ mod tests {
         };
         assert_eq!(watched, 0);
         // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_ne!(unsafe { windows_sys::Win32::System::Memory::VirtualFree(p, 0, MEM_RELEASE) }, 0);
         assert_eq!(query(p).flags, 0);
         // No address field: above the 32-bit range and below 2^40, where
         // the console keeps it.
@@ -1198,7 +1220,7 @@ mod tests {
         assert!(!p.is_null() && (p as usize) >= 1 << 32, "{p:p}");
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_ne!(unsafe { windows_sys::Win32::System::Memory::VirtualFree(p, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
