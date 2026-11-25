@@ -53,6 +53,9 @@ enum Command {
         #[arg(long)]
         missing: bool,
     },
+    /// Check title-memory aliasing on macOS without a title (needs VICTORY_ALIAS=1 under Wine on macOS).
+    #[command(hide = true)]
+    AliasCheck,
     /// List the `dll!export` pairs an import library describes.
     LibExports {
         lib: PathBuf,
@@ -186,6 +189,10 @@ fn main() -> Result<()> {
             strict,
             missing,
         } => census::run(paths, strict, missing),
+        Command::AliasCheck => {
+            victory_gpu::alias_self_check();
+            Ok(())
+        }
         Command::LibExports { lib, list } => inspect::lib_exports(&lib, list),
         Command::ShaderInfo {
             paths,

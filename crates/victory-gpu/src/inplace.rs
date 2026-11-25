@@ -84,7 +84,14 @@ pub(crate) fn probe_level() -> u8 {
 /// call before such a call once it takes them over.
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    // With `VICTORY_ALIAS=1` (macOS: title memory aliased onto the card's buffers,
+    // `crate::machalias`) title buffers and windows go in place unless asked otherwise.
+    *LEVEL.get_or_init(|| {
+        std::env::var("VICTORY_INPLACE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(if crate::machalias::enabled() { 2 } else { 0 })
+    })
 }
 
 /// The most title memory in place at once, in bytes
@@ -104,7 +111,9 @@ static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
     pub(crate) buffer: ID3D12Resource,
-    pub(crate) heap: ID3D12Heap,
+    /// The heap opened on title memory; `None` for a buffer title memory is aliased onto
+    /// (`crate::machalias`), which owns its memory.
+    pub(crate) heap: Option<ID3D12Heap>,
     /// The host GPU address of the title memory's first byte.
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
@@ -125,7 +134,7 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap: Some(heap), gpu, bias: start - at })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -133,6 +142,18 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
+        return None;
+    }
+    // Aliased memory (macOS): the buffer already is the title's memory.
+    if let Some((buffer, gpu, bias)) = crate::machalias::placed(start, len) {
+        let at = if window { 0 } else { 2 };
+        STATS[at].fetch_add(1, Ordering::Relaxed);
+        STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+        return Some(Placed { buffer, heap: None, gpu, bias });
+    }
+    // On macOS D3DMetal refuses every heap over existing memory: do not ask it for each buffer.
+    if crate::machalias::enabled() {
+        STATS[5].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     // View memory: known from the runtime without asking Windows.
@@ -207,6 +228,20 @@ fn say() {
         s[6],
         s[7]
     );
+}
+
+/// The aliasing line, every ten seconds while `VICTORY_ALIAS` is on.
+fn alias_say() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let Some(line) = crate::machalias::report() else {
+        return;
+    };
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    tracing::info!("{line}");
 }
 
 /// What a heap is opened on.
@@ -1218,6 +1253,7 @@ pub(crate) fn tick() {
     if level() > 0 {
         say();
     }
+    alias_say();
     if probe_level() == 0 {
         return;
     }
