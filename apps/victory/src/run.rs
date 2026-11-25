@@ -94,6 +94,52 @@ pub fn run(
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    // `VICTORY_RESOLUTION=1920x1080`: cap the title's resolution ladder so its
+    // frame is the display's size instead of the console's 4K.
+    let resolution = std::env::var("VICTORY_RESOLUTION").ok().and_then(|text| {
+        let (w, h) = text.split_once('x')?;
+        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+    });
+    // `VICTORY_RENDER_SCALE=0.5`: the title's own temporal upscaler renders
+    // at half width and height and reconstructs the full output size.
+    let render_scale = std::env::var("VICTORY_RENDER_SCALE").ok().and_then(|v| {
+        v.trim().parse::<f32>().ok().filter(|s| (0.2..=1.0).contains(s))
+    });
+    let own_upscaler = std::env::var_os("VICTORY_OWN_UPSCALER").is_some_and(|v| v != "0");
+    if resolution.is_some() || render_scale.is_some() || own_upscaler {
+        let base = image.base();
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image is mapped for `size` bytes; the patches rewrite it
+        // before title code runs.
+        let writable =
+            unsafe { victory_loader::make_writable(base as *const core::ffi::c_void, size) };
+        if writable {
+            if let Some((width, height)) = resolution {
+                // SAFETY: writable for `size` bytes, as above.
+                let changed = unsafe {
+                    victory_game::output::cap_ladder(base as *mut u8, size, width, height)
+                };
+                println!("resolution     {changed} ladder entry(ies) capped to {width}x{height}");
+                if let Some(at) = unsafe { victory_game::output::assert_site(base as usize, size) } {
+                    // SAFETY: `at` lies inside the image, made writable above.
+                    unsafe { std::ptr::write_bytes(at as *mut u8, 0x90, 1) };
+                    println!("resolution     int3 at {at:#x} patched to nop");
+                }
+            }
+            if let Some(scale) = render_scale {
+                // SAFETY: as above.
+                let changed = unsafe { victory_game::output::render_scale(base as *mut u8, size, scale) };
+                println!("render scale   {changed}/2 patches applied: the title's upscaler at {scale}");
+            }
+            if own_upscaler {
+                // SAFETY: as above.
+                let changed = unsafe { victory_game::output::force_own_upscaler(base as *mut u8, size) };
+                println!("upscaler       own temporal upscaler forced ({changed} patch)");
+            }
+        } else {
+            eprintln!("resolution     the image could not be made writable; no patch");
+        }
+    }
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
