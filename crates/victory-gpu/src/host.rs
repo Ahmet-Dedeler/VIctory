@@ -8544,10 +8544,13 @@ fn make_scale_pipeline(format: DXGI_FORMAT) -> windows::core::Result<ScalePipeli
         let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
         let mut targets = [DXGI_FORMAT_UNKNOWN; 8];
         targets[0] = format;
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             VS: code(&vs[..]),
             PS: code(&ps[..]),
+            BlendState: blend,
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {
                 FillMode: D3D12_FILL_MODE_SOLID,
