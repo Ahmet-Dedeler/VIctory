@@ -180,6 +180,11 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    // macOS with `VICTORY_ALIAS=1`: fresh committed memory we reserved is pointed at buffers of
+    // the card's before the title has its address (`victory_gpu::title_memory_aliasable`).
+    if constrained && !placeholder && !at.is_null() && kind & MEM_COMMIT != 0 && protect == PAGE_READWRITE {
+        victory_gpu::title_memory_aliasable(at as usize, size);
+    }
     note_protection(asked, kind, flags, at as usize, size);
     at
 }
@@ -360,6 +365,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            victory_gpu::title_memory_alias_freed(address as usize, 0, true);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -1875,6 +1881,9 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
+        if !address.is_null() {
+            victory_gpu::title_memory_alias_freed(address as usize, size, kind & MEM_RELEASE != 0);
+        }
     }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }

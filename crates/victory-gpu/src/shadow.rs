@@ -101,7 +101,7 @@ pub(crate) struct Shadow {
     /// the title's own bytes and nothing is copied either way. The heap,
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    place: Option<(Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>, u64)>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -4979,7 +4979,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+        // Aliased memory (macOS, `crate::machalias`) is one memory for both: big ones too.
+        if (!big || crate::machalias::covers(key.0, len)) && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
