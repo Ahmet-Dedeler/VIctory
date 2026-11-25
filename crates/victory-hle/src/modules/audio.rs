@@ -334,6 +334,10 @@ struct Voice {
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
+    /// Samples per channel the hardware clock still allows writing, and
+    /// when that clock was last topped up.
+    budget: usize,
+    ticked: std::time::Instant,
     trace: Trace,
 }
 
@@ -439,6 +443,8 @@ impl Xma {
         dump_input(index, context);
         *slot = Some(Voice {
             decoder: None,
+            budget: 0,
+            ticked: std::time::Instant::now(),
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
@@ -554,12 +560,29 @@ impl Xma {
     }
 }
 
+/// Samples per second of a context's rate field (word 1, bits 27-28).
+const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
+
 fn pump(context: Context, voice: &mut Voice) {
     let size = context.field(0, 22, 5);
     if size == 0 {
         return;
     }
+    let channels = context.channels();
+    let rate = RATES[context.field(1, 27, 2) as usize] as usize;
+    // The hardware clock: output appears at the stream's own rate, never
+    // bursting. The budget caps at ten milliseconds of samples so even a
+    // stalled emulation cannot catch up in one burst.
+    let cap = rate / 100 + 1;
+    let now = std::time::Instant::now();
+    let elapsed = now.duration_since(voice.ticked).as_secs_f64();
+    voice.ticked = now;
+    voice.budget = (voice.budget + (elapsed * rate as f64) as usize).min(cap);
     while context.field(1, 31, 1) == 1 {
+        let need = SAMPLES_PER_BLOCK / channels;
+        if voice.budget < need {
+            return;
+        }
         if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
             return;
         }
@@ -576,6 +599,7 @@ fn pump(context: Context, voice: &mut Voice) {
             pair.copy_from_slice(&sample.to_le_bytes());
         }
         voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
+        voice.budget = voice.budget.saturating_sub(SAMPLES_PER_BLOCK / context.channels());
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
         // The read block is the title's: taken modulo the ring like the
@@ -634,7 +658,6 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         return true;
     };
     let decoder = voice.decoder.get_or_insert_with(|| {
-        const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
         xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
     });
     let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
@@ -1339,6 +1362,8 @@ mod tests {
         context.set(5, input_apu);
         let mut voice = Voice {
             decoder: None,
+            budget: 0,
+            ticked: std::time::Instant::now(),
             pcm: VecDeque::new(),
             skip: 0,
             ended: false,
