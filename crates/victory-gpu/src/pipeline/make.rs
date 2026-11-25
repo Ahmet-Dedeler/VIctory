@@ -33,6 +33,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// When a worker began it ([`slow`]).
+    begun: OnceLock<Instant>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -42,6 +44,11 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
+    /// Whether it is a compute pipeline.
+    fn computes(&self) -> bool {
+        matches!(self.shaders.as_slice(), [only] if only.stage == "compute")
+    }
+
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
@@ -56,10 +63,12 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            begun: OnceLock::new(),
         }
     }
 
     fn make(&self) {
+        let _ = self.begun.set(Instant::now());
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
         let (lock, done) = &DONE;
@@ -105,6 +114,39 @@ fn wait_budget() -> Duration {
         tracing::info!(millis, "host pipeline wait budget per frame");
         Duration::from_millis(millis)
     })
+}
+
+/// Whether the host's driver has been at `p` for longer than most take
+/// (one of the title's takes 85 s): no frame waits for it.
+fn slow(p: &Pending) -> bool {
+    // A pass a title runs once (it unpacks a model, say) is lost if its
+    // pipeline is not there; a draw comes again in the next frame.
+    let most = if p.computes() { 10 } else { 3 };
+    p.begun.get().is_some_and(|at| at.elapsed() > Duration::from_secs(most))
+}
+
+/// What a frame may wait while a world loads: pipelines are asked for by
+/// the hundred then, and a pass the title runs once is lost if its
+/// pipeline is not there. All such waits of a run together are bounded;
+/// the title's GPU watchdog bounds one frame's (30 s).
+const LOADING_FRAME: Duration = Duration::from_secs(4);
+/// The same for compute pipelines, waited for apart: the passes that unpack
+/// a world's models are dispatched once, and in a run whose pipelines were
+/// all still to be loaded 130 of them were dropped, and with them walls,
+/// floor, ceiling and faces (they never came back).
+const LOADING_FRAME_COMPUTE: Duration = Duration::from_secs(12);
+
+/// `VICTORY_PIPELINE_GATE_S`: the bound on all of them (0: none of them).
+fn loading_left(spent: Duration) -> Duration {
+    static TOTAL: OnceLock<Duration> = OnceLock::new();
+    let total = *TOTAL.get_or_init(|| {
+        let seconds = std::env::var("VICTORY_PIPELINE_GATE_S")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(120);
+        Duration::from_secs(seconds)
+    });
+    total.saturating_sub(spent)
 }
 
 /// Pipelines queued and not made yet.
@@ -162,15 +204,23 @@ fn shared_budget() -> bool {
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
-    if budget.is_zero() {
+    if budget.is_zero() || slow(p) {
         return;
     }
+    // What was waited past the budget since the start, in milliseconds; the
+    // second of each is the compute pipelines'.
+    static LOADINGS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let compute = p.computes();
+    let past_total = &LOADINGS[usize::from(compute)];
+    let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)));
+    let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    let frame_spent = &SPENTS[usize::from(compute)];
     let shared = shared_budget();
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -186,17 +236,21 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !slow(p) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }
+        // Woken now and then to see whether it has become a slow one.
+        let rest = rest.min(Duration::from_millis(250));
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    let past = waited.saturating_sub(wait_budget());
+    past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
