@@ -900,7 +900,14 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     if start >= end || g.aliased.is_empty() {
         return any;
     }
-    let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+    let range = start / BLOCK..end.div_ceil(BLOCK);
+    // Nearly every opening of a write the guards never held finds nothing:
+    // no allocation for it (the copy-back opens some hundred thousand
+    // ranges a frame).
+    if g.aliased.range(range.clone()).next().is_none() {
+        return any;
+    }
+    let aliased: Vec<usize> = g.aliased.range(range).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
@@ -917,11 +924,13 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// [`open`] for one range, without the other views of its pages.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let range = start / BLOCK..end.div_ceil(BLOCK);
+    // Asked first without collecting: most openings have nothing guarded
+    // in the range, and the walk into a Vec allocated one per opening.
+    if g.protected.range(range.clone()).next().is_none() {
+        return false;
+    }
+    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
