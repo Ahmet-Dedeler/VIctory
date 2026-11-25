@@ -2242,6 +2242,12 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Work that writes host memory only and reads what the `Texture`
+    /// steps before it found (levels on demand: which levels the staging
+    /// buffer holds as the title's, set by its detiling). With
+    /// [`texture_threads`] those refreshes are collected: it runs after
+    /// them, at the flush that does them ([`Batch::flush_textures`]).
+    AfterTextures(std::sync::Arc<dyn Fn() + Send + Sync>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2971,7 +2977,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::AfterTextures(_) => {}
             }
         }
     }
@@ -7216,6 +7222,12 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// As [`HostList::defer_host`], for work that reads what the texture
+    /// refreshes deferred before it found ([`Step::AfterTextures`]).
+    pub(crate) fn defer_host_after_textures(&self, work: impl Fn() + Send + Sync + 'static) {
+        self.deferred().copies.push(Step::AfterTextures(std::sync::Arc::new(work)));
+    }
+
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
@@ -7310,6 +7322,16 @@ impl HostList {
                     {
                         add(C::GpuWrites, 1);
                         add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+                    }
+                    continue;
+                }
+                Step::AfterTextures(work) => {
+                    if batch.texture_jobs.is_empty() {
+                        work();
+                    } else {
+                        // A refresh it reads is still collected: after
+                        // it, in order with the other work of the kind.
+                        batch.after_textures.push(work.clone());
                     }
                     continue;
                 }
@@ -7450,6 +7472,12 @@ struct Batch {
     /// at the next flush ([`Batch::flush_textures`]). Each is in it once:
     /// the flush comes before the write that would make one due again.
     texture_jobs: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// The `Step::AfterTextures` work met while refreshes were collected,
+    /// in step order: run when those are done (the levels on demand that
+    /// a list's upload gives memory to are the ones its refresh found;
+    /// run before it, a texture's first upload found none and copied into
+    /// no memory: black for the run if nothing uploaded it again).
+    after_textures: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Batch {
@@ -7623,6 +7651,7 @@ impl Batch {
     /// The time counted is the time it took, not the threads' sum.
     fn flush_textures(&mut self) {
         if self.texture_jobs.is_empty() {
+            debug_assert!(self.after_textures.is_empty());
             return;
         }
         let started = std::time::Instant::now();
@@ -7637,6 +7666,9 @@ impl Batch {
         let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
         PREPARING[2].fetch_sub(over, Ordering::Relaxed);
         crate::framelog::sub(crate::framelog::T::RefreshUs, over);
+        for work in self.after_textures.drain(..) {
+            work();
+        }
     }
 }
 

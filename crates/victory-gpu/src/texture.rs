@@ -784,7 +784,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     list.defer_texture(staging.clone());
-    list.defer_host(move || {
+    // After the refresh above has run, wherever it runs: `detiled` is
+    // what it found (`crate::host` collects refreshes with
+    // `VICTORY_TEXTURE_THREADS`; read before them it was the last
+    // submission's, 0 at a texture's first upload: no level got memory and
+    // the copy went into none).
+    list.defer_host_after_textures(move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
@@ -903,7 +908,9 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
         fresh: fresh & !unzeroed,
         ran: std::sync::atomic::AtomicBool::new(false),
     };
-    list.defer_host(move || {
+    // In step order with the uploads' giving of levels, which may wait
+    // for collected refreshes ([`crate::host::HostList::defer_host_after_textures`]).
+    list.defer_host_after_textures(move || {
         step.ran.store(true, std::sync::atomic::Ordering::Relaxed);
         step.on_demand.card_wrote(levels, memory);
     });
