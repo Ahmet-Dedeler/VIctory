@@ -820,9 +820,16 @@ fn protect_alias(g: &mut Guards, block: usize) {
 }
 
 /// [`protect`] for one range, without the other views of its pages.
+///
+/// Under Wine one `VirtualProtect` can cover only one view: a call across
+/// two of them fails and the range is then walked block by block. Runs are
+/// cut at the end Windows reports for the region (`VirtualQuery`: one view,
+/// or the committed part of it) so that a run inside one view is one call.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
+        #[cfg(test)]
+        tests::PROTECTS.with(|n| n.set(n.get() + 1));
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
         unsafe {
@@ -841,29 +848,49 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             g.viewed.extend(from..to);
         }
     };
-    if set(from, to) {
-        note(g, from, to);
-        return;
-    }
-    for block in from..to {
-        // Never guard plain private host memory (e.g. process heap adjacent
-        // to a tracked view range, pragyaangaur/VIctory-macOS#50).
-        if !block_is_view(block) {
-            if block < uncommitted_end(block) {
-                g.absent.insert(block);
-            }
-            continue;
-        }
-        if set(block, block + 1) {
-            note(g, block, block + 1);
-        } else if block < uncommitted_end(block) {
+    let absent = |g: &mut Guards, block: usize| {
+        if block < uncommitted_end(block) {
             g.absent.insert(block);
         }
+    };
+    let mut block = from;
+    while block < to {
+        // Never guard plain private host memory (e.g. process heap adjacent
+        // to a tracked view range, pragyaangaur/VIctory-macOS#50).
+        let Some(region_end) = view_region_end(block) else {
+            absent(g, block);
+            block += 1;
+            continue;
+        };
+        // Views of the runtime's physical pages begin and end on whole
+        // blocks. If one does not, take its first block alone rather than
+        // make a call knowingly across the region's end.
+        let end = region_end.min(to).max(block + 1);
+        if set(block, end) {
+            note(g, block, end);
+        } else {
+            // Pages can go or lose their commit between the query and the
+            // protection change. Then the blocks are looked at one at a
+            // time, as before; those not there count as absent.
+            for one in block..end {
+                if !block_is_view(one) {
+                    absent(g, one);
+                    continue;
+                }
+                if set(one, one + 1) {
+                    note(g, one, one + 1);
+                } else {
+                    absent(g, one);
+                }
+            }
+        }
+        block = end;
     }
 }
 
-/// Whether `block` is a committed mapped view (safe to make read-only).
-fn block_is_view(block: usize) -> bool {
+/// If `block` starts in a committed mapped view (safe to make read-only),
+/// the end of its region as Windows reports it, in blocks and exclusive.
+fn view_region_end(block: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -871,7 +898,15 @@ fn block_is_view(block: usize) -> bool {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Type == MEM_MAPPED
+    if n == 0 || info.State != MEM_COMMIT || info.Type != MEM_MAPPED {
+        return None;
+    }
+    Some((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK)
+}
+
+/// Whether `block` is a committed mapped view (safe to make read-only).
+fn block_is_view(block: usize) -> bool {
+    view_region_end(block).is_some()
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
@@ -915,6 +950,10 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 }
 
 /// [`open`] for one range, without the other views of its pages.
+///
+/// Consecutive protected blocks of one view are opened with one call (under
+/// Wine a call across two views fails); one that the host refuses is tried
+/// block by block, as before.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
@@ -922,12 +961,54 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
+    let set = |from: usize, to: usize| {
+        #[cfg(test)]
+        tests::OPENS.with(|n| n.set(n.get() + 1));
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // SAFETY: blocks we made read-only.
+        unsafe {
+            VirtualProtect(
+                (from * BLOCK) as *const _,
+                (to - from) * BLOCK,
+                PAGE_READWRITE,
+                &mut old,
+            )
+        }
+    };
+    let note = |g: &mut Guards, from: usize, to: usize| {
+        for block in from..to {
+            g.protected.remove(&block);
+            g.clean.remove(&block);
+        }
+    };
+    let mut i = 0;
+    while i < blocks.len() {
+        // A run of consecutive protected blocks.
+        let first = blocks[i];
+        let mut last = first + 1;
+        i += 1;
+        while i < blocks.len() && blocks[i] == last {
+            last += 1;
+            i += 1;
+        }
+        let mut block = first;
+        while block < last {
+            // A single block needs no query: it is one call either way.
+            let end = if block + 1 == last {
+                last
+            } else {
+                view_region_end(block).unwrap_or(block + 1).min(last).max(block + 1)
+            };
+            if set(block, end) != 0 {
+                note(g, block, end);
+            } else {
+                for one in block..end {
+                    let _ = set(one, one + 1);
+                    note(g, one, one + 1);
+                }
+            }
+            block = end;
+        }
     }
     !blocks.is_empty()
 }
@@ -1214,6 +1295,110 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    thread_local! {
+        /// `VirtualProtect` calls this thread made in `protect` and `open`.
+        pub(super) static PROTECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(super) static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// `single` views of one block each side by side, then one view of
+    /// `single` blocks: the address of the first, and of the long one.
+    fn views_side_by_side(single: usize) -> (usize, usize) {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let len = 2 * single * BLOCK;
+        // SAFETY: a pagefile section and a placeholder of our own, split and
+        // filled with views of the section; the caller unmaps and releases them.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let base = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(base, 0);
+            let map = |at: usize, offset: usize, n: usize| {
+                VirtualFree(at as *mut _, n * BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                let view = MapViewOfFile3(
+                    section,
+                    GetCurrentProcess(),
+                    at as *const _,
+                    offset as u64,
+                    n * BLOCK,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                assert_eq!(view.Value as usize, at);
+            };
+            for k in 0..single {
+                map(base + k * BLOCK, k * BLOCK, 1);
+            }
+            let long = base + single * BLOCK;
+            map(long, single * BLOCK, single);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            (base, long)
+        }
+    }
+
+    /// Guarding and opening consecutive blocks take one call for each view,
+    /// not one failed call across views and then one call for each block.
+    #[test]
+    fn guards_take_one_view_per_protection_call() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_PRESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const SINGLE: usize = 4;
+        let (base, long) = views_side_by_side(SINGLE);
+        let end = base + 2 * SINGLE * BLOCK;
+        let before = PROTECTS.with(std::cell::Cell::get);
+        assert_eq!(guard(base, end).map(|pages| pages.len()), Some(2 * SINGLE));
+        assert_eq!(PROTECTS.with(std::cell::Cell::get) - before, SINGLE + 1);
+        assert!((0..2 * SINGLE).all(|k| read_only(base + k * BLOCK)));
+
+        let before = OPENS.with(std::cell::Cell::get);
+        assert!(open(&mut guards(), base, end));
+        assert_eq!(OPENS.with(std::cell::Cell::get) - before, SINGLE + 1);
+        assert!((0..2 * SINGLE).all(|k| writable(base + k * BLOCK)));
+
+        title_memory_remapped(base, 2 * SINGLE * BLOCK);
+        // SAFETY: the views and placeholders made above.
+        unsafe {
+            for k in 0..SINGLE {
+                let at = base + k * BLOCK;
+                UnmapViewOfFile2(
+                    GetCurrentProcess(),
+                    MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ },
+                    MEM_PRESERVE_PLACEHOLDER,
+                );
+                VirtualFree(at as *mut _, 0, MEM_RELEASE);
+            }
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS { Value: long as *mut _ },
+                MEM_PRESERVE_PLACEHOLDER,
+            );
+            VirtualFree(long as *mut _, 0, MEM_RELEASE);
+        }
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
