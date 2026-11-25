@@ -930,6 +930,96 @@ fn meeting_mode() -> u32 {
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
+/// Whether every non-swizzle/permute LDS access in `p` addresses only the
+/// current lane's own words (derived from entry VGPRs + uniforms/constants,
+/// never from memory or shared LDS). Such accesses need no cross-half ordering
+/// when a console wave64 program is halved onto 32-lane hosts (fxceless#158).
+fn lds_lane_private(p: &crate::ir::Program) -> bool {
+    let mut def: HashMap<Value, &Inst> = HashMap::new();
+    for block in &p.blocks {
+        for inst in &block.insts {
+            for &(_, v) in &inst.writes {
+                def.insert(v, inst);
+            }
+        }
+    }
+    let inputs: HashMap<Value, Reg> = p.inputs.iter().map(|&(r, v)| (v, r)).collect();
+    // bit 0 = lane-varying (entry VGPR), bit 1 = uniform/const, bit 2 = unknown/mem
+    fn taint(
+        v: Value,
+        def: &HashMap<Value, &Inst>,
+        inputs: &HashMap<Value, Reg>,
+        seen: &mut std::collections::HashSet<Value>,
+    ) -> u8 {
+        if !seen.insert(v) {
+            return 2;
+        }
+        if let Some(&reg) = inputs.get(&v) {
+            return match reg {
+                Reg::V(_) => 1,
+                _ => 2,
+            };
+        }
+        let Some(&inst) = def.get(&v) else {
+            return 2;
+        };
+        let name = inst.name();
+        if matches!(inst.fields, Fields::Buffer { .. } | Fields::Smem { .. })
+            || (matches!(inst.fields, Fields::Ds { .. })
+                && !name.starts_with("ds_swizzle")
+                && !name.contains("permute"))
+        {
+            return 4;
+        }
+        let mut t = 2u8;
+        for &(reg, sv) in &inst.reads {
+            if matches!(
+                reg,
+                Reg::Scc | Reg::S(106..=107) | Reg::S(crate::ir::EXEC..=127)
+            ) {
+                continue;
+            }
+            t |= taint(sv, def, inputs, seen);
+        }
+        t
+    }
+    for block in &p.blocks {
+        for inst in &block.insts {
+            let name = inst.name();
+            if !matches!(inst.fields, Fields::Ds { .. })
+                || name.starts_with("ds_swizzle")
+                || name.contains("permute")
+            {
+                continue;
+            }
+            let Fields::Ds { addr, .. } = &inst.fields else {
+                continue;
+            };
+            let Some(Operand::Vector { reg, dwords }) = addr else {
+                return false;
+            };
+            let values: Vec<Value> = inst
+                .reads
+                .iter()
+                .filter(|&(r, _)| *r == Reg::V(*reg))
+                .map(|&(_, v)| v)
+                .take(*dwords as usize)
+                .collect();
+            if values.is_empty() {
+                return false;
+            }
+            for v in values {
+                let mut seen = std::collections::HashSet::new();
+                let t = taint(v, &def, &inputs, &mut seen);
+                if (t & 1) == 0 || (t & 4) != 0 {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
@@ -1435,7 +1525,8 @@ impl<'a> Lower<'a> {
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
-                if !crosses && (s.lds_dwords == 0 || group <= 32) {
+                let lds_private = s.lds_dwords > 0 && group > 32 && lds_lane_private(p);
+                if !crosses && (s.lds_dwords == 0 || group <= 32 || lds_private) {
                     wave = 32;
                 } else {
                     // (Groups of several console waves too: each console wave is two host
@@ -1454,7 +1545,7 @@ impl<'a> Lower<'a> {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
                             })
                         });
-                        let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
+                        let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok || lds_private;
                         if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
@@ -12247,6 +12338,12 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // Compute every channel's value first, then emit stores grouped by
+        // (id, col). Apple's DXIL-to-Metal converter merges per-channel stores
+        // of one output element into one vector write at the first store: if an
+        // f16 conversion sits between two stores, the vector uses a value
+        // defined after it and the Metal GPU compiler crashes in regalloc.
+        let mut ready = Vec::with_capacity(stores.len());
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -12275,15 +12372,19 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            ready.push((id, col, suffix, x));
+        }
+        let thread = (mesh && !ready.is_empty()).then(|| self.mesh_thread());
+        // Stable: two stores to the same channel keep their order.
+        ready.sort_by_key(|&(id, col, ..)| (id, col));
+        for (id, col, suffix, x) in ready {
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),
                 self.s.m.i8(col),
                 x,
             ];
-            if mesh {
-                args.push(self.mesh_thread());
-            }
+            args.extend(thread);
             let void = self.s.t.void;
             self.s.op(
                 self.cur,
