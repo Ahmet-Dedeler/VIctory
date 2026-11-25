@@ -63,6 +63,9 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Its result gets the stand-in indirect diffuse light ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     /// Whether its code walks the ray-tracing structures, once looked at
     /// ([`Shader::walks`]).
     #[cfg(windows)]
@@ -117,6 +120,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                resolves_light: bytes
+                    .windows(crate::ambient::PROGRAM.len())
+                    .any(|w| w == crate::ambient::PROGRAM),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
             })
