@@ -1793,6 +1793,28 @@ fn merge_gap() -> usize {
     *GAP.get_or_init(|| std::env::var("VICTORY_MERGE_GAP").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(0, |n| n.min(64)))
 }
 
+/// The gap, in bytes, over which the differing runs of a stretch copied
+/// back into title memory are joined into one write (`VICTORY_BACK_GAP`,
+/// 0 to 1024; 0 by default: only the runs themselves are written, as
+/// before).
+///
+/// Byte by byte the world's big buffers differ in tens of thousands of
+/// short runs a frame (equal bytes in between, mostly zeros), and each run
+/// is a write of its own. Joined over small gaps the same stretch is a few
+/// writes, and the gap's bytes cost what copying them costs: memory speed,
+/// no asking.
+///
+/// What it gives up, as with [`merge_gap`]: a gap byte goes in with its
+/// run as the stretch was read before the merge. If the title wrote
+/// exactly that byte between that read and the write (the stretch is read
+/// and written within microseconds, on one thread), its newer byte is
+/// overwritten with the older one as read; exact (0) never writes a byte
+/// the GPU did not change. Exact is the default for that reason.
+fn back_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| std::env::var("VICTORY_BACK_GAP").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(0, |n| n.min(1024)))
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -2537,7 +2559,10 @@ impl Shadow {
                 crate::watch::writing(start + at, n);
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
-                // there since stays.
+                // there since stays. `VICTORY_BACK_GAP` joins runs a small
+                // gap apart into one write, gap bytes included; exact (0)
+                // by default.
+                runs = joined_over(std::mem::take(&mut runs), back_gap());
                 for &(off, len) in &runs {
                     crate::host::write_mapped_opened((start + at + off) as *mut u8, title[off..].as_ptr(), len);
                     written += len;
