@@ -8474,7 +8474,7 @@ struct Corner {
 };
 Corner corner(uint i : SV_VertexID) {
     Corner o;
-    o.p = float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0);
+    o.p = float4(float(i & 1) * 4.0 - 1.0, 1.0 - float(i >> 1) * 4.0, 0.0, 1.0);
     o.uv = float2(float(i & 1) * 2.0, float(i >> 1) * 2.0);
     return o;
 }
