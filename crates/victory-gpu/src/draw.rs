@@ -2294,6 +2294,22 @@ impl State {
             };
             crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            static LISTED: std::sync::Once = std::sync::Once::new();
+            LISTED.call_once(|| {
+                for u in stage.translated().used.iter().filter(|u| u.root == RootType::Table) {
+                    let r = match view(u.kind, (u.slot, u.table_offset_dwords)) {
+                        Some(View::Shader(r, _)) | Some(View::Unordered(r, ..)) => r,
+                        _ => continue,
+                    };
+                    let Some(t) = crate::resource::host_resource(r as This) else { continue };
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    tracing::info!(kind = ?u.kind, slot = u.slot, offset = u.table_offset_dwords, format = d.Format.0, width = d.Width, height = d.Height, depth = d.DepthOrArraySize, flags = d.Flags.0, "the light resolve reads");
+                }
+            });
+        }
         let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
             Some(View::Unordered(r, ..)) => r,
             _ => 0,
@@ -2306,7 +2322,22 @@ impl State {
             Some(View::Shader(r, _)) => Some(r as This),
             _ => None,
         };
-        crate::ambient::raise(list, light as This, depth)
+        // Table 0 holds this pass's scene inputs (table 1 is probe history and
+        // output). The ambient pass picks the HDR colour one of these; depth
+        // itself is not a candidate.
+        let mut direct = Vec::new();
+        for u in stage.translated().used.iter().filter(|u| {
+            u.kind == ResourceType::Srv && u.root == RootType::Table && u.slot == crate::ambient::DEPTH.0
+                && u.dwords == 8 && (u.slot, u.table_offset_dwords) != crate::ambient::DEPTH
+        }) {
+            if let Some(View::Shader(r, _)) = view(ResourceType::Srv, (u.slot, u.table_offset_dwords)) {
+                let r = r as This;
+                if !direct.contains(&r) {
+                    direct.push(r);
+                }
+            }
+        }
+        crate::ambient::raise(list, light as This, depth, &direct)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
