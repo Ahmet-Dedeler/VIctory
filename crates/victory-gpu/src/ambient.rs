@@ -28,9 +28,10 @@ pub(crate) const LIGHT: (u8, u32) = (1, 176);
 /// root parameter and place in its table.
 pub(crate) const DEPTH: (u8, u32) = (0, 464);
 
-/// 0.6 looked balanced; `VICTORY_AMBIENT=off` leaves the title's resolve
-/// output untouched; `0` is no indirect diffuse light at all.
-const DEFAULT: f32 = 0.6;
+/// 0.4 balances night scenes (opening cutscene) and daytime shadows without
+/// clipping bright highlights under night auto-exposure; override via
+/// `VICTORY_AMBIENT=<level>` (e.g. `0.6` for brighter daytime) or `off`.
+const DEFAULT: f32 = 0.4;
 
 /// The stand-in diffuse level; `None` if off.
 pub(crate) fn level() -> Option<f32> {

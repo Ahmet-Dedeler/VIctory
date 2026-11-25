@@ -113,10 +113,12 @@ const LEAST: usize = 256;
 
 /// The 64 KiB blocks of title memory a copy in place faulted in lately:
 /// their copies go straight to the kernel's, which reads round the hole.
-/// By the block's number, in the place its low bits name (a later block
-/// with the same low bits takes the place). Forgotten every two seconds:
-/// the title maps the memory in the end.
-static RECENT: [std::sync::atomic::AtomicUsize; 1024] = [const { std::sync::atomic::AtomicUsize::new(0) }; 1024];
+/// Sized to 65,536 slots (512 KiB) so the ~12k unmapped streaming textures in
+/// world scenes do not thrash the table and repeat VEH faults every frame.
+/// Forgotten every two seconds: the title maps the memory in the end.
+const RECENT_LEN: usize = 65_536;
+const RECENT_MASK: usize = RECENT_LEN - 1;
+static RECENT: [std::sync::atomic::AtomicUsize; RECENT_LEN] = [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_LEN];
 /// When [`RECENT`] was last emptied (milliseconds of [`now_ms`]).
 static EMPTIED: AtomicU64 = AtomicU64::new(0);
 
@@ -142,14 +144,14 @@ fn faulted_lately(from: usize, len: usize) -> bool {
         return false;
     }
     let (first, last) = blocks(from, len);
-    RECENT[first & 1023].load(Relaxed) == first || RECENT[last & 1023].load(Relaxed) == last
+    RECENT[first & RECENT_MASK].load(Relaxed) == first || RECENT[last & RECENT_MASK].load(Relaxed) == last
 }
 
 /// A copy from there faulted.
 fn note_fault(from: usize, len: usize) {
     let (first, last) = blocks(from, len);
-    RECENT[first & 1023].store(first, Relaxed);
-    RECENT[last & 1023].store(last, Relaxed);
+    RECENT[first & RECENT_MASK].store(first, Relaxed);
+    RECENT[last & RECENT_MASK].store(last, Relaxed);
 }
 
 /// The handler that turns a read fault inside [`guarded`] into its return
