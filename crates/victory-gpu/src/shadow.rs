@@ -1333,7 +1333,11 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        // Half the cores, at most 8: the refreshes of title textures join
+        // the copies and compares here (`crate::host::texture_threads`),
+        // and a submission's texture work is hundreds of megabytes read,
+        // hashed and detiled while most of the cores stand idle.
+        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 8);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");

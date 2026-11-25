@@ -7053,7 +7053,15 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if texture_threads() {
+                            // Refreshed with the others on the kept
+                            // threads at the next flush: before a step
+                            // that writes title memory, and before the
+                            // lists go to the card.
+                            batch.texture_jobs.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -7079,6 +7087,29 @@ impl HostList {
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+}
+
+/// Whether a submission's texture refreshes are spread over the threads
+/// kept for the snapshots (`crate::shadow::wide_run`), a texture to a job
+/// (on by default; `VICTORY_TEXTURE_THREADS=1` refreshes on the submitting
+/// thread, as before).
+///
+/// While the world streams in, a submission checks hundreds of megabytes
+/// of texture memory — read, hashed and detiled one texture after the
+/// other on the submitting thread, the frame line's "textures" (200-750 MB
+/// and 400-1,600 ms a frame) while most of the cores stand idle. A
+/// refresh reads title memory and writes the texture's own staging
+/// buffer, nothing of another texture's; the write-watch journal and the
+/// guards are behind their own locks, as they are for the title's
+/// threads. What must not move is the order against the submission's own
+/// writes of title memory: the refreshes collected are done before a
+/// step that writes title memory runs ([`Batch::flush`], called by
+/// [`Batch::title_written`] and [`Batch::title_wrote`] ahead of such a
+/// step), so a refresh sees the writes of the steps before it and none
+/// of the steps after it, as it did in line.
+fn texture_threads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_THREADS").is_none_or(|v| v != "1"))
 }
 
 /// Whether a range of a host copy brought up to date in a submission is
@@ -7128,6 +7159,11 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`texture_threads`]: the staging buffers whose refreshes are
+    /// collected instead of done in line, run together on the kept threads
+    /// at the next flush ([`Batch::flush_textures`]). Each is in it once:
+    /// the flush comes before the write that would make one due again.
+    texture_jobs: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -7290,6 +7326,31 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        self.flush_textures();
+    }
+
+    /// With [`texture_threads`]: the textures collected since the last
+    /// flush are refreshed on the kept threads, a texture to a job, and
+    /// the flush returns when all of them are done. Called with the
+    /// copies' flush: before a step that writes title memory (which the
+    /// refreshes must not overtake) and before the lists go to the card.
+    /// The time counted is the time it took, not the threads' sum.
+    fn flush_textures(&mut self) {
+        if self.texture_jobs.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let before = PREPARING[2].load(Ordering::Relaxed);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = self
+            .texture_jobs
+            .drain(..)
+            .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+        let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
+        PREPARING[2].fetch_sub(over, Ordering::Relaxed);
+        crate::framelog::sub(crate::framelog::T::RefreshUs, over);
     }
 }
 
