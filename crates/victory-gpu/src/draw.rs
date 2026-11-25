@@ -1730,6 +1730,9 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        // And the placed texture views nothing brings up to date any more
+        // are looked at, a part of the heap at a time.
+        host.texture_sweep(heap, frame);
         // Levels on demand: the slots of textures whose first level with
         // memory changed since the last pass are made again from it.
         host.texture_views_remade();
