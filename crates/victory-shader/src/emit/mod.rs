@@ -417,12 +417,20 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
-        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // A group of one console wave can take its per-lane branches wave-wide: the two host
+        // halves decide together, so every thread of the group reaches the barriers that form
+        // inserts. `widen` refuses larger groups, whose waves could decide differently.
+        // Runs 121-124 lost the card in a submission of two one-wave programs that had just
+        // moved to this form (`ptfx_CS_lightAtlas_Sprite` and `_Trail`, three branches each),
+        // so the automatic form is limited to the simplest one-branch case until that runtime
+        // failure is explained. `VICTORY_WAVE_WIDE=1` tries more; `=0` keeps the old behaviour.
+        let wide = std::env::var_os("VICTORY_WAVE_WIDE");
+        let one_console_wave = match native.io {
+            crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>() == 64,
+            _ => false,
+        };
+        let wide_on = wide.as_deref().is_some_and(|v| v == "1")
+            || one_console_wave && wide.as_deref().is_none_or(|v| v != "0");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -451,9 +459,11 @@ pub fn emit(
                         forms[0].1.as_ref().map(|f| &f.0),
                         Some(p),
                     ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
-                        report("wave-wide branches", &again);
+                    let explicit = wide.as_deref().is_some_and(|v| v == "1");
+                    let limit = (!explicit).then_some(1);
+                    for (n, base) in bases.into_iter().flatten().enumerate() {
+                        let again = widen(c, native, base, why, limit);
+                        report(&format!("wave-wide branches (base {n})"), &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
                         }
@@ -514,7 +524,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), None);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -551,6 +561,7 @@ fn widen(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    max_wide: Option<usize>,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -599,6 +610,15 @@ fn widen(
             return r;
         }
         wide.extend(more);
+        if max_wide.is_some_and(|max| wide.len() > max) {
+            if why {
+                eprintln!("WAVE64-WIDE stopped past the automatic one-branch limit");
+            }
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "wave-wide branches past the automatic limit",
+            });
+        }
     }
 }
 
