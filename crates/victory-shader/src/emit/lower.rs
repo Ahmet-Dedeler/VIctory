@@ -25,6 +25,11 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// Format loads that move 16-bit halves without the d16 form, a child
+/// module so it shares the emitter's state.
+#[path = "halves.rs"]
+mod halves;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -55,6 +60,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// See [`super::HostShader::half_views`].
+    pub half_views: Vec<(u8, u32)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -295,6 +302,11 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Table descriptors read or written sixteen bits a channel
+    /// ([`super::HostShader::half_views`]): root parameter, dword offset.
+    half_views: std::collections::BTreeSet<(u8, u32)>,
+    /// [`Self::places_read_as_halves`], found before the code is lowered.
+    halves_only: std::collections::BTreeSet<(u8, u32)>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1230,6 +1242,17 @@ pub(super) fn host_rdna() -> u32 {
     if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) { super::rdna_float() } else { 0 }
 }
 
+/// `VICTORY_D16_BITS=0`: 16-bit typed buffer accesses keep the float path
+/// (no unsigned-integer lowering, no `half_views` named), as before
+/// fxceless/victory-fork#927. On by default: moving each channel's bits is
+/// what the console does through the title's integer views (the face
+/// network's tensors), and the value joins the translation fingerprint, so
+/// the shader cache keys on it.
+fn d16_bits_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_D16_BITS").is_none_or(|v| v != "0"))
+}
+
 /// The refusal of a first half of an interpolation whose result is read
 /// as data ([`Lower::interp`]).
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
@@ -1726,6 +1749,8 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            half_views: Default::default(),
+            halves_only: Default::default(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2426,6 +2451,7 @@ impl<'a> Lower<'a> {
             self.s.entry = body;
         }
         self.find_coherent();
+        self.halves_only = self.places_read_as_halves();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -2511,6 +2537,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
@@ -2519,6 +2546,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -6573,7 +6601,16 @@ impl<'a> Lower<'a> {
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
-                    (10 | u, 0x409)
+                    // (Unsigned integers where the access moves halves.)
+                    let halves = d16_bits_on()
+                        && self
+                            .table_place(&Source::Loaded { load: site, first })
+                            .is_some_and(|p| {
+                                un.contains("_format_d16_")
+                                    || (self.halves_only.contains(&p)
+                                        && self.format_load_read_as_halves(ui))
+                            });
+                    (10 | u, if halves { 0x405 } else { 0x409 })
                 } else if !counted
                     && *idxen
                     && format.is_none()
@@ -7211,6 +7248,22 @@ impl<'a> Lower<'a> {
             .find(|u| u.user_data == rp.user_data)
             .map(|u| u.kind);
         (kind == Some(ResourceType::Uav)).then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
+    }
+
+    /// The table descriptor `src` is, as (root parameter, dword in the
+    /// table), when the code loads it from a fixed place in a table: the
+    /// load's own place, not the start of the range its used-resource
+    /// entry describes (a range of several descriptors starts before most
+    /// of them). `None` for a descriptor picked at run time, built in the
+    /// code or chosen by control flow.
+    fn table_place(&self, src: &Source) -> Option<(u8, u32)> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load)?;
+        let rp = self.x.native.layout.get(a.param)?;
+        (rp.root == RootType::Table && a.dynamic.is_none())
+            .then(|| (rp.slot, a.offset / 4 + u32::from(*first)))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -11721,6 +11774,24 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        // Sixteen bits a channel through a view of a table: the bits go as
+        // they are, as unsigned integers, and the host is told, which shows
+        // the shader a 16-bit float view there as its unsigned twin
+        // ([`super::HostShader::half_views`]).
+        // A format load of whole dwords whose every use reads one half of a
+        // result as a half float moves 16-bit integers too (the head
+        // program's reads of the face network's output), where every
+        // access through its view does ([`Self::places_read_as_halves`]).
+        let place = (d16_bits_on() && typed)
+            .then(|| self.table_place(src))
+            .flatten()
+            .filter(|p| {
+                d16 || (self.halves_only.contains(p) && self.format_load_read_as_halves(inst))
+            });
+        let halves = place.is_some();
+        if let Some(place) = place {
+            self.half_views.insert(place);
+        }
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -11952,7 +12023,11 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             if d16 {
-                // d16 data is taken as f16, widened for the 32-bit float
+                // Through a view of a table each half is stored as it is
+                // (`halves`). Reached another way:
+                // shortcut: d16 data is taken as f16 (integer formats would
+                // keep 16 bits), widened for the 32-bit float store.
+                // Otherwise d16 data is taken as f16, widened for the 32-bit float
                 // store; through a view of an integer format it is a 16-bit
                 // integer, zero- or sign-extended (VIctory 4243a96a: the face
                 // network keeps its halves in UINT views; its output was
@@ -11966,6 +12041,11 @@ impl<'a> Lower<'a> {
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
+                    }
+                    if halves {
+                        let low = self.s.m.i32(0xffff);
+                        wide.push(self.s.m.bin(c, Bin::And, x, low));
+                        continue;
                     }
                     let f32t = self.s.t.f32;
                     let f = self
@@ -11991,12 +12071,21 @@ impl<'a> Lower<'a> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
+                // Four unsigned integers for halves, four floats otherwise.
+                let component = if halves { 0x405 } else { 0x409 };
+                args.push(self.handle(site, src, false, (10 | u, component))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
-                    args.push(self.as_float(x));
+                    args.push(if halves { x } else { self.as_float(x) });
                 }
-                (69, "bufferStore.f32")
+                (
+                    69,
+                    if halves {
+                        "bufferStore.i32"
+                    } else {
+                        "bufferStore.f32"
+                    },
+                )
             } else {
                 match index {
                     // A raw buffer (stride 1) written by index: the index is the byte.
@@ -12056,16 +12145,30 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
             let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(
-                c,
-                "bufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                68,
-                &[h, index, iu],
-            )
+            if halves {
+                let h = self.handle(site, src, false, (10 | u, 0x405))?;
+                let i32t = self.s.t.i32;
+                let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+                self.s.op(
+                    c,
+                    "bufferLoad.i32",
+                    Attr::ReadOnly,
+                    ret,
+                    68,
+                    &[h, index, iu],
+                )
+            } else {
+                let h = self.handle(site, src, false, (10 | u, 0x409))?;
+                self.s.op(
+                    c,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    68,
+                    &[h, index, iu],
+                )
+            }
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
@@ -12115,8 +12218,8 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0); the low
-            // 16 bits of an integer view's (see the stores above).
+            // Two f16 channels per VGPR (an odd last high half 0); through
+            // a view of a table, the 16 bits of each as they are.
             let integer = if typed { self.integer_view(src)? } else { None };
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
@@ -12124,15 +12227,21 @@ impl<'a> Lower<'a> {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let mut h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
-                    if let Some((int, _)) = integer {
-                        let bits = self.as_int(f);
-                        let low = self.s.m.i32(0xFFFF);
-                        let low = self.s.m.bin(c, Bin::And, bits, low);
-                        h = self.s.m.select(c, int, low, h);
-                    }
+                    let h = if halves {
+                        let low = self.s.m.i32(0xffff);
+                        self.s.m.bin(c, Bin::And, f, low)
+                    } else {
+                        let mut h = self
+                            .s
+                            .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                        if let Some((int, _)) = integer {
+                            let bits = self.as_int(f);
+                            let low = self.s.m.i32(0xFFFF);
+                            let low = self.s.m.bin(c, Bin::And, bits, low);
+                            h = self.s.m.select(c, int, low, h);
+                        }
+                        h
+                    };
                     x = Some(match x {
                         Some(hi) => {
                             let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
@@ -12147,7 +12256,8 @@ impl<'a> Lower<'a> {
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
+            // (Integers already where the load moved halves.)
+            let x = if halves { x } else { self.as_int(x) };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
@@ -13471,5 +13581,251 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    // The 16-bit typed buffer access tests of fxceless/victory-fork#927
+    // (`halves_go_through_a_table_as_they_are_and_name_their_views`,
+    // `half_places_are_the_descriptors_the_program_loads`,
+    // `a_format_load_read_as_halves_loads_the_integer`), lowering-only:
+    // their DXIL validation and device dispatch parts are in
+    // `valu_tests.rs` (Windows). The instruction encodings are the PR's.
+
+    /// SOP1 `s_mov_b32 sdst, src0`.
+    const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
+        0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
+    }
+
+    /// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
+    const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
+        [
+            0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+            125 << 25,
+        ]
+    }
+
+    /// VOP1 `op vdst, src0` (`src0`: 0..105 = SGPR, 256..511 = VGPR).
+    const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
+        0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
+    }
+
+    /// VOP2 `op vdst, src0, vsrc1`.
+    const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+        (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+    }
+
+    const fn vgpr(n: u8) -> u16 {
+        256 + n as u16
+    }
+
+    /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
+    const fn mubuf_idxen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 13,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+
+    /// MUBUF `buffer_store_dword vdata, off, s[srsrc:srsrc+3], 0 offset:byte_off`.
+    const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+        [
+            0x38 << 26 | 0x1C << 18 | (byte_off as u32 & 0xFFF),
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+        ]
+    }
+
+    /// The #927 tests' root layout: 4 dwords of root constants in s0..s3,
+    /// the descriptor table's address in s4.
+    fn halves_layout() -> Vec<RootParam> {
+        vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ]
+    }
+
+    /// The #927 tests' used-resource entry: a view in the table of root
+    /// parameter 1 at `table_offset_dwords`.
+    fn halves_view(kind: ResourceType, table_offset_dwords: u32, stride: u32) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: table_offset_dwords / 8,
+            stride,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }
+    }
+
+    /// A program that moves a typed buffer's 16-bit channels
+    /// (`buffer_load_format_d16_xyzw` from the table's first view,
+    /// `buffer_store_format_d16_xyzw` to its second) names both places for
+    /// the host (`HostShader::half_views`); one that moves no halves names
+    /// nothing. (#927's `halves_go_through_a_table_as_they_are_and_name_their_views`,
+    /// lowering part; the device part is in `valu_tests.rs`.)
+    #[test]
+    fn halves_through_a_table_name_their_views() {
+        const LOAD_D16_XYZW: u32 = 0x83;
+        const STORE_D16_XYZW: u32 = 0x87;
+        // The table's second descriptor, 0x20 bytes on.
+        let mut second = s_load_dwordx4(12, 4);
+        second[1] |= 0x20;
+        let mut words = vec![s_mov_b32(5, 0x80)];
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        words.extend_from_slice(&second);
+        // v[1:2] = first[thread] (four halves), second[thread] = v[1:2].
+        words.extend_from_slice(&mubuf_idxen(LOAD_D16_XYZW, 1, 0, 8));
+        words.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
+        words.push(S_ENDPGM);
+        let used = vec![
+            halves_view(ResourceType::Srv, 0, 4),
+            halves_view(ResourceType::Uav, 8, 4),
+        ];
+        let lowered = lower_wave(&words, halves_layout(), used, false).expect("lower");
+        assert_eq!(lowered.half_views, [(1, 0), (1, 8)]);
+        // A raw store through the same table: no halves, nothing named.
+        let mut raw = vec![s_mov_b32(5, 0x80)];
+        raw.extend_from_slice(&s_load_dwordx4(8, 4));
+        raw.extend_from_slice(&second);
+        raw.extend_from_slice(&buffer_store_dword(2, 12, 0));
+        raw.push(S_ENDPGM);
+        let used = vec![
+            halves_view(ResourceType::Srv, 0, 4),
+            halves_view(ResourceType::Uav, 8, 0),
+        ];
+        let lowered = lower_wave(&raw, halves_layout(), used, false).expect("lower");
+        assert!(lowered.half_views.is_empty());
+    }
+
+    /// The places a program that moves halves names are the descriptors it
+    /// loads, not the start of the range their used-resource entry
+    /// describes: with one entry for a range from dword 0, a load at byte
+    /// 0x20 names dword 8. A descriptor picked at run time (the load's
+    /// offset in an SGPR) names nothing. (#927's
+    /// `half_places_are_the_descriptors_the_program_loads`.)
+    #[test]
+    fn half_places_are_the_descriptors_the_program_loads() {
+        const LOAD_D16_XYZW: u32 = 0x83;
+        const STORE_D16_XYZW: u32 = 0x87;
+        let lowered = |words: &[u32]| {
+            // One entry for a range of views from dword 0, one at 16.
+            let used = vec![
+                halves_view(ResourceType::Srv, 0, 4),
+                halves_view(ResourceType::Uav, 16, 4),
+            ];
+            lower_wave(words, halves_layout(), used, false).expect("lower")
+        };
+        // `s_load_dwordx4 s[dst:dst+3], s[4:5], offset` (soffset null), or
+        // with the offset in `soffset` instead.
+        let at = |dst: u8, offset: u32| {
+            let mut w = s_load_dwordx4(dst, 4);
+            w[1] |= offset;
+            w
+        };
+        let picked = |dst: u8, soffset: u8| {
+            let mut w = s_load_dwordx4(dst, 4);
+            w[1] = u32::from(soffset) << 25;
+            w
+        };
+        let mut fixed = vec![s_mov_b32(5, 0x80)];
+        fixed.extend_from_slice(&at(8, 0x20));
+        fixed.extend_from_slice(&at(12, 0x40));
+        fixed.extend_from_slice(&mubuf_idxen(LOAD_D16_XYZW, 1, 0, 8));
+        fixed.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
+        fixed.push(S_ENDPGM);
+        assert_eq!(lowered(&fixed).half_views, [(1, 8), (1, 16)]);
+        // The load's offset in s20, from the first lane's thread index
+        // (`v_readfirstlane_b32 s20, v0`): picked at run time.
+        let mut runtime = vec![s_mov_b32(5, 0x80), vop1(0x02, 20, vgpr(0))];
+        runtime.extend_from_slice(&picked(8, 20));
+        runtime.extend_from_slice(&at(12, 0x40));
+        runtime.extend_from_slice(&mubuf_idxen(LOAD_D16_XYZW, 1, 0, 8));
+        runtime.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
+        runtime.push(S_ENDPGM);
+        assert_eq!(lowered(&runtime).half_views, [(1, 16)]);
+    }
+
+    /// A format load of whole dwords (`buffer_load_format_x`, not d16)
+    /// whose result the program only reads one half of as a half float
+    /// (`v_cvt_f32_f16`) names its view; used as a whole float instead
+    /// (`v_add_f32`) it names nothing, and neither does a load of halves
+    /// beside a load of the same view read as a whole float. Behind a
+    /// branch, as the head program reads the face network's output, the
+    /// place is named all the same. (#927's
+    /// `a_format_load_read_as_halves_loads_the_integer`, lowering part.)
+    #[test]
+    fn a_format_load_read_as_halves_names_its_view() {
+        const LOAD_FORMAT_X: u32 = 0x00;
+        const V_CVT_F32_F16: u16 = 0x0B;
+        const V_ADD_F32: u8 = 0x03;
+        let lowered = |body: &[u32]| {
+            let mut second = s_load_dwordx4(12, 4);
+            second[1] |= 0x20;
+            let mut words = vec![s_mov_b32(5, 0x80)];
+            words.extend_from_slice(&s_load_dwordx4(8, 4));
+            words.extend_from_slice(&second);
+            // `body` leaves v2, stored raw.
+            words.extend_from_slice(body);
+            words.extend_from_slice(&buffer_store_dword(2, 12, 0));
+            words.push(S_ENDPGM);
+            let used = vec![
+                halves_view(ResourceType::Srv, 0, 4),
+                halves_view(ResourceType::Uav, 8, 0),
+            ];
+            lower_wave(&words, halves_layout(), used, false).expect("lower")
+        };
+        // v1 = first[v0] (one channel).
+        let load = mubuf_idxen(LOAD_FORMAT_X, 1, 0, 8);
+        let half = vop1(V_CVT_F32_F16, 2, vgpr(1));
+        let as_halves = lowered(&[&load[..], &[half]].concat());
+        assert_eq!(as_halves.half_views, [(1, 0)]);
+        let as_float = lowered(&[&load[..], &[vop2(V_ADD_F32, 2, vgpr(1), 1)]].concat());
+        assert!(as_float.half_views.is_empty());
+        // v3 = first[v0] too, read as a whole float: v2 = half(v1) + v3.
+        let mut beside = load.to_vec();
+        beside.extend_from_slice(&mubuf_idxen(LOAD_FORMAT_X, 3, 0, 8));
+        beside.push(half);
+        beside.push(vop2(V_ADD_F32, 2, vgpr(3), 2));
+        assert!(lowered(&beside).half_views.is_empty());
+        // Behind a branch, as the head program has it: where the lanes meet
+        // again the loaded value goes on through a phi, and a later write
+        // of v1 under EXEC reads it only to keep it in the lanes it leaves
+        // alone.
+        const SAVE_EXEC: u32 = 0xBE90_037E; // s_mov_b32 s16, exec_lo
+        const ONLY_LANE_0: u32 = 0x7DA4_0080; // v_cmpx_eq_u32 exec_lo, 0, v0
+        const SKIP_3: u32 = 0xBF88_0003; // s_cbranch_execz over the next 3 words
+        const RESTORE_EXEC: u32 = 0xBEFE_0310; // s_mov_b32 exec_lo, s16
+        let zero = vop1(0x01, 2, 128); // v_mov_b32 v2, 0
+        let rewrite = vop1(0x01, 1, 128); // v_mov_b32 v1, 0
+        let branched = lowered(
+            &[
+                &[zero, SAVE_EXEC, ONLY_LANE_0, SKIP_3][..],
+                &load,
+                &[
+                    half,
+                    RESTORE_EXEC,
+                    SAVE_EXEC,
+                    ONLY_LANE_0,
+                    rewrite,
+                    RESTORE_EXEC,
+                ],
+            ]
+            .concat(),
+        );
+        assert_eq!(branched.half_views, [(1, 0)]);
     }
 }
