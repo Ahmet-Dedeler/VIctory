@@ -8,10 +8,14 @@
 #[path = "console_insn_decode.rs"]
 mod decode;
 
+#[cfg(all(not(windows), test))]
+use crate::test_windows as winapi;
 use decode::ConsoleOnly;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
+#[cfg(windows)]
+use windows_sys as winapi;
+use winapi::Win32::System::Diagnostics::Debug::CONTEXT;
 
 const CONTINUE_EXECUTION: i32 = -1;
 
@@ -83,12 +87,12 @@ fn clock_us() -> u64 {
     let per_second = *PER_SECOND.get_or_init(|| {
         let mut f = 0i64;
         // SAFETY: a valid out pointer.
-        unsafe { windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut f) };
+        unsafe { winapi::Win32::System::Performance::QueryPerformanceFrequency(&mut f) };
         f.max(1)
     });
     let mut now = 0i64;
     // SAFETY: a valid out pointer.
-    unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut now) };
+    unsafe { winapi::Win32::System::Performance::QueryPerformanceCounter(&mut now) };
     (now as u128 * 1_000_000 / per_second as u128) as u64
 }
 
@@ -117,7 +121,7 @@ fn wait_ended(begin: u64, last: u64, address: usize, wanted: u64, spins: u32) {
     }
     if us >= 500 && (detail_now() || WAITS_SAID.fetch_add(1, Relaxed) < 40) {
         // SAFETY: no preconditions.
-        let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        let thread = unsafe { winapi::Win32::System::Threading::GetCurrentThreadId() };
         tracing::info!(
             "mwait: thread {thread} waited {:.1} ms for the value at {address:#x} to reach {wanted} ({spins} mwaitx)",
             us as f64 / 1e3
@@ -176,7 +180,7 @@ fn line() {
 }
 
 fn readable(va: usize, bytes: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+    use winapi::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
     // SAFETY: plain data filled in by the query.
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
@@ -196,7 +200,7 @@ fn writable(va: usize, bytes: usize) -> bool {
 /// on view memory opens as it does any write, and which is a crash otherwise (as the
 /// unchecked single-line emulation behind this one already is).
 fn writable_to(va: usize, end: usize) -> Option<usize> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery};
+    use winapi::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery};
     let remember = remembers();
     if remember {
         let (regions, answers) = WRITABLE.with(Cell::get);
@@ -355,7 +359,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb => {
             // nothing to write back on the PC: patched to NOPs, no exception next time
-            use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+            use winapi::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
             let mut old = 0u32;
             // SAFETY: the instruction's own bytes, made writable for the patch and restored.
             unsafe {
@@ -436,14 +440,14 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         ConsoleOnly::Rdpru => {
             let mut v = 0i64;
             // SAFETY: a valid out pointer.
-            unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut v) };
+            unsafe { winapi::Win32::System::Performance::QueryPerformanceCounter(&mut v) };
             let v = if ctx.Rcx as u32 <= 1 { v as u64 } else { 0 };
             ctx.Rax = v & 0xFFFF_FFFF;
             ctx.Rdx = v >> 32;
         }
         ConsoleOnly::Rdpid(r) => {
             // SAFETY: no preconditions.
-            let cpu = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() } as u64;
+            let cpu = unsafe { winapi::Win32::System::Threading::GetCurrentProcessorNumber() } as u64;
             let regs: [&mut u64; 16] = [
                 &mut ctx.Rax, &mut ctx.Rcx, &mut ctx.Rdx, &mut ctx.Rbx, &mut ctx.Rsp, &mut ctx.Rbp, &mut ctx.Rsi, &mut ctx.Rdi, &mut ctx.R8, &mut ctx.R9, &mut ctx.R10, &mut ctx.R11, &mut ctx.R12, &mut ctx.R13,
                 &mut ctx.R14, &mut ctx.R15,
