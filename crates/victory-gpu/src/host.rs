@@ -7296,9 +7296,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    // Into host memory: in place first, if asked for (`crate::plaincopy`);
-    // through the kernel if that is off or met a page that was not there.
-    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
+    // In place first when `plaincopy` is on (default on macOS/Wine to avoid
+    // wineserver `task_suspend` RPCs); through the kernel if off or a page is
+    // not there.
+    let whole = if title_dst {
+        crate::plaincopy::write(dst, src, len) || read(src, dst, len)
+    } else {
+        crate::plaincopy::copy(dst, src, len) || read(src, dst, len)
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -7348,7 +7353,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read(at, to, n) {
+        } else if !(crate::plaincopy::copy(to, at, n) || read(at, to, n)) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
         }
@@ -7422,6 +7427,30 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    if crate::plaincopy::on() {
+        // Ensure any watch-guarded pages are opened before writing in place so
+        // our VEH never has to fall back to wineserver's NtWriteVirtualMemory
+        // (which calls task_suspend on every thread under macOS Wine).
+        crate::watch::writing(dst as usize, len);
+        let write_plain = |at: usize, n: usize| {
+            let from = src.wrapping_add(at - dst as usize);
+            crate::plaincopy::write(at as *mut u8, from, n)
+        };
+        if write_plain(dst as usize, len) {
+            return;
+        }
+        for_pieces(dst as usize, len, 64 << 10, |at, n| {
+            if !write_plain(at, n) {
+                for_pieces(at, n, 4 << 10, |at, n| {
+                    write_plain(at, n);
+                });
+            }
+        });
+        return;
+    }
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
@@ -7440,7 +7469,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
+    if write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
