@@ -1309,6 +1309,20 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     const KERNEL_PAGE: usize = 4096;
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
     let of = last - first + 1;
+    // Under macOS Wine, K32QueryWorkingSetEx is a stub returning 0 and every
+    // 1-byte ReadProcessMemory fallback RPCs into wineserver (task_suspend).
+    // Probe in place via plaincopy instead.
+    if crate::host::is_darwin() && crate::plaincopy::on() {
+        let mut there = 0;
+        for page in first..=last {
+            if crate::plaincopy::probe(page * KERNEL_PAGE) {
+                there += 1;
+            } else if all {
+                return (there, of);
+            }
+        }
+        return (there, of);
+    }
     let mut there = 0;
     // SAFETY: plain data.
     let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };

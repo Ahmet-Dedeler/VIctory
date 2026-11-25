@@ -148,13 +148,14 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 /// Optional cap on mesh shader output bytes on Darwin/D3DMetal
-/// (`VICTORY_METAL_MESH_LIMIT=0` or `off` disables the cap; default 32768).
+/// (off by default on D3DMetal 4.0b3+, which accepts >32 KiB mesh shaders
+/// cleanly; set `VICTORY_METAL_MESH_LIMIT=32768` on D3DMetal 3.0).
 fn metal_mesh_limit() -> Option<u32> {
     static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| match std::env::var("VICTORY_METAL_MESH_LIMIT") {
         Ok(v) if v.trim() == "0" || v.trim().eq_ignore_ascii_case("off") => None,
         Ok(v) => v.trim().parse::<u32>().ok().filter(|&n| n > 0),
-        Err(_) => Some(32_768),
+        Err(_) => None,
     })
 }
 

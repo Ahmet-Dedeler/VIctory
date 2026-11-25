@@ -244,6 +244,36 @@ pub(crate) fn write(to: *mut u8, from: *const u8, len: usize) -> bool {
     whole
 }
 
+/// With [`on`]: checks whether 1 byte at `addr` is readable without calling
+/// `ReadProcessMemory` (which triggers `wineserver` `task_suspend` under
+/// macOS Wine). Mapped pages resolve in a single guarded load (~2 ns);
+/// blocks that faulted recently use `VirtualQuery` so repeated streaming
+/// polls avoid both faults and `wineserver` RPCs.
+pub(crate) fn probe(addr: usize) -> bool {
+    if !on() {
+        return false;
+    }
+    if faulted_lately(addr, 1) {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+        };
+        // SAFETY: plain out struct.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: queries `addr` in our own process.
+        let n = unsafe { VirtualQuery(addr as *const _, &mut info, size_of_val(&info)) };
+        return n != 0 && info.State == MEM_COMMIT && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+    }
+    let mut byte = 0u8;
+    if guarded(&mut byte, addr as *const u8, 1) {
+        COUNT[0].fetch_add(1, Relaxed);
+        true
+    } else {
+        COUNT[2].fetch_add(1, Relaxed);
+        note_fault(addr, 1);
+        false
+    }
+}
+
 /// With [`on`]: copies title memory at `from` into host memory at `to`;
 /// false if it is off or a source page was not there (the caller then
 /// copies through the kernel, as before).
@@ -251,7 +281,7 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     if !on() {
         return false;
     }
-    if len < LEAST {
+    if !crate::host::is_darwin() && len < LEAST {
         COUNT[4].fetch_add(1, Relaxed);
         return false;
     }
