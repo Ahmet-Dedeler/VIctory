@@ -935,7 +935,14 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     if start >= end || g.aliased.is_empty() {
         return any;
     }
-    let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+    let range = start / BLOCK..end.div_ceil(BLOCK);
+    // Nearly every opening of a write the guards never held finds nothing:
+    // no allocation for it (the copy-back opens some hundred thousand
+    // ranges a frame).
+    if g.aliased.range(range.clone()).next().is_none() {
+        return any;
+    }
+    let aliased: Vec<usize> = g.aliased.range(range).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
@@ -956,11 +963,13 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// block by block, as before.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let range = start / BLOCK..end.div_ceil(BLOCK);
+    // Asked first without collecting: most openings have nothing guarded
+    // in the range, and the walk into a Vec allocated one per opening.
+    if g.protected.range(range.clone()).next().is_none() {
+        return false;
+    }
+    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     let set = |from: usize, to: usize| {
         #[cfg(test)]
         tests::OPENS.with(|n| n.set(n.get() + 1));
@@ -1013,11 +1022,17 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
+/// Since the last frame line: calls of [`writing`], wherever they were
+/// made (the copy-back's openings are most of them). Taken in
+/// [`crate::plaincopy::line`].
+pub(crate) static WRITING_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    WRITING_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.

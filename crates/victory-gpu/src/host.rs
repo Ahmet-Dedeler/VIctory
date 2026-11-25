@@ -7555,6 +7555,68 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     });
 }
 
+/// [`write_mapped`] when the caller has just opened the whole write's
+/// range with `crate::watch::writing` (the copy-back of what shaders wrote
+/// does so once per stretch, then writes its runs): the opening is not
+/// repeated here. With the copies in place that was one lock of the
+/// guards' mutex, a walk of their tree, an allocation and the texture
+/// table's mutex per run of a few bytes, some hundred thousand times a
+/// frame.
+///
+/// The opening cannot be relied on alone: a block of the range can be
+/// read-only again by the time it is written. Blocks are guarded only from
+/// `crate::watch::writes` with `guarded` set (`guard` -> `protect`, the
+/// only inserts into `protected`/`clean`), which a copy's refresh calls:
+/// buffer copies (`Shadow::update_free`, on the submitting thread or the
+/// pool threads of `crate::shadow::wide_run`), textures in view memory
+/// (`texture.rs` `refresh_timed`, the submitting thread), descriptor heaps
+/// (`sync_heaps`, the submitting thread) and `Shadow::merge_under_writes`
+/// (the submitting thread) — while the copy-back runs on the submitting
+/// thread, the relay's landing thread or a pool thread. What makes that
+/// race slow but never wrong: read-only memory cannot be written without
+/// a fault, and a fault of the guarded `rep movsb` is always taken by one
+/// of the two vectored handlers ahead of the others in the line (both
+/// installed with `first` set, so the one installed later is first):
+/// the watch's, if it sees the fault first, opens the block and lets the
+/// write go on (correct: the block then counts as written and copies take
+/// it again); ours (`crate::plaincopy`) ends the copy with false, and the
+/// piece is opened again here and retried. `rep movsb` copies byte by
+/// byte, so a failed try may have written the bytes before the faulting
+/// one; the retry writes the same bytes again, which changes nothing.
+pub(crate) fn write_mapped_opened(dst: *mut u8, src: *const u8, len: usize) {
+    if len == 0 || !crate::plaincopy::on() {
+        // Without the copies in place `write_mapped` opens nothing itself:
+        // the kernel's write needs the caller's opening either way.
+        write_mapped(dst, src, len);
+        return;
+    }
+    let write_plain = |at: usize, n: usize| {
+        let from = src.wrapping_add(at - dst as usize);
+        crate::plaincopy::write(at as *mut u8, from, n)
+    };
+    if write_plain(dst as usize, len) {
+        return;
+    }
+    // The write failed: a page of the range is not there, or a block was
+    // guarded again since the caller opened the range. Open it again and
+    // retry before the pieces: the failure says which it was only by
+    // failing again.
+    crate::watch::writing(dst as usize, len);
+    if write_plain(dst as usize, len) {
+        return;
+    }
+    for_pieces(dst as usize, len, 64 << 10, |at, n| {
+        if !write_plain(at, n) {
+            crate::watch::writing(at, n);
+            if !write_plain(at, n) {
+                for_pieces(at, n, 4 << 10, |at, n| {
+                    write_plain(at, n);
+                });
+            }
+        }
+    });
+}
+
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
 fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
