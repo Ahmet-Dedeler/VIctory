@@ -334,10 +334,6 @@ struct Voice {
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
-    /// Samples per channel the hardware clock still allows writing, and
-    /// when that clock was last topped up.
-    budget: usize,
-    ticked: std::time::Instant,
     trace: Trace,
 }
 
@@ -443,8 +439,6 @@ impl Xma {
         dump_input(index, context);
         *slot = Some(Voice {
             decoder: None,
-            budget: 0,
-            ticked: std::time::Instant::now(),
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
@@ -568,21 +562,7 @@ fn pump(context: Context, voice: &mut Voice) {
     if size == 0 {
         return;
     }
-    let channels = context.channels();
-    let rate = RATES[context.field(1, 27, 2) as usize] as usize;
-    // The hardware clock: output appears at the stream's own rate, never
-    // bursting. The budget caps at ten milliseconds of samples so even a
-    // stalled emulation cannot catch up in one burst.
-    let cap = rate / 100 + 1;
-    let now = std::time::Instant::now();
-    let elapsed = now.duration_since(voice.ticked).as_secs_f64();
-    voice.ticked = now;
-    voice.budget = (voice.budget + (elapsed * rate as f64) as usize).min(cap);
     while context.field(1, 31, 1) == 1 {
-        let need = SAMPLES_PER_BLOCK / channels;
-        if voice.budget < need {
-            return;
-        }
         if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
             return;
         }
@@ -599,14 +579,18 @@ fn pump(context: Context, voice: &mut Voice) {
             pair.copy_from_slice(&sample.to_le_bytes());
         }
         voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
-        voice.budget = voice.budget.saturating_sub(SAMPLES_PER_BLOCK / context.channels());
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
         // The read block is the title's: taken modulo the ring like the
         // write block and `advance_read`'s. Compared as it is, one at or
         // past the end would never be met, and a stream that loops would
         // keep this voice (and its lock) filling forever.
-        if write == context.field(9, 0, 5) % size {
+        // Full one block early: write never meets read while data waits in
+        // the ring, so the title cannot mistake a full ring for an empty
+        // one. Voices used to die within 9-90 ms of enable: the first fill
+        // lapped the ring, write caught read exactly, the title read the
+        // ring as empty and recycled the voice, forever.
+        if (write + 1) % size == context.field(9, 0, 5) % size {
             // Full: nothing more until the title advances its read block.
             context.set_field(1, 31, 1, 0);
         }
@@ -1362,8 +1346,6 @@ mod tests {
         context.set(5, input_apu);
         let mut voice = Voice {
             decoder: None,
-            budget: 0,
-            ticked: std::time::Instant::now(),
             pcm: VecDeque::new(),
             skip: 0,
             ended: false,
