@@ -519,10 +519,19 @@ impl HostPipeline {
             )
         };
         if compute.is_some() {
+            let cs_code = code(0);
+            let cs_bytes = code_bytes(&cs_code);
+            let max_wave = crate::host::host_max_wave_lanes();
+            if let Some(need) = wave_lanes(&cs_bytes)
+                && need > max_wave
+            {
+                WIDE_WAVE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return refuse("the compute program needs wider waves than the host GPU runs", shaders);
+            }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-                CS: code(0),
+                CS: cs_code,
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
@@ -575,7 +584,18 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
-        if mesh.is_some() {
+        if let Some(ms) = mesh {
+            if crate::host::is_darwin() {
+                if let Some(bytes) = ms.translated().and_then(|t| metal_mesh_bytes(&t.host.dxil))
+                    && bytes > 32_768
+                {
+                    tracing::warn!(?shaders, bytes, limit = 32_768u32, "no host pipeline: mesh outputs over Metal's 32 KiB limit");
+                    return refuse(
+                        "the mesh shader's outputs take more than the host GPU allows",
+                        shaders,
+                    );
+                }
+            }
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
@@ -752,6 +772,85 @@ impl HostPipeline {
             },
         })
     }
+}
+
+/// Compute pipelines refused because their program needs wider waves than
+/// the host GPU runs (D3DMetal accepts WaveSize(64) and silently turns it
+/// into a no-op or hang).
+pub(crate) static WIDE_WAVE_REFUSED: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Required wave lane count from a DXIL container's `PSV0` chunk, if fixed.
+pub(crate) fn wave_lanes(dxil: &[u8]) -> Option<u32> {
+    let u32_at = |b: &[u8], at: usize| {
+        b.get(at..at + 4)
+            .map(|v| u32::from_le_bytes(v.try_into().expect("4 bytes")) as usize)
+    };
+    let info = (0..u32_at(dxil, 28)?).find_map(|i| {
+        let at = u32_at(dxil, 32 + 4 * i)?;
+        (dxil.get(at..at + 4)? == b"PSV0")
+            .then(|| dxil.get(at + 8..at + 8 + u32_at(dxil, at + 4)?))
+            .flatten()
+    })?;
+    let (min, max) = (u32_at(info, 4 + 16)? as u32, u32_at(info, 4 + 20)? as u32);
+    (min != 0 && min == max).then_some(min)
+}
+
+/// Output bytes as Apple's Metal counts them for a translated mesh shader
+/// (measured on D3DMetal): per vertex, clip/cull distances, position, then
+/// remaining outputs in signature order, aligned to own size; same for
+/// primitives; multiplied by declared max counts.
+pub(crate) fn metal_mesh_bytes(dxil: &[u8]) -> Option<u32> {
+    let u32_at = |b: &[u8], at: usize| {
+        b.get(at..at + 4)
+            .map(|v| u32::from_le_bytes(v.try_into().expect("4 bytes")) as usize)
+    };
+    let part = |name: &[u8; 4]| {
+        (0..u32_at(dxil, 28)?).find_map(|i| {
+            let at = u32_at(dxil, 32 + 4 * i)?;
+            (dxil.get(at..at + 4)? == name)
+                .then(|| dxil.get(at + 8..at + 8 + u32_at(dxil, at + 4)?))
+                .flatten()
+        })
+    };
+    let elements = |name: &[u8; 4]| -> Option<Vec<(usize, u32)>> {
+        let Some(data) = part(name) else {
+            return Some(Vec::new());
+        };
+        (0..u32_at(data, 0)?)
+            .map(|i| {
+                let at = 8 + 32 * i;
+                let mask = *data.get(at + 24)?;
+                Some((u32_at(data, at + 12)?, mask.count_ones()))
+            })
+            .collect()
+    };
+    const POSITION: usize = 1;
+    const DISTANCES: [usize; 2] = [2, 3];
+    let layout = |sizes: &mut dyn Iterator<Item = u32>| {
+        sizes
+            .filter(|&size| size > 0)
+            .fold(0, |end: u32, size| end.next_multiple_of(size) + size)
+    };
+    let vertex = elements(b"OSG1")?;
+    let distances = vertex
+        .iter()
+        .filter(|(kind, _)| DISTANCES.contains(kind))
+        .map(|&(_, n)| n)
+        .sum::<u32>();
+    let vertex_bytes = layout(
+        &mut std::iter::repeat_n(4, distances as usize)
+            .chain([16])
+            .chain(vertex.iter().filter(|e| e.0 != POSITION).map(|e| 4 * e.1)),
+    );
+    let primitive_bytes = layout(&mut elements(b"PSG1")?.iter().map(|e| 4 * e.1));
+    let info = part(b"PSV0")?.get(4..)?;
+    let maximum = |at: usize| {
+        Some(u32::from(u16::from_le_bytes(
+            info.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    Some(maximum(12)? * vertex_bytes + maximum(14)? * primitive_bytes)
 }
 
 /// A stream subobject: its type, then its description, pointer-aligned.

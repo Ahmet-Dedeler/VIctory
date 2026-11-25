@@ -48,7 +48,10 @@ impl Cache {
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
         let path = self.path_for(&key);
-        if path.is_file() {
+        // Open without `is_file()` / `metadata()` so Wine doesn't call into
+        // the mount manager (`NtQueryVolumeInformationFile`), which deadlocks
+        // when the title suspends threads.
+        if std::fs::File::open(&path).is_ok() {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
         }
@@ -56,13 +59,24 @@ impl Cache {
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
-        std::fs::create_dir_all(dir)?;
-        // Write-then-rename so readers never see partial output.
+        // Write-then-rename so readers never see partial output. Only create
+        // the bucket directory if opening the temp file reports NotFound.
         let tmp = tempfile_in(dir);
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&tmp)?;
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(dir)?;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)?
+            }
+            Err(e) => return Err(e.into()),
+        };
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));

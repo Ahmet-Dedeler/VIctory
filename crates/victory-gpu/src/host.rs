@@ -14,9 +14,45 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
+
+/// Waits until `fence` reaches `value`, waking every second to check the
+/// completed value directly. Under D3DMetal a submission can complete without
+/// setting its event (`pragyaangaur/VIctory-macOS#50`); checking the fence on
+/// every wake-up also ensures a late event cannot end a later wait early.
+pub(crate) fn wait_fence(fence: &ID3D12Fence, value: u64, event: HANDLE) {
+    use std::sync::atomic::AtomicU64;
+    static MISSED: AtomicU64 = AtomicU64::new(0);
+    let mut seconds = 0u32;
+    loop {
+        // SAFETY: our event and fence.
+        let woke = unsafe { WaitForSingleObject(event, 1000) };
+        // SAFETY: as above.
+        let completed = unsafe { fence.GetCompletedValue() };
+        if completed >= value {
+            if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::warn!(
+                        n,
+                        value,
+                        completed,
+                        "a host submission finished without setting its event; went on after checking the fence"
+                    );
+                }
+            }
+            return;
+        }
+        if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
+            seconds += 1;
+            if seconds.is_power_of_two() {
+                tracing::warn!(seconds, value, completed, "still waiting for the host GPU");
+            }
+        }
+    }
+}
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -461,7 +497,7 @@ fn card_clock_watch(clock: &'static CardClock) {
         // SAFETY: the clock's fence and this thread's event.
         unsafe {
             if clock.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
+                wait_fence(&clock.fence, target, event);
             }
         }
         seen = target;
@@ -669,6 +705,7 @@ fn create() -> windows::core::Result<Host> {
             .is_ok()
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
+            HOST_MAX_WAVE.store(o1.WaveLaneCountMax, Ordering::Relaxed);
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
         let messages = debug
@@ -996,8 +1033,142 @@ fn plane_pass() -> Option<&'static PlanePass> {
     .as_ref()
 }
 
+static HOST_MAX_WAVE: AtomicU32 = AtomicU32::new(64);
+
+/// The host GPU's reported maximum wave lane count (32 on Apple Silicon / NVIDIA).
+pub(crate) fn host_max_wave_lanes() -> u32 {
+    HOST_MAX_WAVE.load(Ordering::Relaxed)
+}
+
+/// The OS Wine runs on ("Darwin", "Linux"), if running under Wine.
+fn wine_host() -> Option<&'static str> {
+    static HOST: OnceLock<Option<String>> = OnceLock::new();
+    HOST.get_or_init(|| {
+        use std::ffi::CStr;
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        type HostVersion = unsafe extern "C" fn(*mut *const i8, *mut *const i8);
+        // SAFETY: ntdll is always loaded; wine_get_host_version is a Wine export.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            let f = GetProcAddress(ntdll, c"wine_get_host_version".as_ptr().cast())?;
+            let f: HostVersion = std::mem::transmute(f);
+            let (mut sys, mut rel) = (std::ptr::null(), std::ptr::null());
+            f(&mut sys, &mut rel);
+            (!sys.is_null()).then(|| CStr::from_ptr(sys).to_string_lossy().into_owned())
+        }
+    })
+    .as_deref()
+}
+
+/// Whether we are running under Wine on macOS (Darwin / D3DMetal / Rosetta 2).
+pub fn is_darwin() -> bool {
+    wine_host().is_some_and(|s| s.eq_ignore_ascii_case("Darwin"))
+}
+
+/// Whether this run is a scripted background test (`VICTORY_BACKGROUND=1`):
+/// off-desktop window, muted audio, real keyboard not read.
+pub fn background() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACKGROUND").is_some_and(|v| v != "0"))
+}
+
+/// Loads `dxcompiler.dll` from `VICTORY_DXC_DIR`, beside our executable, or
+/// the default DLL search path (used when Wine's `D3DCompile` refuses SM 5.1 /
+/// embedded `[RootSignature]` shaders).
+fn load_dxc() -> windows::core::Result<windows::Win32::Foundation::HMODULE> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::LibraryLoader::LoadLibraryW;
+    let try_dir = |dir: &std::path::Path| {
+        let p = dir.join("dxcompiler.dll");
+        let wide: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: NUL-terminated path.
+        unsafe { LoadLibraryW(PCWSTR(wide.as_ptr())) }
+    };
+    if let Some(dir) = std::env::var_os("VICTORY_DXC_DIR") {
+        if let Ok(m) = try_dir(std::path::Path::new(&dir)) {
+            return Ok(m);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Ok(m) = try_dir(dir) {
+                return Ok(m);
+            }
+        }
+    }
+    // SAFETY: static wide string.
+    unsafe { LoadLibraryW(w!("dxcompiler.dll")) }
+}
+
+/// Compiles HLSL with `dxcompiler.dll` when `D3DCompile` refuses (e.g. under
+/// CrossOver Wine, where vkd3d-shader ignores `[RootSignature]` and lacks
+/// `RWByteAddressBuffer::Load`). Maps SM 5.x targets to SM 6.0.
+fn dxc_compile(source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::Dxc::*;
+    use windows::Win32::System::LibraryLoader::GetProcAddress;
+    type Create = unsafe extern "system" fn(
+        *const windows::core::GUID,
+        *const windows::core::GUID,
+        *mut *mut std::ffi::c_void,
+    ) -> windows::core::HRESULT;
+    let t6 = match target {
+        "cs_5_0" | "cs_5_1" => "cs_6_0",
+        "vs_5_0" | "vs_5_1" => "vs_6_0",
+        "ps_5_0" | "ps_5_1" => "ps_6_0",
+        other => other,
+    };
+    let entry_w: Vec<u16> = entry.encode_utf16().chain([0]).collect();
+    let target_w: Vec<u16> = t6.encode_utf16().chain([0]).collect();
+    // SAFETY: loading dxcompiler.dll and invoking its documented COM factory.
+    unsafe {
+        let library = load_dxc()?;
+        let create: Create = std::mem::transmute(
+            GetProcAddress(library, windows::core::s!("DxcCreateInstance"))
+                .ok_or_else(windows::core::Error::from_thread)?,
+        );
+        let mut raw = std::ptr::null_mut();
+        create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut raw).ok()?;
+        let compiler = IDxcCompiler3::from_raw(raw);
+        let buffer = DxcBuffer {
+            Ptr: source.as_ptr().cast(),
+            Size: source.len(),
+            Encoding: DXC_CP_UTF8.0,
+        };
+        let arguments = [
+            w!("-T"),
+            PCWSTR(target_w.as_ptr()),
+            w!("-E"),
+            PCWSTR(entry_w.as_ptr()),
+            w!("-O3"),
+        ];
+        let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
+        let status = result.GetStatus()?;
+        if status.is_err() {
+            if let Ok(errors) = result.GetErrorBuffer() {
+                let bytes = std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                );
+                tracing::warn!(
+                    target = t6,
+                    entry,
+                    text = %String::from_utf8_lossy(bytes).trim(),
+                    "DXC refused runtime shader"
+                );
+            }
+            return Err(windows::core::Error::from_hresult(status));
+        }
+        let blob = result.GetResult()?;
+        Ok(
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+                .to_vec(),
+        )
+    }
+}
+
 /// Compiles function `entry` of `source` for `target` with the system's
-/// compiler, as the indirect-argument clamp is (`crate::indirect`).
+/// compiler, falling back to `dxcompiler.dll` on Wine / when `D3DCompile`
+/// refuses or omits the embedded `[RootSignature]` (as Wine's vkd3d-shader does).
 pub(crate) fn compile(
     source: &str,
     entry: windows::core::PCSTR,
@@ -1005,6 +1176,16 @@ pub(crate) fn compile(
 ) -> windows::core::Result<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    let entry_s = unsafe { entry.to_string().unwrap_or_else(|_| "main".into()) };
+    let target_s = unsafe { target.to_string().unwrap_or_else(|_| "cs_5_1".into()) };
+    // Under Wine, d3dcompiler_47 (vkd3d-shader) silently ignores [RootSignature]
+    // and produces DXBC that CreateRootSignature rejects. Prefer DXC directly
+    // when the source carries [RootSignature] on Wine, falling back to D3DCompile.
+    if wine_host().is_some() && source.contains("[RootSignature") {
+        if let Ok(bytes) = dxc_compile(source, &entry_s, &target_s) {
+            return Ok(bytes);
+        }
+    }
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -1024,6 +1205,9 @@ pub(crate) fn compile(
         )
     };
     if let Err(e) = compiled {
+        if let Ok(bytes) = dxc_compile(source, &entry_s, &target_s) {
+            return Ok(bytes);
+        }
         if let Some(errors) = errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
@@ -3141,7 +3325,7 @@ fn late_helper() {
         // SAFETY: our fence and event.
         unsafe {
             if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
+                wait_fence(&host.fence, target, event);
             }
         }
         {
@@ -3281,7 +3465,7 @@ fn relay_worker() {
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
                     host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
+                        wait_fence(&host.fence, target, event);
                     })
                 };
                 if waited.is_err() {
@@ -3866,27 +4050,7 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        let bytes = compile(CARD_COMPARE, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -3896,8 +4060,7 @@ impl Host {
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, &bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
@@ -3924,28 +4087,8 @@ impl Host {
     /// [`CardInflight`] for `results` bytes of the compare's results; `None`
     /// (and the old fetch) if the shader or the memory cannot be had.
     fn make_card_inflight(&self, results: u64) -> Option<CardInflight> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let made = (|| -> windows::core::Result<CardInflight> {
-            let mut code: Option<ID3DBlob> = None;
-            // SAFETY: the source and names live through the call; the out
-            // pointer is ours.
-            unsafe {
-                D3DCompile(
-                    CARD_FETCH.as_ptr().cast(),
-                    CARD_FETCH.len(),
-                    windows::core::s!("card fetch in flight"),
-                    None,
-                    None,
-                    windows::core::s!("main"),
-                    windows::core::s!("cs_5_1"),
-                    0,
-                    0,
-                    &mut code,
-                    None,
-                )?;
-            }
-            let code = code.ok_or_else(windows::core::Error::empty)?;
+            let bytes = compile(CARD_FETCH, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
             let slots = inflight_slots(inflight_fetch_bytes());
             let (table, table_data) = self.shared_buffer(4 + results).ok_or_else(windows::core::Error::empty)?;
             name(&table, || "card fetch in flight: tickets".into());
@@ -3958,8 +4101,7 @@ impl Host {
             // SAFETY: the blob's own bytes; the root signature is inside
             // the shader.
             unsafe {
-                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, &bytes)?;
                 let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     pRootSignature: std::mem::transmute_copy(&root),
                     CS: D3D12_SHADER_BYTECODE {
@@ -4570,7 +4712,7 @@ impl Host {
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
+                wait_fence(&fence, sent, event);
                 Ok(after)
             })()
         };
@@ -4974,7 +5116,7 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    wait_fence(&self.fence, *submitted, self.event);
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -5196,7 +5338,7 @@ impl Host {
                     match self.fence.SetEventOnCompletion(*submitted, self.event) {
                         Ok(()) => {
                             working(false);
-                            WaitForSingleObject(self.event, INFINITE);
+                            wait_fence(&self.fence, *submitted, self.event);
                             stood(waiting);
                             working(true);
                         }
@@ -5483,7 +5625,7 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         working(false);
-                        WaitForSingleObject(self.event, INFINITE);
+                        wait_fence(&self.fence, *submitted, self.event);
                         stood(started);
                         working(true);
                     }
@@ -7648,8 +7790,32 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        let folder = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "?".into());
+        let bg = background();
+        let prefix = if bg { "[background test run] " } else { "" };
+        let kb = if bg { "keyboard off" } else { "keyboard on" };
+        let rate = if ms >= 1000.0 {
+            format!("{:.1} s/frame", ms / 1000.0)
+        } else {
+            format!("{fps:.0} fps {ms:.1} ms/frame")
+        };
+        let gb = process_working_set_bytes() as f64 / (1024.0 * 1024.0 * 1024.0);
+        static FIRST_FRAME: OnceLock<std::time::Instant> = OnceLock::new();
+        let up = FIRST_FRAME.get_or_init(std::time::Instant::now).elapsed().as_secs();
+        let build = env!("VICTORY_BUILD");
+        let suffix = format!(
+            " | VIctory {build} | {folder}, {kb} | {rate} | {draws:.0} draws | {gb:.1} GB | up {}:{:02}",
+            up / 60,
+            up % 60
+        );
+        let mut text: Vec<u16> = prefix
+            .encode_utf16()
+            .chain(caption.iter().copied())
+            .chain(suffix.encode_utf16())
+            .collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
@@ -8226,21 +8392,41 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-        CreateWindowExW(
+        let bg = background();
+        let (x, y) = if bg { (3000, 2000) } else { (CW_USEDEFAULT, CW_USEDEFAULT) };
+        let style = if bg {
+            WS_OVERLAPPEDWINDOW
+        } else {
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE
+        };
+        let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            if bg { w!("[background test run] VIctory") } else { w!("VIctory") },
+            style,
+            x,
+            y,
             rect.right - rect.left,
             rect.bottom - rect.top,
             None,
             None,
             Some(instance.into()),
             None,
-        )
+        )?;
+        if bg {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        Ok(hwnd)
     }
+}
+
+fn process_working_set_bytes() -> usize {
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    c.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    if ok != 0 { c.WorkingSetSize } else { 0 }
 }
 
 fn pump() {

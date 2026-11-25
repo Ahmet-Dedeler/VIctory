@@ -567,8 +567,67 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     viewed: BTreeSet::new(),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+thread_local! {
+    /// Whether this thread holds the guard lock. A guarded block it faults
+    /// on then is one the lock's own work touched (#50), and taking the
+    /// lock again would hang it.
+    static HOLDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Blocks opened by faults taken under the guard lock, for its next holder
+/// to mark changed (0: free slot). Fixed: the handler must not allocate.
+static OPENED_UNDER_LOCK: [std::sync::atomic::AtomicUsize; 64] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 64];
+
+/// A fault on `block` by the thread holding the guard lock: write access
+/// back now, marked opened by the lock's next holder.
+fn open_under_lock(block: usize) {
+    use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    // SAFETY: a block of this process; fails harmlessly if it is gone.
+    unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    let _ = OPENED_UNDER_LOCK
+        .iter()
+        .any(|s| s.compare_exchange(0, block, AcqRel, Relaxed).is_ok());
+}
+
+struct Held {
+    guard: Option<std::sync::MutexGuard<'static, Guards>>,
+}
+
+impl std::ops::Deref for Held {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        self.guard.as_ref().expect("held until dropped")
+    }
+}
+
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Guards {
+        self.guard.as_mut().expect("held until dropped")
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        HOLDING.with(|h| h.set(false));
+    }
+}
+
+fn guards() -> Held {
+    use std::sync::atomic::Ordering::AcqRel;
+    let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    HOLDING.with(|h| h.set(true));
+    let mut held = Held { guard: Some(guard) };
+    for slot in &OPENED_UNDER_LOCK {
+        let block = slot.swap(0, AcqRel);
+        if block != 0 {
+            open(&mut held, block * BLOCK, (block + 1) * BLOCK);
+        }
+    }
+    held
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -787,12 +846,32 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         return;
     }
     for block in from..to {
+        // Never guard plain private host memory (e.g. process heap adjacent
+        // to a tracked view range, pragyaangaur/VIctory-macOS#50).
+        if !block_is_view(block) {
+            if block < uncommitted_end(block) {
+                g.absent.insert(block);
+            }
+            continue;
+        }
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
         }
     }
+}
+
+/// Whether `block` is a committed mapped view (safe to make read-only).
+fn block_is_view(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Type == MEM_MAPPED
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
@@ -1077,6 +1156,13 @@ fn install() {
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
+        if HOLDING.with(|h| h.get()) {
+            if read_only(at) {
+                open_under_lock(at / BLOCK);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         let mut g = guards();
         if open(&mut g, at, at + 1) {
             #[cfg(feature = "diagnostics")]
@@ -1095,6 +1181,18 @@ fn install() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// Whether `at` is committed read-only memory now.
+fn read_only(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READONLY
 }
 
 /// Whether `at` is committed read-write memory now.

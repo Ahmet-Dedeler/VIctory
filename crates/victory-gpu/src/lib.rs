@@ -71,7 +71,7 @@ mod texture;
 mod watch;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{background, is_darwin, on_failure};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
@@ -79,3 +79,21 @@ pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+/// Reads a file without calling `File::metadata()` / `GetFileInformationByHandle` /
+/// `NtQueryVolumeInformationFile` (which deadlocks under CrossOver Wine when
+/// Wine's mount manager completes an ioctl inside its virtual memory lock).
+pub(crate) fn read_file_raw(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut out = Vec::new();
+    let mut chunk = vec![0u8; 1 << 16];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => return Ok(out),
+            Ok(n) => out.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}

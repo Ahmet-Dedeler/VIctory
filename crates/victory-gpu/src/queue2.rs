@@ -57,7 +57,7 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::CreateEventW;
 use windows::core::Interface;
 
 /// `VICTORY_QUEUE2`, a sum of bits; unset or 0: off, everything goes
@@ -290,7 +290,7 @@ impl Lane {
         unsafe {
             if self.fence.GetCompletedValue() < job {
                 self.fence.SetEventOnCompletion(job, event)?;
-                WaitForSingleObject(event, INFINITE);
+                crate::host::wait_fence(&self.fence, job, event);
             }
         }
         Ok(())
@@ -489,7 +489,7 @@ impl Second {
                     if self.reached.SetEventOnCompletion(hold, event).is_err() {
                         return;
                     }
-                    WaitForSingleObject(event, INFINITE);
+                    crate::host::wait_fence(&self.reached, hold, event);
                 }
             }
             if self.up.done(job) {
