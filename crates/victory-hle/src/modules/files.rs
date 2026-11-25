@@ -531,10 +531,29 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
+    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, SetLastError};
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    // The title reads the host's last error (ERROR_IO_PENDING for an
+    // overlapped read in flight); what runs after the call here must not
+    // change it.
+    // SAFETY: a plain query of the thread's last error.
+    let error = unsafe { GetLastError() };
+    // Under Wine on Rosetta, a kernel write into a block that another thread
+    // re-guards while an overlapped read is in flight stops the process for
+    // good (#50). Wait for it to finish before returning; the title still
+    // sees the pending result and its event or completion port is signalled.
+    if done == 0 && error == ERROR_IO_PENDING && !overlapped.is_null() && victory_gpu::is_darwin() {
+        let mut n = 0u32;
+        host!("kernel32.dll", "GetOverlappedResult": extern "system" fn(*mut c_void, *mut c_void, *mut u32, i32) -> i32)(
+            file, overlapped, &mut n, 1,
+        );
+    }
+    // SAFETY: restores the thread's last error.
+    unsafe { SetLastError(error) };
+    done
 }
 
 /// The host CRT reads large requests straight into the caller's buffer

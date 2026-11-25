@@ -1166,7 +1166,10 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
-            if focused() {
+            // Not in a background run: under Wine a window shown without
+            // activation still counts as foreground, and key states are the
+            // whole machine's.
+            if !victory_gpu::background() && focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
