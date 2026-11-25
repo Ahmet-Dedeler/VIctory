@@ -79,6 +79,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// First-lane reads that found the first lane in EXEC.
+    #[cfg(test)]
+    pub exec_first_lanes: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -925,6 +928,16 @@ thread_local! {
 fn own_bits_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_FIRSTLANE_ANY=1`: `v_readfirstlane_b32` reads the first host
+/// lane whatever EXEC holds, as the scalar-result port of agent/shaders
+/// made it (wrong under a per-lane branch; for comparing in a run). Off by
+/// default: the first lane in EXEC, as before that port. Joins the
+/// translation fingerprint as every switch here does.
+fn firstlane_any() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_ANY").is_some_and(|v| v == "1"))
 }
 
 /// `VICTORY_D16_BITS=0`: 16-bit typed buffer accesses keep the float path
@@ -2399,6 +2412,8 @@ impl<'a> Lower<'a> {
             half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            exec_first_lanes: self.s.exec_first_lanes,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -4506,6 +4521,7 @@ impl<'a> Lower<'a> {
         let Some(g) = guard else {
             return (first, self.s.m.bool(true));
         };
+        self.s.exec_first_lanes += 1;
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
         let r = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[g]);
         let (lo, hi) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
@@ -6690,9 +6706,18 @@ impl<'a> Lower<'a> {
             return r;
         }
         // A scalar result (`v_readlane`, `v_readfirstlane`) is written
-        // whatever EXEC holds.
+        // whatever EXEC holds (`write_i` writes an SGPR with no guard in
+        // any case). `v_readfirstlane` keeps EXEC all the same: it reads
+        // the first lane IN EXEC, which `first_lane` finds by the guard;
+        // without it the first host lane was read, in or out of EXEC, and
+        // under a per-lane branch a uniform value (a material's, a texture
+        // index) came from a lane that does not run there: characters'
+        // skin and clothes black, eyes and mouths drawn.
+        // `VICTORY_FIRSTLANE_ANY=1`: no guard for it either, as agent/shaders
+        // had it (for telling the two apart in a run).
+        let first_in_exec = name == "v_readfirstlane_b32" && !firstlane_any();
         let mut guard = match v.dst {
-            Some(Operand::Scalar { .. }) => None,
+            Some(Operand::Scalar { .. }) if !first_in_exec => None,
             _ => self.guard(b, i)?,
         };
         if let Some(d) = v.dpp {
@@ -11840,6 +11865,38 @@ mod tests {
             S_ENDPGM,
         ];
         lowers(&words, 1 << 7).expect("a lane read under an EXEC with no mask");
+    }
+
+    #[test]
+    fn a_first_lane_read_under_a_per_lane_branch_reads_a_lane_in_exec() {
+        // Lanes below 16 run the region (no branch around it: the host runs
+        // every lane through, guarded). `v_readfirstlane` there reads the
+        // first lane IN EXEC: its guard picks the lane (a ballot). Without
+        // it every host lane counted, lane 0 among them whether it ran or
+        // not, and a uniform value taken this way under a per-lane branch
+        // came from a lane outside it (skin and clothes black).
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0xBF80_0000, // s_nop 0: no branch, EXEC alone holds the lanes
+            0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+            0x7E06_0206, // v_mov_b32 v3, s6
+            0xE070_1000,
+            0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+            0xBEFE_0308, // s_mov_b32 exec_lo, s8
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_and_uav_tables();
+        let l = lower_with(&words, layout, used).expect("a first-lane read under a per-lane branch");
+        if !super::firstlane_any() {
+            assert_eq!(l.exec_first_lanes, 1);
+        }
     }
 
     #[test]

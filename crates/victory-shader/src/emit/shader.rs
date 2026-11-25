@@ -161,6 +161,8 @@ pub(crate) struct Shader {
     pub ordered: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// First-lane reads that found the first lane in EXEC (`Lower::first_lane`).
+    pub exec_first_lanes: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -218,6 +220,7 @@ impl Shader {
             flags: 0,
             ordered: false,
             nonuniform_handles: 0,
+            exec_first_lanes: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
