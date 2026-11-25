@@ -8534,7 +8534,21 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
         let bg = background();
-        let (x, y) = if bg { (3000, 2000) } else { (CW_USEDEFAULT, CW_USEDEFAULT) };
+        // A background run's window lies past the bottom right corner of
+        // the desktop (all monitors): at a fixed place inside a large
+        // desktop macOS moved it back whole onto the screen, where it was
+        // taken for the play copy (muted, keyboard off).
+        let (x, y) = if bg {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+            };
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) + 64,
+                GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN) + 64,
+            )
+        } else {
+            (CW_USEDEFAULT, CW_USEDEFAULT)
+        };
         let style = if bg {
             WS_OVERLAPPEDWINDOW
         } else {
@@ -8555,7 +8569,12 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             None,
         )?;
         if bg {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+            };
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            // Behind every other window, should the system put it on a screen after all.
+            let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
         }
         Ok(hwnd)
     }
