@@ -626,7 +626,8 @@ pub(crate) fn host() -> Option<&'static Host> {
 
 fn create() -> windows::core::Result<Host> {
     crate::drvwatch::start();
-    crate::spread::start();
+    // (fxceless's `spread::start()`, the Windows thread-affinity experiment
+    // of 3973179, is not ported: useless under Wine.)
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
