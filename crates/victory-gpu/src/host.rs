@@ -8581,7 +8581,7 @@ fn present_scaling() -> bool {
     *ON.get_or_init(|| {
         let on = match std::env::var("VICTORY_PRESENT_SCALE") {
             Ok(v) => v.trim() != "0",
-            Err(_) => is_darwin(),
+            Err(_) => crate::is_darwin(),
         };
         if on {
             tracing::info!("presenting smaller frames scaled to the window backing (VICTORY_PRESENT_SCALE=0: direct copy)");
@@ -8609,7 +8609,7 @@ fn present_scale_factor(hwnd: HWND) -> f64 {
         let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
         let factor = if dpi > 96 {
             f64::from(dpi) / 96.0
-        } else if is_darwin() {
+        } else if crate::is_darwin() {
             2.0
         } else {
             1.0
