@@ -137,6 +137,38 @@ struct State {
     results: VecDeque<ApuResult>,
     commands: u32,
     dequeued: u32,
+    /// Temporary speech investigation: what each stream decoded, since
+    /// activation (results are otherwise invisible in the log).
+    traces: Vec<StreamTrace>,
+}
+
+/// What a stream's process commands added up to.
+#[derive(Default)]
+struct StreamTrace {
+    commands: u32,
+    frames: u64,
+    /// The loudest sample decoded, magnitude.
+    peak: f32,
+    bad: u32,
+    invalid: u32,
+    since: Option<std::time::Instant>,
+}
+
+impl StreamTrace {
+    fn summary(&self, stream: usize, note: &str, error: HRESULT) {
+        tracing::debug!(
+            stream,
+            commands = self.commands,
+            frames = self.frames,
+            peak = self.peak,
+            bad = self.bad,
+            invalid = self.invalid,
+            ms = self.since.map(|t| t.elapsed().as_millis()),
+            error,
+            note,
+            "Opus stream so far"
+        );
+    }
 }
 
 fn lock(c: &Connection) -> std::sync::MutexGuard<'_, State> {
@@ -210,6 +242,7 @@ pub extern "system" fn XApuConnect(
             results: VecDeque::new(),
             commands: 0,
             dequeued: 0,
+            traces: (0..streams).map(|_| StreamTrace::default()).collect(),
         }),
     });
     // SAFETY: checked non-null.
@@ -269,12 +302,14 @@ pub extern "system" fn XApuEnqueueCommand(
         input_length: 0,
         input: std::ptr::null(),
     };
+    // Split borrows of the streams and their traces out of the guard.
+    let state = &mut *state;
     let decoder = &mut state.streams[stream];
+    let trace = &mut state.traces[stream];
     match id.kind {
         ACTIVATE => {
             // SAFETY: an activate command is this struct.
             let channels = unsafe { command.cast::<Activate>().read_unaligned() }.channels;
-            tracing::debug!(stream, channels, "Opus stream activated");
             result.error = if decoder.is_some() {
                 ALREADY_ACTIVE
             } else if !(1..=2).contains(&channels) {
@@ -288,8 +323,17 @@ pub extern "system" fn XApuEnqueueCommand(
                     Err(_) => E_INVALIDARG,
                 }
             };
+            let error = result.error;
+            tracing::debug!(stream, channels, error, "Opus stream activated");
+            *trace = StreamTrace {
+                since: (error == S_OK).then(std::time::Instant::now),
+                ..StreamTrace::default()
+            };
         }
-        DEACTIVATE => *decoder = None,
+        DEACTIVATE => {
+            trace.summary(stream, "deactivated", result.error);
+            *decoder = None;
+        }
         RESET => {
             if let Some(d) = decoder {
                 let _ = d.reset_state();
@@ -300,8 +344,24 @@ pub extern "system" fn XApuEnqueueCommand(
             // SAFETY: a process command is this struct.
             let command = unsafe { command.cast::<Process>().read_unaligned() };
             match decoder {
-                Some(d) => process(d, connection.options, &command, &mut result),
-                None => result.error = INVALID_STREAM,
+                Some(d) => {
+                    let peak = process(d, connection.options, &command, &mut result);
+                    trace.commands += 1;
+                    trace.frames += result.frames as u64;
+                    trace.peak = trace.peak.max(peak);
+                    trace.bad += u32::from(result.error == BAD_PACKET);
+                    trace.invalid += u32::from(result.error != S_OK && result.error != BAD_PACKET);
+                    if trace.commands.is_multiple_of(128) {
+                        trace.summary(stream, "every so often", result.error);
+                    }
+                }
+                None => {
+                    result.error = INVALID_STREAM;
+                    trace.invalid += 1;
+                    if trace.invalid <= 2 {
+                        tracing::debug!(stream, "Opus process on a stream not activated");
+                    }
+                }
             }
         }
         _ => return INVALID_COMMAND,
@@ -321,8 +381,9 @@ pub extern "system" fn XApuEnqueueCommand(
 }
 
 /// Decodes one packet into the command's output buffer, keeping the frames
-/// from `first_frame` on, at most `frame_count` of them.
-fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
+/// from `first_frame` on, at most `frame_count` of them. Returns the loudest
+/// sample kept, for the investigation log.
+fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) -> f32 {
     let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
     let (output, output_length) = (command.output, command.output_length);
@@ -331,7 +392,7 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     result.output = output;
     if input.is_null() || output.is_null() || input_length == 0 {
         result.error = E_INVALIDARG;
-        return;
+        return 0.0;
     }
     // SAFETY: the title's packet in its connection memory.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
@@ -340,7 +401,7 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
         Ok(n) => n,
         Err(_) => {
             result.error = BAD_PACKET;
-            return;
+            return 0.0;
         }
     };
     let first = (command.first_frame as usize).min(decoded);
@@ -348,6 +409,7 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
         .min(command.frame_count as usize)
         .min(output_length as usize / (4 * channels));
     let kept = &pcm[first * channels..(first + frames) * channels];
+    let peak = kept.iter().fold(0f32, |peak, s| peak.max(s.abs()));
     let bytes = frames * channels * 4;
     if bytes > 0 {
         // SAFETY: `output` is non-null and holds at least `bytes <= output_length` bytes;
@@ -369,6 +431,7 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     }
     result.frames = frames as u32;
     result.output_length = bytes as u32;
+    peak
 }
 
 pub extern "system" fn XApuDequeueResult(handle: *mut Connection, out: *mut ApuResult) -> HRESULT {

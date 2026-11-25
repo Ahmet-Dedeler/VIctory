@@ -276,6 +276,9 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
     let mut xma = XMA.write().unwrap_or_else(|e| e.into_inner());
     xma.array = arrays[4] as usize;
     xma.voices = (0..counts[4]).map(|_| Mutex::new(None)).collect();
+    // How many of each unit the title asked for: rate conversion, EQ,
+    // filter/volume, DMA, XMA, PCM. Zero for a unit the title never uses.
+    tracing::info!(counts = ?counts, "SHAPE contexts allocated");
     S_OK
 }
 
@@ -420,6 +423,16 @@ impl Xma {
         tracing::debug!(
             index,
             words = ?(0..10).map(|w| format!("{:08x}", context.get(w))).collect::<Vec<_>>(),
+            channels = context.channels(),
+            rate = context.field(1, 27, 2),
+            loops = context.field(0, 12, 8),
+            input0_packets = context.field(0, 0, 12),
+            input1_packets = context.field(1, 0, 12),
+            valid = context.field(0, 20, 2),
+            out_blocks = context.field(0, 22, 5),
+            read_block = context.field(9, 0, 5),
+            write_block = context.field(0, 27, 5),
+            skip_subframes = context.field(1, 24, 3),
             "XMA voice enabled"
         );
         #[cfg(feature = "diagnostics")]
@@ -509,6 +522,34 @@ impl Xma {
         let took = start.elapsed();
         if took.as_millis() >= 4 {
             tracing::debug!(active, ms = took.as_millis(), "slow XMA decoding pass");
+        }
+    }
+
+    /// Temporary speech investigation: how far every enabled voice got,
+    /// for voices that stay enabled (loops) and so never log a summary.
+    fn summarize(&self) {
+        for index in 0..self.voices.len() as u32 {
+            let mut slot = lock(&self.voices[index as usize]);
+            let (Some(context), Some(voice)) = (self.context(index), &mut *slot) else {
+                continue;
+            };
+            let t = &voice.trace;
+            tracing::debug!(
+                index,
+                ms = t.since.elapsed().as_millis(),
+                produced = t.produced,
+                taken = t.taken * SAMPLES_PER_BLOCK / context.channels(),
+                takes = t.takes,
+                frames = t.frames,
+                bad_frames = t.bad_frames,
+                peak = t.peak,
+                ended = voice.ended,
+                channels = context.channels(),
+                rate = context.field(1, 27, 2),
+                read_bit = context.field(2, 0, 26),
+                writable = context.field(1, 31, 1),
+                "XMA voice so far"
+            );
         }
     }
 }
@@ -675,8 +716,15 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    let mut summarized = Instant::now();
                     loop {
                         xma().pump();
+                        // Temporary speech investigation: a summary every
+                        // ten seconds, so looping voices are seen too.
+                        if summarized.elapsed().as_secs() >= 10 {
+                            summarized = Instant::now();
+                            xma().summarize();
+                        }
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
                         std::thread::park_timeout(std::time::Duration::from_millis(2));
                     }
