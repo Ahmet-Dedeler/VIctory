@@ -46,8 +46,11 @@ const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 enum Held {
     /// The queue waits for the fence (its address) to reach the value.
     Wait(usize, u64),
-    /// A list of the next submission waits for a memory value.
-    Value(crate::list::ValueWait),
+    /// A list of the next submission waits for a memory value; when the
+    /// wait joined the line (for the valve, [`cross`]), and whether it
+    /// has been found unmet at the head once (for the frame line: it
+    /// really waited, however fast its value came).
+    Value(crate::list::ValueWait, std::time::Instant, bool),
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
     Run(Vec<crate::list::Detached>, Vec<usize>),
@@ -221,6 +224,33 @@ fn forces() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_FORCE").is_none_or(|v| v != "0"))
 }
 
+/// Whether the cross-queue wait behaviour of upstream's "lists wait on
+/// memory values; queues hold work until its waits hold" is on
+/// (`VICTORY_CROSS_QUEUE_WAITS`, on by default; `=0` is the behaviour
+/// before):
+///
+/// - the 32-bit wait's `mask` argument is read and its bits compared;
+/// - memory that cannot be read does not satisfy a wait (unless the
+///   comparison never reads the value), instead of counting as met;
+/// - the valve: a wait at the head of its queue for [`VALVE`] runs
+///   anyway, counted and warned — a wait nothing satisfies held the
+///   queue forever, its signals piled up behind it, the frame fence
+///   never moved and the title's 30 s watchdog ended the run (the crash
+///   report's unsignalled cross-queue barrier);
+/// - a thread re-tests held work every 2 ms, so values the title writes
+///   from the CPU — and the valve — act even when the title makes no
+///   call, and a fence the title polls or waits on re-tests it first.
+pub(crate) fn cross() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CROSS_QUEUE_WAITS").is_none_or(|v| v != "0"))
+}
+
+/// How long a wait may stand at the head of its queue before it is
+/// passed anyway ([`cross`], the valve; upstream's 10 s, well under the
+/// title's 30 s watchdog).
+#[cfg(windows)]
+const VALVE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A submission to a queue whose lists are cut at their waits ([`cuts`]).
 /// The lists before the first one that waits run at once if the queue
 /// holds nothing; the rest goes behind what the queue holds, part by part
@@ -289,8 +319,10 @@ fn submit_cut(this: This, lists: &[This]) {
         }
         {
             let mut held = lock(&queue(this).held);
+            PARTS_HELD.fetch_add(parts.len() as u64, Ordering::Relaxed);
             for (waits, taken, order) in parts {
-                held.extend(waits.into_iter().map(Held::Value));
+                let now = std::time::Instant::now();
+                held.extend(waits.into_iter().map(|w| Held::Value(w, now, false)));
                 held.push(Held::Run(taken, order));
             }
         }
@@ -370,7 +402,8 @@ fn submit_split(this: This, lists: &[This]) {
                     .unwrap_or(lists.len())
             };
             let waits: Vec<crate::list::ValueWait> = by[from..to].concat();
-            pieces.extend(waits.into_iter().map(Held::Value));
+            let now = std::time::Instant::now();
+            pieces.extend(waits.into_iter().map(|w| Held::Value(w, now, false)));
             let (taken, order) = crate::list::detach(&lists[from..to]);
             pieces.push(Held::Run(taken, order));
             from = to;
@@ -414,6 +447,27 @@ pub(crate) fn release_held(all: bool) {
         return;
     }
     release_held_now(all);
+}
+
+/// Starts the 2 ms re-test of held work ([`cross`]), once: values the
+/// title writes from the CPU — and the valve — act even when the title
+/// makes no call of ours (a title thread waiting on a fence submits
+/// nothing more, so without it nothing would ever look again). Cheap:
+/// the look at the queue list is one lock while nothing is held.
+#[cfg(windows)]
+fn wait_timer() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if !cross() {
+            return;
+        }
+        if let Err(e) = std::thread::Builder::new().name("victory-wait-pump".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            release_held(false);
+        }) {
+            tracing::warn!(error = %e, "no timer re-testing waits for memory values: they are looked at only where a fence may have moved");
+        }
+    });
 }
 
 /// Whether a submission is only put in its queue's line by the thread
@@ -510,14 +564,126 @@ pub(crate) fn before_sync() {
     }
 }
 
+/// One caller at a time in [`release_held_inner`], so a queue's
+/// submissions keep their order. Module-level so [`poll_pump`] can try it.
+#[cfg(windows)]
+static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Waits tested at a queue's head and not met, waits that had been unmet
+/// and then passed (they really waited), waits passed by the valve, and
+/// the parts given to queues since the last frame line.
+static STALLED: AtomicU64 = AtomicU64::new(0);
+static WAITED: AtomicU64 = AtomicU64::new(0);
+static VALVED: AtomicU64 = AtomicU64::new(0);
+static PARTS_HELD: AtomicU64 = AtomicU64::new(0);
+/// Page mappings done while their queue held work (they jump ahead of
+/// it: the ordering hazard upstream counts in its frame line too).
+static MAPPINGS_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// The counts since the last call: (unmet head tests, releases that had
+/// waited, valve passes, parts given to queues).
+#[cfg(windows)]
+fn take_wait_accounting() -> (u64, u64, u64, u64) {
+    (
+        STALLED.swap(0, Ordering::Relaxed),
+        WAITED.swap(0, Ordering::Relaxed),
+        VALVED.swap(0, Ordering::Relaxed),
+        PARTS_HELD.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// The frame line of waits for memory values: what lists recorded, what
+/// queues held back and what came of it. Nothing is logged while no list
+/// waits at all; upstream's correct runs end every frame with nothing
+/// held, so `held_unmet` above 0 — or any valve pass — is the ordering
+/// breaking here.
+#[cfg(windows)]
+fn wait_accounting_frame(frame: u64, at_present: (u64, u64, u64)) {
+    let (narrow, wide, masked) = crate::list::take_wait_counts();
+    let (stalled, waited, valved, parts) = take_wait_accounting();
+    let unreadable = crate::list::take_unreadable();
+    let unknown = crate::list::take_unknown();
+    let mappings = MAPPINGS_HELD.swap(0, Ordering::Relaxed);
+    if narrow + wide + parts + stalled + waited + valved + unreadable + unknown + mappings + at_present.0 == 0 {
+        return;
+    }
+    tracing::info!(
+        frame,
+        waits_narrow = narrow,
+        waits_wide = wide,
+        masked,
+        parts,
+        stalled,
+        waited,
+        valved,
+        unreadable,
+        unknown,
+        mappings,
+        held_queues = at_present.0,
+        held_items = at_present.1,
+        held_unmet = at_present.2,
+        "waits for memory values this frame (narrow/wide recorded, narrow with a mask; parts given to queues; head tests \
+         unmet, waits released after waiting, waits passed by the valve, reads of memory that is not there, waits \
+         passed for a comparison we do not know, page mappings done ahead of held work); held at the present: queues, \
+         items, heads whose wait is not met"
+    );
+}
+
+/// The queues still holding work, before the present runs it out:
+/// (queues, items, heads standing at a memory value that is not met).
+/// With correct ordering nothing is held at a present (upstream's runs:
+/// "held at the present 0"), so a nonzero third number is the ordering
+/// breaking — run out by the present, the work runs before its wait holds.
+#[cfg(windows)]
+fn held_back() -> (u64, u64, u64) {
+    let mut out = (0, 0, 0);
+    for &q in lock(&WAITING).iter() {
+        // SAFETY: a live queue: one released is taken off the list.
+        let line = unsafe { &(*(q as *const Queue)).held };
+        let held = lock(line);
+        if held.is_empty() {
+            continue;
+        }
+        out.0 += 1;
+        out.1 += held.len() as u64;
+        if matches!(held.first(), Some(&Held::Value(wait, _, _)) if !value_met(&wait)) {
+            out.2 += 1;
+        }
+    }
+    out
+}
+
+/// The title polling or waiting on a fence: held work that may run now
+/// does first ([`cross`]), so a value another queue's work — or the CPU —
+/// wrote is seen without waiting for the title's next submission, and a
+/// queue's signal behind held work is not needed for the poll itself.
+/// Never re-enters: a fence's value is asked inside the release itself.
+pub(crate) fn poll_pump() {
+    #[cfg(windows)]
+    {
+        if !cross() || RELEASING_HERE.get() || lock(&WAITING).is_empty() {
+            return;
+        }
+        // Another thread may be inside the release; the poll must not
+        // stand behind it.
+        let Ok(_one) = RELEASING.try_lock() else {
+            return;
+        };
+        release_held_inner(false);
+    }
+}
+
 #[cfg(windows)]
 fn release_held_now(all: bool) {
-    // One caller at a time, so a queue's submissions keep their order.
-    static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
     let _one = lock(&RELEASING);
+    release_held_inner(all);
+}
+
+#[cfg(windows)]
+fn release_held_inner(all: bool) {
     let was_here = RELEASING_HERE.replace(true);
     struct Leave(bool);
     impl Drop for Leave {
@@ -526,6 +692,10 @@ fn release_held_now(all: bool) {
         }
     }
     let _leave = Leave(was_here);
+    // With `all` (a present): the waits passed unmet and the submissions
+    // run behind them in this pass, for the frame line.
+    let mut forced_waits = 0u64;
+    let mut forced_runs = 0u64;
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
@@ -534,22 +704,69 @@ fn release_held_now(all: bool) {
             let line = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(line);
             loop {
-                match held.first() {
-                    None | Some(Held::Running) => break,
-                    Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
-                    {
+                // Whether the head may pass, without holding its borrow:
+                // a value wait found unmet needs the line again to mark
+                // it (it really waited, however fast its value then came).
+                enum Head {
+                    Go,
+                    Stop,
+                    Stall,
+                }
+                let mut valved = false;
+                let head = {
+                    match held.first() {
+                        None | Some(Held::Running) => Head::Stop,
+                        Some(&Held::Wait(fence, value))
+                            if !all && crate::fence::completed(fence as This) < value =>
+                        {
+                            Head::Stop
+                        }
+                        Some(&Held::Value(wait, since, _)) if !all && !value_met(&wait) => {
+                            // The valve: a wait nothing satisfies would
+                            // hold its queue — and every signal behind it —
+                            // until the title's watchdog ends the run.
+                            if cross() && since.elapsed() >= VALVE {
+                                valved = true;
+                                Head::Go
+                            } else {
+                                Head::Stall
+                            }
+                        }
+                        Some(_) => Head::Go,
+                    }
+                };
+                match head {
+                    Head::Stop => break,
+                    Head::Stall => {
+                        if let Some(Held::Value(_, _, was_unmet)) = held.first_mut() {
+                            *was_unmet = true;
+                        }
+                        STALLED.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
-                    Some(Held::Value(wait)) if !all && !value_met(wait) => break,
-                    Some(_) => {}
+                    Head::Go => {}
                 }
                 match held.remove(0) {
                     Held::Wait(..) | Held::Running => {}
-                    Held::Value(wait) => {
+                    Held::Value(wait, since, was_unmet) => {
+                        if valved {
+                            VALVED.fetch_add(1, Ordering::Relaxed);
+                            static SEEN_VALVE: AtomicU64 = AtomicU64::new(0);
+                            if SEEN_VALVE.fetch_add(1, Ordering::Relaxed) < 16 {
+                                tracing::warn!(
+                                    queue = format_args!("{q:#x}"),
+                                    ?wait,
+                                    waited_ms = since.elapsed().as_millis(),
+                                    "a wait for a memory value is passed after {VALVE:?} without it (the safety valve)"
+                                );
+                            }
+                        } else if was_unmet {
+                            WAITED.fetch_add(1, Ordering::Relaxed);
+                        }
                         // Passed at a present without being met: what the
                         // queue stood at.
                         if all && !value_met(&wait) {
+                            forced_waits += 1;
                             static SEEN: AtomicU64 = AtomicU64::new(0);
                             if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
                                 tracing::warn!(
@@ -574,10 +791,10 @@ fn release_held_now(all: bool) {
                         // each range shaders write compared once).
                         #[cfg(feature = "diagnostics")]
                         {
-                            let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
+                            let waits = held.iter().take_while(|h| matches!(h, Held::Value(..))).count();
                             if waits > 0
                                 && matches!(held.get(waits), Some(Held::Run(..)))
-                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
+                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w, ..) if w.met()))
                             {
                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
                             }
@@ -619,6 +836,7 @@ fn release_held_now(all: bool) {
                             }
                         }
                         if all {
+                            forced_runs += 1;
                             #[cfg(feature = "diagnostics")]
                             crate::copystat::add(crate::copystat::C::Forced, 1);
                             static ONCE: AtomicBool = AtomicBool::new(false);
@@ -666,6 +884,16 @@ fn release_held_now(all: bool) {
         }
         if !moved {
             break;
+        }
+    }
+    if all && forced_waits > 0 && forced_runs > 0 {
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
+            tracing::warn!(
+                runs = forced_runs,
+                waits = forced_waits,
+                "held submissions run at the present with their waits not met"
+            );
         }
     }
 }
@@ -777,6 +1005,8 @@ fn execute_now(this: This, count: u32, lists: *const This) {
         return;
     }
     #[cfg(windows)]
+    wait_timer();
+    #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
@@ -797,7 +1027,9 @@ fn execute_now(this: This, count: u32, lists: *const This) {
                 if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
                     tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
                 }
-                lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
+                let now = std::time::Instant::now();
+                lock(&queue(this).held)
+                    .extend(unmet.into_iter().map(|w| Held::Value(w, now, false)));
                 let mut waiting = lock(&WAITING);
                 if !waiting.contains(&(this as usize)) {
                     waiting.push(this as usize);
@@ -1061,15 +1293,24 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         // will write runs behind that flight, and nothing is settled here.
         release_held_now(false);
     }
-    // shortcut: what a queue still holds at a present runs now, whatever
-    // its fence: a wait is not kept across frames.
+    // With the cross-queue waits ([`cross`]) a present is a pump like any
+    // other: what a queue holds for a memory value stays held across the
+    // present until its wait holds or the valve passes it, as upstream
+    // does — the frame line says what was still held here. Before it
+    // (and with it off), the shortcut stands: what a queue still holds at
+    // a present runs now, whatever its fence — a wait is not kept across
+    // frames.
+    #[cfg(windows)]
+    let at_present = if sent_behind { (0, 0, 0) } else { held_back() };
     #[cfg(windows)]
     if !sent_behind {
-        release_held(forces());
+        release_held(forces() && !cross());
     }
     #[cfg(windows)]
     crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    wait_accounting_frame(frame, at_present);
     #[cfg(windows)]
     if sent_behind && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {
         tracing::info!(
@@ -1198,10 +1439,13 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// one constant page or of unmapped pages). Done at once.
+///
+/// shortcut: done ahead of work the queue still holds for memory values
+/// (counted in the frame line of waits, [`wait_accounting_frame`]; queue
+/// it as an item like a signal if that count is not 0).
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
@@ -1214,6 +1458,12 @@ extern "system" fn copy_page_mappings(
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    if !this.is_null() && !lock(&queue(this).held).is_empty() {
+        MAPPINGS_HELD.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(windows))]
+    let _ = this;
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }

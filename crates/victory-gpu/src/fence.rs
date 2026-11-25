@@ -76,9 +76,14 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 pub(crate) extern "system" fn completed(this: This) -> u64 {
+    // A title polling for a value: held work that may run now does first
+    // (`crate::queue::poll_pump`), so the answer is not "no" only because
+    // nobody looked since the value was written.
+    crate::queue::poll_pump();
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
+    crate::queue::poll_pump();
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {

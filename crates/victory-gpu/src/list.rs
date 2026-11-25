@@ -1817,6 +1817,10 @@ pub(crate) struct ValueWait {
     comparison: u32,
     reference: u64,
     wide: bool,
+    /// The bits the comparison looks at (the 32-bit form's `mask`
+    /// argument; all of them for a 64-bit wait or one made before masks
+    /// were read, `VICTORY_CROSS_QUEUE_WAITS=0`).
+    mask: u64,
 }
 
 impl ValueWait {
@@ -1855,18 +1859,40 @@ impl ValueWait {
         if self.address == 0 {
             return true;
         }
+        // A comparison we do not know passes without a read, counted, as
+        // upstream does — before the read, so memory that is not there
+        // does not hold back what the console would not even test.
+        if !(1..=8).contains(&self.comparison) {
+            count_unknown();
+            return true;
+        }
         static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
             && !crate::texture::committed(self.address as *const u8, bytes)
         {
-            return true;
+            return self.unreadable();
         }
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
-            return true;
+            return self.unreadable();
         }
         self.holds_for(u64::from_le_bytes(raw))
+    }
+
+    /// Whether a wait whose memory cannot be read counts as met. Taken as
+    /// met before `VICTORY_CROSS_QUEUE_WAITS`, which lets the work run
+    /// before its wait holds when the value is only not there yet (tiled
+    /// or lazily committed memory). Now it does not hold, as on the
+    /// console the wait would still stand — unless the comparison never
+    /// reads the value (ALWAYS).
+    fn unreadable(&self) -> bool {
+        if crate::queue::cross() {
+            const ALWAYS: u32 = 8;
+            count_unreadable();
+            return self.comparison == ALWAYS;
+        }
+        true
     }
 
     /// Where the value waited for is: address and bytes.
@@ -1875,13 +1901,14 @@ impl ValueWait {
         (self.address as usize, if self.wide { 8 } else { 4 })
     }
 
-    /// Whether the wait is met with `value` at its address (its low half
-    /// for a 32-bit wait).
+    /// Whether the wait is met with `value` at its address (its low half,
+    /// and of it only the mask's bits, for a 32-bit wait — the reference
+    /// keeps all of its own, as the console's comparison does).
     pub(crate) fn holds_for(&self, value: u64) -> bool {
         let (value, reference) = if self.wide {
             (value, self.reference)
         } else {
-            (value & 0xFFFF_FFFF, self.reference & 0xFFFF_FFFF)
+            (value & 0xFFFF_FFFF & self.mask, self.reference & 0xFFFF_FFFF)
         };
         match self.comparison {
             1 => false,
@@ -1894,6 +1921,34 @@ impl ValueWait {
             _ => true,
         }
     }
+}
+
+/// Waits whose memory could not be read since the last call, and the
+/// calls (for the frame line of `crate::queue`): with
+/// `VICTORY_CROSS_QUEUE_WAITS` they do not count as met, so one is a
+/// wait holding its queue for memory that is not there.
+static UNREADABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn count_unreadable() {
+    UNREADABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Waits whose memory could not be read since the last call.
+pub(crate) fn take_unreadable() -> u64 {
+    UNREADABLE.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Waits passed with a comparison we do not know since the last call
+/// (they pass without a read, as upstream's pump counts and passes them).
+static UNKNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn count_unknown() {
+    UNKNOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Waits passed with a comparison we do not know since the last call.
+pub(crate) fn take_unknown() -> u64 {
+    UNKNOWN.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The waits lists recorded since their last reset, by list.
@@ -1940,13 +1995,48 @@ pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
     by
 }
 
-fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
+/// Waits recorded since the last call: narrow (32-bit), wide (64-bit),
+/// and narrow ones with a mask that is not all bits (for the frame line
+/// of `crate::queue`).
+static WAIT_COUNTS: [std::sync::atomic::AtomicU64; 3] = [
+    const { std::sync::atomic::AtomicU64::new(0) },
+    const { std::sync::atomic::AtomicU64::new(0) },
+    const { std::sync::atomic::AtomicU64::new(0) },
+];
+
+/// Waits recorded since the last call: (narrow, wide, narrow with a mask).
+pub(crate) fn take_wait_counts() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        WAIT_COUNTS[0].swap(0, Relaxed),
+        WAIT_COUNTS[1].swap(0, Relaxed),
+        WAIT_COUNTS[2].swap(0, Relaxed),
+    )
+}
+
+fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool, mask: u64) {
     let wait = ValueWait {
         address,
         comparison,
         reference,
         wide,
+        mask,
     };
+    use std::sync::atomic::Ordering::Relaxed;
+    WAIT_COUNTS[usize::from(wide)].fetch_add(1, Relaxed);
+    if !wide && mask != u64::from(u32::MAX) {
+        WAIT_COUNTS[2].fetch_add(1, Relaxed);
+        static MASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if MASKS.fetch_add(1, Relaxed) < 8 {
+            tracing::info!(
+                address = format_args!("{address:#x}"),
+                comparison,
+                reference = format_args!("{reference:#x}"),
+                mask = format_args!("{mask:#x}"),
+                "a list waits for a masked memory value"
+            );
+        }
+    }
     static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
         tracing::info!(
@@ -1978,11 +2068,17 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         .unwrap_or_else(|e| e.into_inner())
         .push((this as usize, wait));
 }
-extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
-    wait_for(this, address, comparison, reference, false);
+/// `Wait32BitValueX(address, comparison, reference, mask, flags)`: the
+/// 32-bit wait tests the mask's bits of the value against the reference.
+extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u32, mask: u32, _flags: u32) {
+    // The mask was not read before `VICTORY_CROSS_QUEUE_WAITS`: without it
+    // every bit is compared, as before.
+    let mask = if crate::queue::cross() { u64::from(mask) } else { u64::from(u32::MAX) };
+    wait_for(this, address, comparison, u64::from(reference), false, mask);
 }
-extern "system" fn wait_value64(this: This, address: u64, comparison: u32, reference: u64) {
-    wait_for(this, address, comparison, reference, true);
+/// `Wait64BitValueX(address, comparison, reference, flags)`.
+extern "system" fn wait_value64(this: This, address: u64, comparison: u32, reference: u64, _flags: u32) {
+    wait_for(this, address, comparison, reference, true, u64::MAX);
 }
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
@@ -2269,5 +2365,46 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// The comparisons test the masked low half of the value against the
+    /// reference's low half (the console's 32-bit form; the mask is the
+    /// form's own argument, applied to the value only), and the whole of
+    /// both for a 64-bit wait. Ported from upstream's `hold` tests of
+    /// "lists wait on memory values" (comparisons_test_the_masked_value).
+    #[test]
+    fn waits_compare_the_masked_value() {
+        let w = |comparison, reference, mask| ValueWait {
+            address: 8,
+            comparison,
+            reference,
+            wide: false,
+            mask,
+        };
+        // (never, less, equal, less-equal, greater, not-equal,
+        // greater-equal, always) of 5 against 5, all bits looked at.
+        let expect = [false, false, true, true, false, false, true, true];
+        for (comparison, holds) in expect.into_iter().enumerate() {
+            assert_eq!(w(comparison as u32 + 1, 5, u64::MAX).holds_for(5), holds, "comparison {}", comparison + 1);
+        }
+        assert!(w(2, 6, u64::MAX).holds_for(5), "less");
+        assert!(w(5, 4, u64::MAX).holds_for(5), "greater");
+        assert!(w(0, 5, u64::MAX).holds_for(0), "an unknown comparison counts as met");
+        assert!(w(9, 5, u64::MAX).holds_for(0));
+        // Only the value is masked: bits outside the mask are not looked
+        // at in it, however they stand in the reference.
+        assert!(w(3, 0xff, 0xff).holds_for(0xdead_beef_0000_00ff), "equal in the masked bits");
+        assert!(!w(3, 0xff, 0xff).holds_for(0xff00), "and not outside them");
+        assert!(!w(7, 0x1_0000, 0xffff).holds_for(0xffff), "the reference keeps its own bits");
+        // A 64-bit wait looks at everything.
+        let wide = ValueWait {
+            address: 8,
+            comparison: 3,
+            reference: 0x1_0000_0005,
+            wide: true,
+            mask: u64::MAX,
+        };
+        assert!(wide.holds_for(0x1_0000_0005));
+        assert!(!wide.holds_for(5), "no truncation to the low half");
     }
 }
