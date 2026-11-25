@@ -173,3 +173,133 @@ fn scan_containers_from_env() {
         missing.join(", ")
     );
 }
+
+/// Every distinct compute container in the data file translated, one line
+/// each, to compare whole-pack coverage before and after a change:
+///
+/// ```sh
+/// VICTORY_SHADER_SCAN=/path/to/shaders.rpf VICTORY_HOST_MAX_WAVE=32 \
+/// VICTORY_SCAN_THREADS=4 VICTORY_SCAN_WAVE64=1 \
+/// cargo test -p victory-shader --test offline scan_compute -- --ignored --nocapture
+/// ```
+///
+/// Lines read `SCAN <hash> wave64=<bool> threads=<x,y,z> <result> <name>`,
+/// the result `OK wave=<n|any> bytes=<n>`, `ERROR <why>` or `PANIC`.
+/// `VICTORY_SCAN_WAVE64=1` keeps only programs the console runs as 64
+/// lanes.
+#[test]
+#[ignore = "reads a game data file named by VICTORY_SHADER_SCAN"]
+fn scan_compute_from_env() {
+    let path = std::env::var_os("VICTORY_SHADER_SCAN")
+        .expect("set VICTORY_SHADER_SCAN to the data file to scan");
+    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        emit::set_host_max_wave(n);
+    }
+    let only64 = std::env::var("VICTORY_SCAN_WAVE64").is_ok_and(|v| v == "1");
+    let threads: usize = std::env::var("VICTORY_SCAN_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+        .max(1);
+    let data = std::fs::read(&path).expect("read VICTORY_SHADER_SCAN");
+
+    // (hash, name, wave64, threads, bytes) of each distinct compute container.
+    let mut jobs: Vec<(String, String, bool, [u32; 3], Vec<u8>)> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut take = |bytes: Vec<u8>, name: String| {
+        let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+        if !seen.insert(hash.clone()) {
+            return;
+        }
+        let Ok(container) = Container::parse(&bytes) else {
+            return;
+        };
+        let Some(Ok(programs)) = container
+            .part(FourCC::DXIL)
+            .map(|p| native_programs(p.data))
+        else {
+            return;
+        };
+        let Some(cs) = programs
+            .iter()
+            .find(|p| p.stage == victory_shader::native::HwStage::Cs)
+        else {
+            return;
+        };
+        if only64 && !cs.wave64 {
+            return;
+        }
+        let threads = match &cs.io {
+            victory_shader::native::StageIo::Cs(io) => io.threads,
+            _ => [0; 3],
+        };
+        jobs.push((hash, name, cs.wave64, threads, bytes));
+    };
+    if sgd5::is_sgd5(&data) {
+        for record in sgd5::records(&data) {
+            if let Some(bytes) = record.unpack() {
+                take(bytes, record.name.unwrap_or("?").to_owned());
+            }
+        }
+    }
+    for (offset, bytes) in raw_containers(&data) {
+        take(bytes.to_vec(), format!("@{offset:#x}"));
+    }
+    drop(data);
+    jobs.sort_by(|a, b| a.0.cmp(&b.0));
+    println!("compute containers: {}", jobs.len());
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let lines = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                loop {
+                    let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((hash, name, wave64, threads, bytes)) = jobs.get(n) else {
+                        break;
+                    };
+                    let result = match std::panic::catch_unwind(|| emit::translate(bytes)) {
+                        Ok(Ok(shader)) => {
+                            let wave = Container::parse(&shader.dxil)
+                                .ok()
+                                .and_then(|c| c.part(FourCC::PSV0).map(|p| p.data))
+                                .filter(|d| d.len() >= 28)
+                                .map(|d| {
+                                    let min = u32::from_le_bytes(d[20..24].try_into().unwrap());
+                                    let max = u32::from_le_bytes(d[24..28].try_into().unwrap());
+                                    (min, max)
+                                })
+                                .and_then(|(min, max)| (min == max && min != 0).then_some(min));
+                            format!(
+                                "OK wave={} bytes={}",
+                                wave.map_or("any".to_owned(), |n| n.to_string()),
+                                shader.dxil.len()
+                            )
+                        }
+                        Ok(Err(e)) => format!("ERROR {}", e.to_string().replace('\n', " ")),
+                        Err(_) => "PANIC".to_owned(),
+                    };
+                    let line = format!(
+                        "SCAN {hash} wave64={wave64} threads={},{},{} {result} {name}",
+                        threads[0], threads[1], threads[2]
+                    );
+                    println!("{line}");
+                    lines.lock().unwrap().push(line);
+                }
+            });
+        }
+    });
+    let lines = lines.into_inner().unwrap();
+    let ok = lines.iter().filter(|l| l.contains(" OK ")).count();
+    let wave32 = lines.iter().filter(|l| l.contains(" OK wave=32 ")).count();
+    let wave64 = lines.iter().filter(|l| l.contains(" OK wave=64 ")).count();
+    println!(
+        "scan complete: {} compute containers, {ok} translated ({wave32} host wave 32, {wave64} host wave 64), {} failed",
+        lines.len(),
+        lines.len() - ok
+    );
+}
