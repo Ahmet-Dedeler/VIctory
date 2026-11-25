@@ -1043,7 +1043,8 @@ fn paired_lanes_or_a_wave_inside_a_lane_branch() {
 /// use theirs: no form in two host waves takes it (they would meet inside the branch, and the
 /// skip cannot be left out: s7 would no longer keep 0x77), and the approximate form, each host
 /// wave a wave of its own, gives each half its own OR, 0x77 to the upper half while s0 <= 32.
-/// The title's 39 such programs ran approximate; [`super::emit`] now gives the paired form.
+/// The title's 39 such programs ran approximate; [`super::emit`] now gives the paired form
+/// (with `VICTORY_WAVE_PAIRS_EXACT=1` in this tree; the approximate form by default).
 #[test]
 fn a_wave_value_used_past_a_lane_branch_takes_the_paired_form_not_an_approximate_one() {
     let mut w = vec![
@@ -1071,12 +1072,21 @@ fn a_wave_value_used_past_a_lane_branch_takes_the_paired_form_not_an_approximate
     let c = super::Container::parse(&bytes).expect("container");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     let pairs = super::paired(&c, &native, &p, &io, &res);
+    // (`VICTORY_WAVE_PAIRS_EXACT=1`: off by default in this tree)
+    let exact = super::TEST_PAIRS_EXACT.replace(Some(true));
     let chosen = super::emit(&c, &native, &p, &st, &io, &res);
-    // (as before: the paired form only where no other form takes the program)
+    super::TEST_PAIRS_EXACT.set(exact);
+    // (the default here, and without the paired form: the approximate form, the paired form
+    // only where no other form takes the program)
+    let by_default = super::emit(&c, &native, &p, &st, &io, &res);
     let off = super::TEST_PAIRS.replace(Some(false));
     let approximate = super::emit(&c, &native, &p, &st, &io, &res);
     super::TEST_PAIRS.set(off);
     lower::TEST_HOST_WAVE.set(was);
+    assert!(
+        by_default.as_ref().ok().map(|s| &s.dxil) == approximate.as_ref().ok().map(|s| &s.dxil),
+        "by default, emit gives a program an approximate form takes another form"
+    );
     let (pairs, wave) = pairs.expect("the paired form");
     assert_eq!(wave, Some(32));
     let (chosen, approximate) = (chosen.expect("emit"), approximate.expect("an approximate form"));

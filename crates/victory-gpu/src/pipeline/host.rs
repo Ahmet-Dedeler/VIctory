@@ -1033,7 +1033,9 @@ fn graphics_depth_bounds_pipeline(
 /// reads. Made once per pair (both programs translated again, not kept on disk: the pipeline
 /// library keeps the pipeline); `None` when `ms` fits, or the pair does not link (then the
 /// pipeline is made of the shared translations, as before). `VICTORY_MESH_LINK=0` turns it
-/// off.
+/// off. Off by default on macOS too (`VICTORY_MESH_LINK=1` turns it on there): D3DMetal 4.0b3
+/// builds those mesh programs as translated alone (`metal_mesh_limit`), so linking would change
+/// pipelines that already work there.
 fn linked(
     ms: &Arc<Shader>,
     ps: &Arc<Shader>,
@@ -1042,7 +1044,10 @@ fn linked(
     static PAIRS: std::sync::Mutex<Option<std::collections::HashMap<(String, String), Pair>>> =
         std::sync::Mutex::new(None);
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LINK").is_none_or(|v| v != "0")) {
+    if !*ON.get_or_init(|| match std::env::var_os("VICTORY_MESH_LINK") {
+        Some(v) => v != "0",
+        None => !crate::host::is_darwin(),
+    }) {
         return None;
     }
     let (tm, tp) = (ms.translated()?, ps.translated()?);

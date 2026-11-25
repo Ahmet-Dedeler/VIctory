@@ -481,10 +481,28 @@ fn pairs_on() -> bool {
     std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0")
 }
 
+/// Whether the paired form also goes before the approximate forms, where one of those takes
+/// the program (`exactly` in [`emit_forms`]): `VICTORY_WAVE_PAIRS_EXACT=1`. fxceless#854 does
+/// that by default (36 of the title's programs, which each half-wave counted, ORed or elected
+/// over its own 32 lanes, then run as on the console). Off here by default: those programs
+/// already get a host pipeline on the 32-lane host and run, approximately, and the paired form
+/// changes them (larger DXIL, one #854 tester measured a scene at 4.74 against 5.70 fps). The
+/// paired form as the last resort ([`emit_any`]: a program no other form gives the 32-lane
+/// host, which gets no pipeline at all) stays on with [`pairs_on`].
+fn pairs_exact_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PAIRS_EXACT.get() {
+        return on && pairs_on();
+    }
+    pairs_on() && std::env::var_os("VICTORY_WAVE_PAIRS_EXACT").is_some_and(|v| v == "1")
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's choice for [`pairs_on`], for its thread only.
     static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`pairs_exact_on`], for its thread only.
+    static TEST_PAIRS_EXACT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// [`emit`] in every form but the paired one, with the wave size the result requires of the
@@ -599,9 +617,9 @@ fn emit_forms(
         // and keep the per-half form, which is exact for them. Only these change: a program
         // an approximate form does not take goes on as before, and the paired form stays
         // last for it (`emit_any`). (`VICTORY_WAVE_PAIRS=0` turns the paired form off here
-        // too.)
+        // too.) In this tree only with `VICTORY_WAVE_PAIRS_EXACT=1` ([`pairs_exact_on`]).
         let exactly = |approximate: Result<(HostShader, Option<u32>), ShaderError>| {
-            if pairs_on() {
+            if pairs_exact_on() {
                 let again = paired(c, native, p, io, res);
                 report("paired lanes, before an approximate form", &again);
                 if again.is_ok() {
