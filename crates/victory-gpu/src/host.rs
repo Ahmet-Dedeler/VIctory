@@ -1072,6 +1072,45 @@ pub fn background() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BACKGROUND").is_some_and(|v| v != "0"))
 }
 
+/// In a background run: where a top-level window goes so that it covers
+/// nothing of the work of whoever sits at the screen: past the bottom
+/// right corner of the desktop (all monitors). `None` outside such a run,
+/// or with `VICTORY_BACKGROUND_WINDOW=visible`. Frame captures are of the
+/// frames, not of the window, and show them as before.
+pub fn background_window() -> Option<(i32, i32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+    if !background() || std::env::var("VICTORY_BACKGROUND_WINDOW").is_ok_and(|v| v.trim() == "visible") {
+        return None;
+    }
+    // SAFETY: plain queries.
+    unsafe {
+        Some((
+            GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) + 64,
+            GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN) + 64,
+        ))
+    }
+}
+
+/// In a background run: puts a top-level window just shown behind every
+/// other window, without activating it.
+pub fn background_behind(hwnd: *mut std::ffi::c_void) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GA_ROOT, GetAncestor, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    };
+    if !background() || hwnd.is_null() {
+        return;
+    }
+    let hwnd = HWND(hwnd);
+    // SAFETY: plain calls on a window of ours.
+    unsafe {
+        if GetAncestor(hwnd, GA_ROOT) == hwnd {
+            let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+        }
+    }
+}
+
 /// Loads `dxcompiler.dll` from `VICTORY_DXC_DIR`, beside our executable, or
 /// the default DLL search path (used when Wine's `D3DCompile` refuses SM 5.1 /
 /// embedded `[RootSignature]` shaders).
@@ -8538,17 +8577,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         // the desktop (all monitors): at a fixed place inside a large
         // desktop macOS moved it back whole onto the screen, where it was
         // taken for the play copy (muted, keyboard off).
-        let (x, y) = if bg {
-            use windows::Win32::UI::WindowsAndMessaging::{
-                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-            };
-            (
-                GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) + 64,
-                GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN) + 64,
-            )
-        } else {
-            (CW_USEDEFAULT, CW_USEDEFAULT)
-        };
+        let (x, y) = background_window().unwrap_or((CW_USEDEFAULT, CW_USEDEFAULT));
         let style = if bg {
             WS_OVERLAPPEDWINDOW
         } else {
@@ -8569,12 +8598,9 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             None,
         )?;
         if bg {
-            use windows::Win32::UI::WindowsAndMessaging::{
-                HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
-            };
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             // Behind every other window, should the system put it on a screen after all.
-            let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+            background_behind(hwnd.0);
         }
         Ok(hwnd)
     }

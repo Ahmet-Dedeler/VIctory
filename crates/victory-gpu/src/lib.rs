@@ -75,7 +75,7 @@ mod watch;
 
 pub use mapped::{title_pages_mapped, title_pages_released, title_pages_reserved, title_pages_unmapped};
 #[cfg(windows)]
-pub use host::{background, is_darwin, on_failure};
+pub use host::{background, background_behind, background_window, is_darwin, on_failure};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
