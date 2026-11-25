@@ -2124,7 +2124,11 @@ impl State {
             once!("no ambient light: other tables");
             return false;
         }
-        crate::ambient::raise(list, light as This)
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
