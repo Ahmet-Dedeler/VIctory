@@ -346,9 +346,11 @@ pub(crate) fn line(frames: f64) {
     }
     let [copies, bytes, gone, lately, small, writes, wbytes, wfaults, asked, known] =
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
+    let openings = crate::watch::WRITING_CALLS.swap(0, Relaxed) as f64 / frames;
     tracing::info!(
         "in-place title copies/frame: reads {copies:.0} ({:.1} MB, {gone:.1} faults, {lately:.0} lately, {small:.0} <{LEAST}B, \
-         {known:.0} known to have no pages, {asked:.1} faults asking for a page); writes {writes:.0} ({:.1} MB, {wfaults:.1} faults)",
+         {known:.0} known to have no pages, {asked:.1} faults asking for a page); writes {writes:.0} ({:.1} MB, {wfaults:.1} faults); \
+         watch::writing calls {openings:.0}",
         bytes / 1e6,
         wbytes / 1e6
     );

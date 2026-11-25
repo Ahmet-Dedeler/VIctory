@@ -941,11 +941,17 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
+/// Since the last frame line: calls of [`writing`], wherever they were
+/// made (the copy-back's openings are most of them). Taken in
+/// [`crate::plaincopy::line`].
+pub(crate) static WRITING_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    WRITING_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
