@@ -332,6 +332,41 @@ pub(crate) fn build(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
     out
 }
 
+/// The shader hash part (`HASH`): flags (0, no source included) and the
+/// MD5 of the program. Apple's D3DMetal keys its shader cache on this hash,
+/// so it must differ between shaders: with one shared value, two shaders of
+/// the same length got each other's compiled code.
+pub(crate) fn shader_hash(dxil: &[u8]) -> [u8; 20] {
+    let mut out = [0; 20];
+    out[4..].copy_from_slice(&md5(dxil));
+    out
+}
+
+/// Standard MD5.
+pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
+    let len = data.len();
+    let mut tail = data[len - len % 64..].to_vec();
+    tail.push(0x80);
+    while tail.len() % 64 != 56 {
+        tail.push(0);
+    }
+    tail.extend(((len as u64) << 3).to_le_bytes());
+    let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+    for block in data[..len - len % 64]
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .chain(tail.as_chunks::<64>().0)
+    {
+        md5_block(&mut state, block);
+    }
+    let mut out = [0; 16];
+    for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        o.copy_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
 /// The container hash D3D12 checks: MD5 whose last block carries the bit
 /// count first and `2 × bytes + 1` last instead of standard padding.
 pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
