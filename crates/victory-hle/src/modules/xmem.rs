@@ -629,10 +629,67 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
-/// Whether every page under `[offset, offset + len)` is known (a write that
-/// fails with them known is a host failure).
-pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
-    runs(pages, offset, len).is_some()
+/// A destination's physical pages resolved to their sections: the page
+/// numbers are read once, and the sections are held, so the title may
+/// change its page list or free the pages before the write without the
+/// write going astray (DirectStorage resolves a request's list when the
+/// title submits it).
+pub(crate) struct PageRuns {
+    runs: Vec<(Slice, usize)>,
+    within: usize,
+    len: usize,
+    /// The page numbers they were resolved from, copied: what
+    /// [`pages_written`] tells of, the title's table being its own to
+    /// reuse once the request is submitted.
+    pages: Vec<usize>,
+}
+
+/// Bytes `[offset, offset + len)` of `pages`, resolved; `None` if a page
+/// is unknown.
+pub(crate) fn resolve_pages(pages: &[usize], offset: usize, len: usize) -> Option<PageRuns> {
+    Some(PageRuns {
+        runs: runs(pages, offset, len)?,
+        within: offset % PAGE,
+        len,
+        pages: pages.to_vec(),
+    })
+}
+
+impl PageRuns {
+    /// The bytes in place when they are one run of one section.
+    pub(crate) fn window(&self) -> Option<PageWindow> {
+        let [(slice, n)] = self.runs.as_slice() else {
+            return None;
+        };
+        Some(PageWindow {
+            view: View::map(slice, *n)?,
+            within: self.within,
+            len: self.len,
+        })
+    }
+
+    /// Copies `data` (at most `len` bytes) in. False if the host fails.
+    pub(crate) fn write(&self, data: &[u8]) -> bool {
+        let (mut within, mut done) = (self.within, 0);
+        for (slice, n) in &self.runs {
+            if done == data.len() {
+                break;
+            }
+            let Some(mut view) = View::map(slice, *n) else {
+                return false;
+            };
+            let k = (n * PAGE - within).min(data.len() - done);
+            view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+            (within, done) = (0, done + k);
+        }
+        true
+    }
+
+    /// The page numbers the runs were resolved from (`offset` bytes into
+    /// the first of them, as resolved).
+    pub(crate) fn numbers(&self) -> &[usize] {
+        &self.pages
+    }
 }
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
@@ -640,20 +697,9 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
 /// One view per run of consecutive pages, not one per page: each view
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
+#[cfg(test)]
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
-    let Some(runs) = runs(pages, offset, data.len()) else {
-        return false;
-    };
-    let (mut within, mut done) = (offset % PAGE, 0);
-    for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
-            return false;
-        };
-        let k = (n * PAGE - within).min(data.len() - done);
-        view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
-        (within, done) = (0, done + k);
-    }
-    true
+    resolve_pages(pages, offset, data.len()).is_some_and(|runs| runs.write(data))
 }
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
@@ -677,16 +723,9 @@ impl PageWindow {
 /// `None` otherwise (pages of several allocations, out of order, or
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
+#[cfg(test)]
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
-    let runs = runs(pages, offset, len)?;
-    let [(slice, n)] = runs.as_slice() else {
-        return None;
-    };
-    Some(PageWindow {
-        view: View::map(slice, *n)?,
-        within: offset % PAGE,
-        len,
-    })
+    resolve_pages(pages, offset, len)?.window()
 }
 
 /// The title addresses that show bytes `[offset, offset + len)` of `pages`
