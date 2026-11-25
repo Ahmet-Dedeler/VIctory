@@ -3545,7 +3545,7 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+    lookup(address, len, false, None).map(|(shadow, _)| shadow)
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -3570,10 +3570,42 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !fine() {
         return find(address, len);
     }
-    lookup(address, len, true)
+    lookup(address, len, true, None).map(|(shadow, _)| shadow)
 }
 
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+type ExactRange<'a> = dyn Fn(u64) -> Option<(u64, u64)> + 'a;
+
+/// Selects a descriptor's whole backing or, when its offset requires it,
+/// its own byte range. The flag says that the descriptor starts at element
+/// zero of the latter. Select before allocating an otherwise unused copy.
+pub(crate) fn find_or_exact(
+    address: u64,
+    len: u64,
+    range: impl Fn(u64) -> Option<(u64, u64)>,
+) -> Option<(Arc<Shadow>, bool)> {
+    if crate::inplace::level() != 0 {
+        // A placed buffer can add a bias to its offset after opening the
+        // heap. Use the actual backing when in-place placement is enabled.
+        let shadow = find(address, len)?;
+        return Some(match exact_for(Some(&range), shadow.offset(address)) {
+            Some(own) => (own, true),
+            None => (shadow, false),
+        });
+    }
+    lookup(address, len, false, Some(&range))
+}
+
+fn exact_for(range: Option<&ExactRange<'_>>, offset: u64) -> Option<Arc<Shadow>> {
+    let (start, bytes) = range?(offset)?;
+    exact(start, bytes)
+}
+
+fn lookup(
+    address: u64,
+    len: u64,
+    any: bool,
+    range: Option<&ExactRange<'_>>,
+) -> Option<(Arc<Shadow>, bool)> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -3584,9 +3616,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return loose(address, end, len <= 1, any, range);
     };
     let entry = map.get_mut(&key)?;
+    if let Some(own) = exact_for(range, address - key.0) {
+        return Some((own, true));
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -3599,7 +3634,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && size >= card_limits().0;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
+            return entry.shadow.clone().map(|shadow| (shadow, false));
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
@@ -3647,7 +3682,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         entry.shadow = Some(shadow);
     }
-    entry.shadow.clone()
+    entry.shadow.clone().map(|shadow| (shadow, false))
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -3785,7 +3820,13 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
-fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+fn loose(
+    address: u64,
+    end: u64,
+    unsized_ask: bool,
+    any: bool,
+    range: Option<&ExactRange<'_>>,
+) -> Option<(Arc<Shadow>, bool)> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
@@ -3801,6 +3842,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     } else {
         named
     };
+    if let Some(own) = exact_for(range, address - start) {
+        return Some((own, true));
+    }
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
@@ -3812,7 +3856,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     };
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
-        return Some(shadow.clone());
+        return Some((shadow.clone(), false));
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
@@ -3820,7 +3864,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
-        return Some(shadow);
+        return Some((shadow, false));
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -3856,7 +3900,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
-    Some(shadow)
+    Some((shadow, false))
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
