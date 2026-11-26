@@ -1060,17 +1060,27 @@ enum Pairs {
 /// entry point), so it goes on to the next exact form (the paired one with
 /// `VICTORY_WAVE_PAIRS=1`).
 ///
-/// The title's tiled sun shadows (`CS_ShadowRenderTiledCascades*`, 14 variants: plain, `CB`,
-/// `Alpha`, `PPPC` and their mixes) are wrong in it: on M5 Max under D3DMetal the open world
-/// showed 16x16-pixel square blocks along every shadow's edge (lit squares in shadow, dark
-/// squares on sunlit ground and on Jason's arms, moving with the camera) with all eight seen
-/// variants in this form, on 7e106c20, fcca35bc and cb423ccf alike. On an RTX 4080 keeping
-/// exactly these programs out of it gave the best picture (fxceless/victory-fork 1c7ded3f,
-/// #62). `VICTORY_SHADOW_TILES_DEEP=1` lets them take it again.
+/// The title's wide soft sun shadows (`CS_ShadowRenderTiledCascades*PPPC`: `PPPC`, `CBPPPC`,
+/// `AlphaPPPC`, `AlphaCBPPPC`) are wrong in it: on M5 Max under D3DMetal the open world showed
+/// 16x16-pixel square blocks along the edges of large shadows on the ground (lit squares in
+/// shadow, dark squares on sunlit ground) on 7e106c20, fcca35bc and cb423ccf; keeping all the
+/// tiled cascade programs out (b0d18091) took most of them away. The sharp variants (plain,
+/// `CB`, `Alpha`, `AlphaCB`: Jason's body and cap, railings) were right in it, and out of it
+/// Jason's face went flat and pale under his cap (cb423ccf same spot: right), so only the
+/// `PPPC` ones are kept out. On an RTX 4080 keeping the tiled cascade programs out of the form
+/// gave the best picture (fxceless/victory-fork 1c7ded3f, #62).
+/// `VICTORY_SHADOW_TILES_DEEP=1` lets them take it again; `=all` keeps every tiled cascade
+/// program out, sharp ones too.
 fn deep_skips_wrong_for(entry: Option<&str>) -> bool {
-    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let allowed = *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_SHADOW_TILES_DEEP").is_some_and(|v| v == "1"));
-    !allowed && entry.is_some_and(|name| name.starts_with("CS_ShadowRenderTiled"))
+    static SET: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    // None: none kept out; Some(true): every tiled cascade program; Some(false): `PPPC` alone.
+    let set = *SET.get_or_init(|| match std::env::var("VICTORY_SHADOW_TILES_DEEP").as_deref() {
+        Ok("1") => None,
+        Ok("all") => Some(true),
+        _ => Some(false),
+    });
+    let Some(all) = set else { return false };
+    entry.is_some_and(|name| name.starts_with("CS_ShadowRenderTiled") && (all || name.contains("PPPC")))
 }
 
 fn parse_pairs(value: Option<&str>) -> Pairs {
