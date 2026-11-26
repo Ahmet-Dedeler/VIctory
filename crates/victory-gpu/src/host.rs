@@ -8366,7 +8366,7 @@ impl Host {
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
+            Width: crate::mac::mapped_buffer_bytes(size).max(1),
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -8407,7 +8407,7 @@ impl Host {
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
+            Width: crate::mac::mapped_buffer_bytes(size).max(1),
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -9142,7 +9142,7 @@ impl Host {
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
+            Width: crate::mac::mapped_buffer_bytes(size).max(1),
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -9227,7 +9227,7 @@ impl Host {
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
+            Width: crate::mac::mapped_buffer_bytes(size).max(1),
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,

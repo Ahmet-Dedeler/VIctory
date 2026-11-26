@@ -344,3 +344,18 @@ pub(crate) fn presented() {
         f.drawn = crate::draw::drawn();
     }
 }
+
+/// Mac layer: the bytes to make a CPU-mapped buffer (upload or shared) of
+/// `size` with. D3DMetal reads some copies out of such buffers on the CPU and
+/// reads every row at its full pitch, the last one too, where D3D12 asks only
+/// for the last row's own bytes: 23 KB past the end of a 2.6 MB buffer, into
+/// unmapped memory, and the process died (run nb-av-d, 2026-11-26). The
+/// overrun is under one row's pitch, which is at most the buffer's size; a
+/// buffer gets that much more, up to 256 KiB. `VICTORY_MAPPED_PAD=0`: exact.
+pub(crate) fn mapped_buffer_bytes(size: u64) -> u64 {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| switch("VICTORY_MAPPED_PAD", true, false)) {
+        return size;
+    }
+    size + size.min(256 << 10).next_multiple_of(4096)
+}
