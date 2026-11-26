@@ -64,6 +64,9 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// Whether PSV0 names a decoration bake, asked only when enabled.
+    #[cfg(any(windows, test))]
+    bake_entry: OnceLock<bool>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -116,11 +119,37 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(any(windows, test))]
+                bake_entry: OnceLock::new(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
         .clone()
+}
+
+/// The four hashes used to identify bake pixel shaders before entry names.
+#[cfg(any(windows, test))]
+const BAKE_PIXEL_SHADERS: [&str; 4] =
+    ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+
+#[cfg(any(windows, test))]
+impl Shader {
+    pub(crate) fn is_decoration_bake(&self, entry_names: bool) -> bool {
+        if self.stage != "pixel" {
+            return false;
+        }
+        BAKE_PIXEL_SHADERS.contains(&self.hash.as_str())
+            || entry_names
+                && *self.bake_entry.get_or_init(|| {
+                    victory_shader::Container::parse(&self.container)
+                        .ok()
+                        .and_then(|container| container.pixel_entry_name())
+                        .is_some_and(|name| {
+                            name.starts_with("PS_BakeDecorations") || name.starts_with("PS_DecorationBlend")
+                        })
+                })
+    }
 }
 
 /// A translated shader and the console resources its code reads.
@@ -802,6 +831,58 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    // Minimal synthetic DXBC with one PSV0 part and no resource bindings.
+    fn bake_shader(stage: &'static str, psv_stage: u8, name: &[u8]) -> Arc<Shader> {
+        let size = 44 + 64 + name.len() + 1;
+        let mut bytes = vec![0; size];
+        bytes[..4].copy_from_slice(b"DXBC");
+        bytes[20] = 1;
+        bytes[24..28].copy_from_slice(&(size as u32).to_le_bytes());
+        bytes[28] = 1;
+        bytes[32] = 36;
+        bytes[36..40].copy_from_slice(b"PSV0");
+        bytes[40..44].copy_from_slice(&((size - 44) as u32).to_le_bytes());
+        let psv = &mut bytes[44..];
+        psv[0] = 52;
+        psv[4 + 24] = psv_stage;
+        psv[60..64].copy_from_slice(&((name.len() + 1) as u32).to_le_bytes());
+        psv[64..64 + name.len()].copy_from_slice(name);
+        shader(stage, &bytes)
+    }
+
+    #[test]
+    fn decoration_bake_names_require_opt_in_and_pixel_stage() {
+        for name in [b"PS_BakeDecorations_Test".as_slice(), b"PS_DecorationBlend_Test".as_slice()] {
+            let bake = bake_shader("pixel", 0, name);
+            assert!(!bake.is_decoration_bake(false));
+            assert!(bake.bake_entry.get().is_none());
+            assert!(bake.is_decoration_bake(true));
+            assert_eq!(bake.bake_entry.get(), Some(&true));
+            assert!(!bake.is_decoration_bake(false));
+        }
+        assert!(!bake_shader("compute", 0, b"PS_DecorationBlend_WrongStage").is_decoration_bake(true));
+        assert!(!bake_shader("pixel", 5, b"PS_DecorationBlend_WrongMetadata").is_decoration_bake(true));
+        assert!(!bake_shader("pixel", 0, b"PS_Unrelated").is_decoration_bake(true));
+        assert!(!shader("pixel", b"truncated shader").is_decoration_bake(true));
+    }
+
+    #[test]
+    fn decoration_bake_detection_retains_legacy_hash_fallback() {
+        let bake = Shader {
+            stage: "pixel",
+            hash: BAKE_PIXEL_SHADERS[0].into(),
+            container: Vec::new(),
+            #[cfg(windows)]
+            ambient: None,
+            bake_entry: OnceLock::new(),
+            #[cfg(windows)]
+            translated: OnceLock::new(),
+        };
+        assert!(bake.is_decoration_bake(false));
+        assert!(bake.is_decoration_bake(true));
+        assert!(bake.bake_entry.get().is_none());
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
