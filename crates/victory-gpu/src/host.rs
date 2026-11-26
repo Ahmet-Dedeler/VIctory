@@ -2355,6 +2355,10 @@ fn late_stage() -> u8 {
             Ok("3") => 3,
             // The relay alone: on top of stage 3.
             Err(_) if crate::shadow::relay() => 3,
+            // Mac layer: stage 3 without the relay (off on Darwin): late waits
+            // took world frames from 901 to 727 ms on the Mac (main session,
+            // 2026-11-26).
+            Err(_) if crate::mac::is_darwin() => 3,
             _ => 0,
         }
     })
