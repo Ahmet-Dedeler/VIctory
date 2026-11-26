@@ -59,7 +59,7 @@ RWByteAddressBuffer dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+// BUDGET is injected at compile time (default 2^30 on Darwin, 2^27 elsewhere).
 // The vertices or indices an instance from which a draw record runs empty.
 static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
@@ -291,14 +291,31 @@ pub(crate) fn amd(device: &ID3D12Device) -> bool {
     }
 }
 
+/// Power-of-two shift for the per-list indirect-work budget
+/// (`VICTORY_INDIRECT_BUDGET=<20..31>`; default `30` = 2^30 on Darwin so dense
+/// forest/swamp tree mesh dispatches do not oscillate between drawn and
+/// zeroed every frame, `27` elsewhere).
+pub(crate) fn budget_shift() -> u32 {
+    static SHIFT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SHIFT.get_or_init(|| {
+        if let Ok(raw) = std::env::var("VICTORY_INDIRECT_BUDGET")
+            && let Ok(n) = raw.trim().parse::<u32>()
+        {
+            return n.clamp(20, 31);
+        }
+        if crate::mac::is_darwin() { 30 } else { 27 }
+    })
+}
+
 /// Whether a record that does not fit in what is left of its list's budget
 /// takes the rest, so that every record after it runs empty too
 /// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
-/// runs). A list whose budget one garbage record empties loses all its later
-/// draws, and which record that is may differ from frame to frame. The frame
-/// line says how many records a frame are refused.
+/// runs; default `0` on Darwin so one large record cannot drop every tree draw
+/// after it in the list). A list whose budget one garbage record empties loses
+/// all its later draws, and which record that is may differ from frame to
+/// frame. The frame line says how many records a frame are refused.
 fn rest() -> u32 {
-    u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
+    u32::from(crate::mac::switch("VICTORY_INDIRECT_REST", false, true))
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
@@ -306,7 +323,12 @@ fn rest() -> u32 {
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     #[cfg(feature = "diagnostics")]
     let batched = source == batch::SOURCE;
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    let budget = 1u32 << budget_shift();
+    let source = &format!(
+        "#define BUDGET {budget}u\n#define WIDEST {}u\n#define REST {}\n{source}",
+        widest(amd(device)),
+        rest()
+    );
     // Mac layer: through `compile` (DXC under Wine); it says why it failed.
     let bytes = crate::host::compile(source, s!("main"), s!("cs_5_1"))?;
     // SAFETY: the compiled bytes; the root signature is inside the shader.

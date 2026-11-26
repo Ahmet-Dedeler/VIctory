@@ -50,11 +50,54 @@ fn kinds() -> &'static [(u64, u32, u32)] {
     })
 }
 
+/// Whether tiny compute-written textures (at most 16x16, non-depth — e.g.
+/// `CS_AutofocusSceneDepthScanFinalReduction`'s focus-distance reduction,
+/// auto-exposure, luminance probes) are also copied back into title memory
+/// (`VICTORY_TEXTURE_BACK_TINY=0` disables; off when `VICTORY_TEXTURE_BACK=0`).
+fn tiny_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !kinds().is_empty() && std::env::var_os("VICTORY_TEXTURE_BACK_TINY").is_none_or(|v| v != "0")
+    })
+}
+
+/// Depth/stencil DXGI formats that are never CPU-readable color/reduction UAVs.
+fn is_depth_format(format: u32) -> bool {
+    matches!(format, 19 | 20 | 39 | 40 | 44 | 45 | 54 | 55)
+}
+
+/// Whether `(width, height, format)` is a tiny reduction texture eligible for
+/// automatic readback (at most 16x16, <= 4 KiB even at RGBA32F).
+fn is_tiny_kind((w, h, format): (u64, u32, u32)) -> bool {
+    w > 0 && w <= 16 && h > 0 && h <= 16 && !is_depth_format(format)
+}
+
 /// Whether title texture `resource` is of a kind copied back.
 pub(crate) fn wanted(resource: This) -> bool {
     let kinds = kinds();
-    !kinds.is_empty()
-        && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
+    if kinds.is_empty() {
+        return false;
+    }
+    let Some(kind) = crate::resource::texture_kind(resource) else {
+        return false;
+    };
+    if kinds.contains(&kind) {
+        return true;
+    }
+    if tiny_enabled() && is_tiny_kind(kind) {
+        static SEEN: Mutex<std::collections::BTreeSet<(u64, u32, u32)>> =
+            Mutex::new(std::collections::BTreeSet::new());
+        if SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(kind) {
+            tracing::info!(
+                width = kind.0,
+                height = kind.1,
+                format = kind.2,
+                "copying back tiny UAV-written texture (VICTORY_TEXTURE_BACK_TINY=0 disables)"
+            );
+        }
+        return true;
+    }
+    false
 }
 
 /// An outstanding write to a specific allocation. Mapping and resource
@@ -269,5 +312,17 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn tiny_kind_filter_keeps_small_color_reductions_and_skips_depth() {
+        assert!(is_tiny_kind((1, 1, 2)));
+        assert!(is_tiny_kind((4, 4, 10)));
+        assert!(is_tiny_kind((16, 16, 41)));
+        assert!(!is_tiny_kind((0, 1, 2)));
+        assert!(!is_tiny_kind((32, 16, 2)));
+        assert!(!is_tiny_kind((1, 1, 40))); // D32_FLOAT
+        assert!(!is_tiny_kind((1, 1, 45))); // D24_UNORM_S8_UINT
+        assert!(!is_tiny_kind((1, 1, 55))); // D16_UNORM
     }
 }
