@@ -276,7 +276,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// indirect counts. Other cards stay at 65,535.
 fn widest(amd: bool) -> u32 {
     let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
-    if amd && on { 1 << 20 } else { 65_535 }
+    if (amd || crate::mac::is_darwin()) && on { 1 << 20 } else { 65_535 }
 }
 
 /// Whether `device` is an AMD card's.

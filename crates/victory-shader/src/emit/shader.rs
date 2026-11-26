@@ -94,6 +94,15 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes, read by
+/// a program with a ray-tracing node test (`image_bvh_intersect_ray`,
+/// `image_bvh64_intersect_ray`): not 0 while the title's structures have
+/// been built (its structure builder runs). While 0, every node test
+/// answers no hit without reading the node: a box node enters no child,
+/// any other node is a triangle missed. The title's passes run whether or
+/// not anything built the structures, and would otherwise walk whatever
+/// bytes lie where they would be.
+pub const USER_STRUCTURES: u32 = 0x107;
 
 /// `ShaderFlags` bits in the DXIL metadata.
 pub(crate) mod flags {
