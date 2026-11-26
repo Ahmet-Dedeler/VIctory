@@ -1081,6 +1081,13 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        // Ensure placed textures participating in copies hold mip 0 even when
+        // VICTORY_HELD_LEVELS initially made them from a smaller viewed mip;
+        // otherwise subresource indices and uncompressed->BC bit copies mismatch.
+        crate::resource::want_level(dst.resource, 0);
+        if src.kind != FOOTPRINT {
+            crate::resource::want_level(src.resource, 0);
+        }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the

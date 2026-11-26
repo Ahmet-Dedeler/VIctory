@@ -51,12 +51,16 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Resolves the traced reflections (`VICTORY_AMBIENT_REFLECT`).
+    Reflect,
 }
 
 /// The program's part in this, by its name in the container.
 pub(crate) fn role(container: &[u8]) -> Option<Role> {
     let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
-    if has(b"CS_ScreenProbes_TemporalResolve") {
+    if has(b"CS_TemporalResolve2_Opaque") || has(b"CS_TemporalResolve1_Alpha") {
+        Some(Role::Reflect)
+    } else if has(b"CS_ScreenProbes_TemporalResolve") {
         Some(Role::Resolve)
     } else if has(b"CS_CacheScreenSpaceRadiance") {
         Some(Role::Radiance)
@@ -75,6 +79,9 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where the reflections' resolves write them: the first of these places
+/// that holds a 2D R32_UINT image (opaque at first, alpha at second).
+pub(crate) const REFLECTIONS: [(u8, u32); 2] = [(1, 128), (1, 136)];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -109,6 +116,34 @@ fn air() -> f32 {
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+    })
+}
+
+/// The most a reflection may hold, as a multiple of the light around
+/// (`VICTORY_AMBIENT_REFLECT=<multiple>`; `0` or `off`: the title's own;
+/// unset: `1.0`, avatarmanz PR #314). Prevents glowing white eyes and
+/// sky-through-walls indoor glass when ray tracing is off.
+const REFLECT: f32 = 1.0;
+
+fn parse_reflect(set: &str) -> f32 {
+    let set = set.trim();
+    if set.is_empty() {
+        return REFLECT;
+    }
+    set.parse()
+        .ok()
+        .filter(|v: &f32| v.is_finite() && *v > 0.0)
+        .unwrap_or(0.0)
+}
+
+fn reflect() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let held = std::env::var("VICTORY_AMBIENT_REFLECT").map_or(REFLECT, |v| parse_reflect(&v));
+        if held > 0.0 && set() != Set::Off {
+            tracing::info!(held, "reflections held to a multiple of the light around (VICTORY_AMBIENT_REFLECT)");
+        }
+        held
     })
 }
 
@@ -331,6 +366,60 @@ void raise(uint3 at : SV_DispatchThreadID) {
 #endif
 "#;
 
+const HOLD_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define CX 64
+#define CY 36
+#define CELLS (CX * CY)
+#define PX 160
+#define PY 90
+cbuffer Set : register(b0) {
+    float level; float constant; float strength; float radius;
+    float near; float tan_y; uint width; uint height;
+    float follow; float most; float air; float unused;
+};
+RWTexture2D<uint> light : register(u0);
+RWStructuredBuffer<float4> cells : register(u1);
+RWStructuredBuffer<float4> points : register(u2);
+static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+float3 unpack(uint v) {
+    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+}
+uint pack(float3 c) {
+    c = clamp(c, 0.0, 65408.0);
+    float top = max(max(c.r, c.g), c.b);
+    int e = max(-15, int(floor(log2(max(top, 1e-12)))) + 1) + 15;
+    float scale = exp2(float(24 - e));
+    uint3 m = min(uint3(c * scale + 0.5), 511u);
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    light.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    float3 around = float3(1.0, 0.98, 0.94) * constant;
+    if (constant <= 0.0) {
+        float2 g = (float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY) - 0.5;
+        int2 g0 = int2(floor(g));
+        float2 f = g - float2(g0);
+        around = 0;
+        for (int k = 0; k < 4; k++) {
+            int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+            float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+            uint at0 = (q.y * PX + q.x) * 3;
+            around += b.x * b.y * float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+        }
+        around = lerp(around, cells[CELLS].rgb, 0.2);
+    }
+    float top = most * dot(around, LUMA);
+    float3 c = unpack(light[at.xy]);
+    float has = dot(c, LUMA);
+    if (has > top) light[at.xy] = pack(c * (top / has));
+}
+"#;
+
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
@@ -344,6 +433,7 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    hold: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -375,6 +465,16 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let hold_code = crate::host::compile(HOLD_SOURCE, s!("hold"), s!("cs_5_1"))?;
+    // SAFETY: same root signature layout as above.
+    let hold = unsafe {
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: hold_code.as_ptr().cast(), BytecodeLength: hold_code.len() },
+            ..Default::default()
+        };
+        device.CreateComputePipelineState(&desc)?
+    };
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -384,6 +484,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        hold,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -440,6 +541,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    if role == Role::Reflect && reflect() == 0.0 {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -459,7 +563,11 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    let most = match role {
+        Role::Reflect => reflect(),
+        _ => 4.0,
+    };
+    words[9] = most.to_bits();
     words[10] = air().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
@@ -485,6 +593,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Reflect => {
+                let [w, h] = views.size;
+                run(&pass.hold, w.div_ceil(8), h.div_ceil(8), 1);
+            }
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);

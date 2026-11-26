@@ -449,3 +449,36 @@ pub(crate) fn primitive_varyings() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| is_darwin() && crate::switch::on("VICTORY_MAC_PRIMITIVE_VARYINGS"))
 }
+
+/// Whether a vertex+pixel triangle pipeline whose pixel program reads
+/// non-provoking per-vertex values uses a pass-through geometry shader
+/// (`VICTORY_P10`/`VICTORY_P20`, pragyaangaur/VIctory-macOS#300) instead of
+/// `attributeAtVertex` (default on on Darwin; `VICTORY_VERTEX_DELTAS=0`: off).
+pub(crate) fn vertex_deltas() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| switch("VICTORY_VERTEX_DELTAS", true, false))
+}
+
+/// Whether over-32-KiB mesh pipelines (e.g. the 71 `MS_VS_PedTransform*`
+/// character shaders) are re-translated paired with their pixel shader to
+/// prune unread outputs so they fit Metal's 32 KiB limit instead of turning
+/// into D3DMetal no-ops (`pragyaangaur/VIctory-macOS#161`). Default on on
+/// Darwin (`VICTORY_LINK_MESH_OUTPUTS=0`: off).
+pub(crate) fn link_mesh_outputs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| switch("VICTORY_LINK_MESH_OUTPUTS", true, false))
+}
+
+/// Whether a mesh pipeline whose outputs still exceed Metal's 32 KiB limit
+/// (by packed or aligned Metal layout, `pragyaangaur/VIctory-macOS#282`) is
+/// refused instead of hanging D3DMetal. Default on on Darwin
+/// (`VICTORY_MESH_OVER_LIMIT=1`: allow).
+pub(crate) fn refuse_over_limit_mesh() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        match std::env::var_os("VICTORY_MESH_OVER_LIMIT") {
+            Some(v) => v == "0",
+            None => is_darwin(),
+        }
+    })
+}

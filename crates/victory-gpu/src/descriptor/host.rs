@@ -524,11 +524,11 @@ pub(crate) struct Spans {
 /// When a view the title writes makes an older view of other memory stale.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Rule {
-    /// When it starts where the older one starts: at the same address
-    /// with another length, or within the older one's first [`HEAD`]
-    /// bytes (or the older within its own). No two textures share the
-    /// block of their smallest levels. A view that only reaches into the
-    /// address range of an older texture's larger levels says nothing.
+    /// When its range overlaps the older one's and either starts within
+    /// the other's first [`HEAD`] bytes. Small textures can be adjacent
+    /// within that distance (for example, packed ped clothing palettes). A
+    /// view that only reaches into the address range of an older texture's
+    /// larger levels says nothing.
     #[default]
     Start,
     /// Whenever their spans at full size overlap (the rule until run
@@ -592,8 +592,8 @@ impl Spans {
         let clashing: Vec<u64> = match rule {
             Rule::Start => self
                 .by_start
-                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
-                .map(|(at, _)| *at)
+                .range(start.saturating_sub(HEAD - 1)..end.min(start.saturating_add(HEAD)))
+                .filter_map(|(at, span)| (span.0 > start).then_some(*at))
                 .collect(),
             Rule::Overlap | Rule::Never => self.overlapping(start, end),
         };
@@ -938,14 +938,22 @@ impl TextureQueue {
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        let mut rechecks: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+            let class = if w.checked.2 != 0 {
+                &mut rechecks
+            } else if w.looks > 0 || w.mapped > 0 {
+                &mut again
+            } else {
+                &mut fresh
+            };
             class.push((w.written, index, w.write));
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
+        rechecks.sort_unstable_by(newest_first);
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
@@ -955,6 +963,12 @@ impl TextureQueue {
                 old -= 1;
                 order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        for &(_, index, write) in &rechecks {
+            if order.len() >= max {
+                break;
+            }
+            order.push((index, write));
         }
         order.truncate(max);
         order
@@ -1046,6 +1060,32 @@ impl TextureQueue {
     /// waiting for such a look.
     fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, u64)> {
         self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
+    }
+
+    /// Of the slots `indices`, the ones that wait for their upload, due or
+    /// not and held or not, each with its write number as
+    /// [`TextureQueue::due`] hands it out: for a pass that has to bring
+    /// those very slots up to date now (`crate::draw::State::bake_sources`).
+    /// Not the ones uploaded whole that wait for another look.
+    fn queued(&self, indices: &[u32]) -> Vec<(u32, u64)> {
+        indices
+            .iter()
+            .filter_map(|&index| self.slots.get(&index).filter(|w| w.checked.2 == 0).map(|w| (index, w.write)))
+            .collect()
+    }
+
+    /// Puts the slots `indices` into the queue as written in `frame` and
+    /// due at once, unless they wait in it for their upload already: for
+    /// texture views a shader is about to pick by index whose host slot
+    /// shows nothing and which nothing would bring up to date. One uploaded
+    /// whole that waits for another look is put back too: that look would
+    /// find its memory unchanged and leave it.
+    fn requeue(&mut self, indices: &[u32], frame: u64) {
+        for &index in indices {
+            if self.slots.get(&index).is_none_or(|w| w.checked.2 != 0) {
+                self.written(index, frame, frame, false);
+            }
+        }
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -1783,6 +1823,16 @@ impl HostHeap {
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+    }
+
+    /// See [`TextureQueue::requeue`].
+    pub(crate) fn texture_slots_requeue(&self, indices: &[u32], frame: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).requeue(indices, frame);
+    }
+
+    /// See [`TextureQueue::queued`].
+    pub(crate) fn texture_slots_queued(&self, indices: &[u32]) -> Vec<(u32, u64)> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).queued(indices)
     }
 
     /// A number that changes when a slot is written or made due anew, and
@@ -5566,6 +5616,45 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // A draw makes a slot of the second texture: it is one of them.
         assert!(spans.note(9, b, b + 0x2c000, false).is_empty());
         assert_eq!(spans.by_slot.get(&9), Some(&b));
+    }
+
+    /// Two disjoint, sub-page textures (for example adjacent ped clothing
+    /// tint palettes) can share a 4 KiB page without replacing each other.
+    /// A write of genuinely overlapping memory still replaces its owner.
+    #[test]
+    fn adjacent_small_texture_views_stay() {
+        let first = (1, 0x10_000, 0x10_c00);
+        let second = (2, 0x10_c00, 0x11_700);
+        for order in [[first, second], [second, first]] {
+            let mut spans = Spans::default();
+            for (slot, start, end) in order {
+                assert!(spans.note(slot, start, end, true).is_empty());
+            }
+            assert_eq!(spans.slots_in(first.1, first.2), [first.0]);
+            assert_eq!(spans.slots_in(second.1, second.2), [second.0]);
+            // A draw sees another view of the same texture.
+            assert!(spans.note(3, first.1, first.2, false).is_empty());
+            assert_eq!(spans.slots_in(first.1, first.2), [1, 3]);
+            // A write overlapping the first texture still replaces it without touching the second.
+            assert_eq!(spans.note(4, 0x10_100, first.2, true), [1, 3]);
+            assert_eq!(spans.slots_in(second.1, second.2), [second.0]);
+        }
+    }
+
+    /// Already-uploaded recheck slots (e.g. small linear palettes) must not
+    /// starve fresh never-uploaded texture slots when `due` caps the batch.
+    #[test]
+    fn recheck_slots_do_not_starve_fresh() {
+        let mut q = TextureQueue::default();
+        for i in 0..5u32 {
+            q.written(i, 1, 1, false);
+            let w = q.slots[&i].write;
+            q.recheck(i, w, 2, (0x1000 * u64::from(i + 1), 0x400), 1, 0, 1, VIEW_TEXTURE_SMALL_LINEAR);
+        }
+        q.written(100, 2, 2, false);
+        let due: Vec<u32> = q.due(2, 3).into_iter().map(|(idx, _)| idx).collect();
+        assert_eq!(due[0], 100, "fresh slot must come ahead of rechecks");
+        assert_eq!(due.len(), 3);
     }
 
     /// A texture written where another starts replaces it: at the same

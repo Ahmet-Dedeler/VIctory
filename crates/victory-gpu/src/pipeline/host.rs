@@ -691,7 +691,15 @@ impl HostPipeline {
                     ps.translated().is_some_and(|t| crate::mac::feature_bits(&t.host.dxil) & 0x2_0000 != 0)
                 })
         };
-        if !(mesh.is_some() && crate::mac::primitive_varyings()) && per_vertex_refused() {
+        let host_topology = match g.topology.0 {
+            RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            _ => g.topology,
+        };
+        let try_vertex_deltas = mesh.is_none()
+            && g.topology.0 != RECTANGLES
+            && host_topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+            && crate::mac::vertex_deltas();
+        if !(mesh.is_some() && crate::mac::primitive_varyings()) && !try_vertex_deltas && per_vertex_refused() {
             return refuse("the pixel program reads per-vertex values (D3DMetal makes a no-op pipeline)", shaders);
         }
         if let Some(ms) = mesh {
@@ -712,12 +720,59 @@ impl HostPipeline {
                 );
                 mesh_pipeline(&host.device, &root, ms, ps, g, depth_bounds, &name)
             };
+            let shader_code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: bytes.as_ptr().cast(),
+                BytecodeLength: bytes.len(),
+            };
+            // On Darwin/D3DMetal, mesh shaders exceeding 32 KiB (packed or
+            // Metal's aligned layout — 71 `MS_VS_PedTransform*` character
+            // pipelines) silently become no-op PSOs or hang the queue
+            // (`pragyaangaur/VIctory-macOS#161`, `#282`). Prune unread outputs
+            // against the paired pixel shader first.
+            let mesh_bytes_of = |dxil: &[u8]| {
+                victory_shader::emit::mesh_output_bytes(dxil)
+                    .max(metal_mesh_bytes(dxil))
+            };
+            let pruned = if crate::mac::link_mesh_outputs()
+                && mesh_bytes_of(&ms.translated()?.host.dxil)
+                    .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT)
+            {
+                let ps_arg = find("pixel").and_then(|ps| {
+                    let dxil = ps.translated()?.host.dxil.as_slice();
+                    Some((ps.container.as_slice(), dxil))
+                });
+                match victory_shader::emit::translate_linked_mesh(&ms.container, ps_arg) {
+                    Ok(pair) => {
+                        tracing::info!(
+                            ?shaders,
+                            before = ?mesh_bytes_of(&ms.translated()?.host.dxil),
+                            after = ?mesh_bytes_of(&pair.0.dxil),
+                            "linked mesh outputs pruned to fit 32 KiB"
+                        );
+                        Some(pair)
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, ?shaders, "mesh output pruning unavailable");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let base_ms_host = pruned
+                .as_ref()
+                .map(|(m, _)| m)
+                .unwrap_or(&ms.translated()?.host);
             let linked = if crate::mac::primitive_varyings()
                 && let Some(ps) = find("pixel")
             {
+                let base_ps_host = pruned
+                    .as_ref()
+                    .and_then(|(_, p)| p.as_ref())
+                    .unwrap_or(&ps.translated()?.host);
                 match victory_shader::emit::link_mesh_primitive_varyings(
-                    (&ms.container, &ms.translated()?.host),
-                    (&ps.container, &ps.translated()?.host),
+                    (&ms.container, base_ms_host),
+                    (&ps.container, base_ps_host),
                 ) {
                     Ok(pair) => pair,
                     Err(error) => {
@@ -728,12 +783,14 @@ impl HostPipeline {
             } else {
                 None
             };
-            let shader_code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            };
-            let linked_pso = linked.as_ref().and_then(|(ms, ps)| {
-                match make(shader_code(&ms.dxil), shader_code(&ps.dxil), true) {
+            let linked_pso = linked.as_ref().and_then(|(ms_l, ps_l)| {
+                if crate::mac::refuse_over_limit_mesh()
+                    && mesh_bytes_of(&ms_l.dxil)
+                        .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT)
+                {
+                    return None;
+                }
+                match make(shader_code(&ms_l.dxil), shader_code(&ps_l.dxil), true) {
                     Ok(pso) => Some(pso),
                     Err(error) => {
                         tracing::warn!(%error, ?shaders, "host refused linked mesh pipeline, trying ordinary stages");
@@ -745,7 +802,24 @@ impl HostPipeline {
             if !used_linked && per_vertex_refused() {
                 return refuse("the pixel program reads per-vertex values (D3DMetal makes a no-op pipeline)", shaders);
             }
-            let pso = linked_pso.map_or_else(|| make(code(0), code(1), false), Ok);
+            if !used_linked
+                && crate::mac::refuse_over_limit_mesh()
+                && let Some(bytes) = mesh_bytes_of(&base_ms_host.dxil)
+                && bytes > victory_shader::emit::MESH_OUTPUT_LIMIT
+            {
+                tracing::warn!(
+                    ?shaders,
+                    bytes,
+                    "mesh outputs over Metal's 32 KiB after linking: pipeline refused (VICTORY_MESH_OVER_LIMIT=1 allows)"
+                );
+                return refuse("the mesh shader's outputs exceed Metal's 32 KiB limit", shaders);
+            }
+            let ordinary_ms = pruned.as_ref().map_or_else(|| code(0), |(m, _)| shader_code(&m.dxil));
+            let ordinary_ps = pruned
+                .as_ref()
+                .and_then(|(_, p)| p.as_ref())
+                .map_or_else(|| code(1), |p| shader_code(&p.dxil));
+            let pso = linked_pso.map_or_else(|| make(ordinary_ms, ordinary_ps, false), Ok);
             let pso = match pso {
                 Ok(pso) => pso,
                 Err(e) => {
@@ -783,12 +857,61 @@ impl HostPipeline {
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
         }
+        // Vertex+pixel triangle pipelines whose pixel shader uses
+        // `attributeAtVertex` on D3DMetal get a pass-through geometry stage
+        // emitting flat `VICTORY_P10`/`VICTORY_P20` deltas (#203 / PR #300).
+        let mut delta_ps = None;
+        let mut delta_gs = None;
+        if try_vertex_deltas && per_vertex_refused() {
+            let built = find("pixel").and_then(|ps| {
+                let ps_d = match victory_shader::emit::translate_vertex_deltas(&ps.container) {
+                    Ok(t) => t,
+                    Err(error) => {
+                        tracing::debug!(%error, ?shaders, "vertex delta pixel translation unavailable");
+                        return None;
+                    }
+                };
+                if crate::mac::feature_bits(&ps_d.dxil) & 0x2_0000 != 0
+                    || !victory_shader::emit::needs_vertex_deltas(&ps_d.dxil)
+                {
+                    return None;
+                }
+                let vs = &stages[0].0.translated()?.host.dxil;
+                match victory_shader::emit::vertex_delta_gs(vs, &ps_d.dxil) {
+                    Ok(gs) => Some((ps_d.dxil, gs)),
+                    Err(error) => {
+                        tracing::debug!(%error, ?shaders, "vertex delta geometry stage unavailable");
+                        None
+                    }
+                }
+            });
+            match built {
+                Some((ps_dxil, gs_dxil)) => {
+                    delta_ps = Some(ps_dxil);
+                    delta_gs = Some(gs_dxil);
+                }
+                None => {
+                    return refuse(
+                        "the pixel program reads per-vertex values (D3DMetal makes a no-op pipeline)",
+                        shaders,
+                    );
+                }
+            }
+        }
+        let ps_bytecode = delta_ps.as_ref().map_or_else(
+            || code(1),
+            |bytes| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: bytes.as_ptr().cast(),
+                BytecodeLength: bytes.len(),
+            },
+        );
+        let gs_stage = delta_gs.as_ref().or(rect_gs.as_ref());
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
-            PS: code(1),
-            GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+            PS: ps_bytecode,
+            GS: gs_stage.map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
                 D3D12_SHADER_BYTECODE {
                     pShaderBytecode: gs.as_ptr().cast(),
                     BytecodeLength: gs.len(),
@@ -805,29 +928,26 @@ impl HostPipeline {
             IBStripCutValue: g.strip_cut,
             // The console's rectangle and quad types draw as triangles on
             // the host (see `draw`).
-            PrimitiveTopologyType: match g.topology.0 {
-                RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                _ => g.topology,
-            },
+            PrimitiveTopologyType: host_topology,
             NumRenderTargets: g.targets.NumRenderTargets,
             RTVFormats: g.targets.RTFormats,
             DSVFormat: g.depth_format,
             SampleDesc: g.samples,
             ..Default::default()
         };
-        // A pipeline with the geometry stage has a name of its own in the
-        // library; the others keep theirs.
-        let name = |gs: Option<&Vec<u8>>| match gs {
-            Some(gs) => super::library::name(
-                "graphics rectangles",
+        // A pipeline with a synthesized geometry stage has a name of its own
+        // in the library; the others keep theirs.
+        let name = |kind: Option<(&str, &Vec<u8>)>| match kind {
+            Some((tag, gs)) => super::library::name(
+                tag,
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                &[&code_bytes(&code(0)), &code_bytes(&ps_bytecode), &gs[..]],
                 &state,
             ),
             None => super::library::name(
                 "graphics",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&code(0)), &code_bytes(&ps_bytecode)],
                 &state,
             ),
         };
@@ -843,7 +963,11 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(desc) },
             )
         };
-        let mut made = make(&desc, &name(rect_gs.as_ref()));
+        let initial_tag = delta_gs
+            .as_ref()
+            .map(|gs| ("graphics vertex deltas", gs))
+            .or_else(|| rect_gs.as_ref().map(|gs| ("graphics rectangles", gs)));
+        let mut made = make(&desc, &name(initial_tag));
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
@@ -855,12 +979,12 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(error = %e, ?shaders, deltas = delta_gs.is_some(), "host pipeline refused");
                 host.log_messages();
                 return None;
             }
         };
-        tracing::info!(?shaders, "host pipeline");
+        tracing::info!(?shaders, deltas = delta_gs.is_some(), "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -1132,6 +1256,63 @@ fn root_signature(
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
+}
+
+/// Output bytes as Apple's Metal counts them for a translated mesh shader
+/// (`pragyaangaur/VIctory-macOS#282`): per vertex, clip/cull distances,
+/// position, then remaining outputs in signature order, aligned to own size;
+/// same for primitives; multiplied by declared max counts.
+fn metal_mesh_bytes(dxil: &[u8]) -> Option<u64> {
+    let u32_at = |b: &[u8], at: usize| {
+        b.get(at..at + 4)
+            .map(|v| u32::from_le_bytes(v.try_into().expect("4 bytes")) as usize)
+    };
+    let part = |name: &[u8; 4]| {
+        (0..u32_at(dxil, 28)?).find_map(|i| {
+            let at = u32_at(dxil, 32 + 4 * i)?;
+            (dxil.get(at..at + 4)? == name)
+                .then(|| dxil.get(at + 8..at + 8 + u32_at(dxil, at + 4)?))
+                .flatten()
+        })
+    };
+    let elements = |name: &[u8; 4]| -> Option<Vec<(usize, u64)>> {
+        let Some(data) = part(name) else {
+            return Some(Vec::new());
+        };
+        (0..u32_at(data, 0)?)
+            .map(|i| {
+                let at = 8 + 32 * i;
+                let mask = *data.get(at + 24)?;
+                Some((u32_at(data, at + 12)?, u64::from(mask.count_ones())))
+            })
+            .collect()
+    };
+    const POSITION: usize = 1;
+    const DISTANCES: [usize; 2] = [2, 3];
+    let layout = |sizes: &mut dyn Iterator<Item = u64>| {
+        sizes
+            .filter(|&size| size > 0)
+            .fold(0, |end: u64, size| end.next_multiple_of(size) + size)
+    };
+    let vertex = elements(b"OSG1")?;
+    let distances = vertex
+        .iter()
+        .filter(|(kind, _)| DISTANCES.contains(kind))
+        .map(|&(_, n)| n)
+        .sum::<u64>();
+    let vertex_bytes = layout(
+        &mut std::iter::repeat_n(4u64, distances as usize)
+            .chain([16])
+            .chain(vertex.iter().filter(|e| e.0 != POSITION).map(|e| 4 * e.1)),
+    );
+    let primitive_bytes = layout(&mut elements(b"PSG1")?.iter().map(|e| 4 * e.1));
+    let info = part(b"PSV0")?.get(4..)?;
+    let maximum = |at: usize| {
+        Some(u64::from(u16::from_le_bytes(
+            info.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    Some(maximum(12)? * vertex_bytes + maximum(14)? * primitive_bytes)
 }
 
 #[cfg(test)]
