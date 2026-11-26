@@ -20,6 +20,8 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+use super::primitive_varyings::{Layout, Mode};
+
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
@@ -57,6 +59,8 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    /// Physical input signature channels read with `attributeAtVertex`.
+    pub vertex_fetches: Vec<(usize, u8)>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -120,20 +124,20 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
-    lower_impl(parts, counted, None)
+    lower_impl(parts, counted, Mode::Ordinary)
 }
 
-pub(super) fn lower_with_varyings(parts: &Parts, varyings: Option<&super::primitive_varyings::Layout>) -> Result<Lowered, ShaderError> {
-    match varyings {
-        Some(varyings) => lower_impl(parts, false, Some(varyings)),
-        None => lower(parts),
+pub(super) fn lower_with_varyings(parts: &Parts, mode: Mode<'_>) -> Result<Lowered, ShaderError> {
+    match mode {
+        Mode::Ordinary => lower(parts),
+        _ => lower_impl(parts, false, mode),
     }
 }
 
-fn lower_impl(parts: &Parts, counted: bool, varyings: Option<&super::primitive_varyings::Layout>) -> Result<Lowered, ShaderError> {
+fn lower_impl(parts: &Parts, counted: bool, mode: Mode<'_>) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, varyings).run(counted) {
+        match Lower::new(parts, &bad, mode).run(counted) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -283,7 +287,8 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
-    varyings: Option<&'a super::primitive_varyings::Layout>,
+    varyings: Option<&'a Layout>,
+    vertex_fetches: Option<std::collections::BTreeSet<(usize, u8)>>,
     mesh_varyings: Option<mesh_varyings::Staging>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
@@ -1632,7 +1637,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, varyings: Option<&'a super::primitive_varyings::Layout>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, mode: Mode<'a>) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1892,7 +1897,8 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
-            varyings,
+            varyings: mode.layout(),
+            vertex_fetches: matches!(mode, Mode::Discover).then(Default::default),
             mesh_varyings: None,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
@@ -2983,6 +2989,7 @@ impl<'a> Lower<'a> {
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
+            vertex_fetches: self.vertex_fetches.into_iter().flatten().collect(),
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -11472,6 +11479,9 @@ impl<'a> Lower<'a> {
                 return Err("a linked mesh payload component that is not a float");
             };
             return Ok(self.as_float(value));
+        }
+        if let Some(fetches) = &mut self.vertex_fetches {
+            fetches.insert((id, col));
         }
         if per_vertex_solved() {
             return Ok(self.solved_vertex_input(id, col)[usize::from(k)]);

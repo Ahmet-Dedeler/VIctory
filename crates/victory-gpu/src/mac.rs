@@ -440,3 +440,12 @@ pub(crate) fn feature_bits(dxil: &[u8]) -> u64 {
     })()
     .unwrap_or(0)
 }
+
+/// Whether a mesh pipeline's pixel program reads its per-vertex values from
+/// flat per-primitive outputs the mesh program writes (Darwin with
+/// `VICTORY_MAC_PRIMITIVE_VARYINGS=1`; off by default): no
+/// `attributeAtVertex`, which D3DMetal 4.0b3 cannot run.
+pub(crate) fn primitive_varyings() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| is_darwin() && crate::switch::on("VICTORY_MAC_PRIMITIVE_VARYINGS"))
+}

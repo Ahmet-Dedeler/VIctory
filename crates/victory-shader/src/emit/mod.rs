@@ -929,7 +929,14 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
-    emit_program_with_varyings(c, native, p, st, io, res, None)
+    emit_program_with_varyings(c, native, p, st, io, res, primitive_varyings::Mode::Ordinary)
+        .map(|e| (e.host, e.wave_size))
+}
+
+struct Emitted {
+    host: HostShader,
+    wave_size: Option<u32>,
+    vertex_fetches: Vec<(usize, u8)>,
 }
 
 fn emit_program_with_varyings(
@@ -939,8 +946,8 @@ fn emit_program_with_varyings(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
-    varyings: Option<&primitive_varyings::Layout>,
-) -> Result<(HostShader, Option<u32>), ShaderError> {
+    mode: primitive_varyings::Mode<'_>,
+) -> Result<Emitted, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -987,7 +994,7 @@ fn emit_program_with_varyings(
     for e in &mut prims {
         e.interp = 1;
     }
-    if let Some(layout) = varyings {
+    if let Some(layout) = mode.layout() {
         layout.extend_signatures(&native.io, &mut inputs, &outputs, &mut prims)?;
     }
     // A mesh group's id arrives multiplied by max(threads, vertices,
@@ -1017,7 +1024,7 @@ fn emit_program_with_varyings(
         outputs,
         prims,
         mesh_stride,
-    }, varyings)?;
+    }, mode)?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -1042,7 +1049,11 @@ fn emit_program_with_varyings(
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: l.half_views,
     };
-    Ok((shader, wave_size))
+    Ok(Emitted {
+        host: shader,
+        wave_size,
+        vertex_fetches: l.vertex_fetches,
+    })
 }
 
 /// The title's vertex output interpolation lives in PSV0. A float packed
