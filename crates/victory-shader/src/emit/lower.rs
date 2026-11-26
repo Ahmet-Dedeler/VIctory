@@ -1450,6 +1450,12 @@ thread_local! {
     /// `VICTORY_P10`/`VICTORY_P20` inputs fed by [`super::vertex_delta_gs`]
     /// instead of `dx.op.attributeAtVertex` ([`with_vertex_deltas`]).
     static VERTEX_DELTAS_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Last-resort fallback for mesh+pixel pipelines that still exceed Metal's
+    /// 32 KiB output budget even with packed `VICTORY_VERTEX_DATA`: evaluate
+    /// per-vertex `Interp::Weighted` at pixel center (`P0 = P1 = P2 = here`)
+    /// using native hardware interpolation, with zero extra mesh outputs and
+    /// zero `attributeAtVertex`/`SV_Barycentrics` ops.
+    static PER_VERTEX_CENTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// When set, arbitrary mesh outputs / pixel inputs not in this map are
     /// pruned so >32 KiB character mesh shaders fit Metal's 32 KiB limit.
     static KEPT_MESH_OUTPUTS: std::cell::RefCell<Option<KeptOutputs>> = const { std::cell::RefCell::new(None) };
@@ -1494,6 +1500,20 @@ pub(super) fn with_vertex_deltas<R>(translate: impl FnOnce() -> R) -> R {
 
 fn vertex_deltas_mode() -> bool {
     VERTEX_DELTAS_MODE.get()
+}
+
+/// Runs `translate` with per-vertex weighted reads evaluated at pixel center
+/// (`P0 = P1 = P2 = here`), requiring no `attributeAtVertex` and no extra
+/// primitive varyings.
+pub(super) fn with_per_vertex_center<R>(translate: impl FnOnce() -> R) -> R {
+    let before = PER_VERTEX_CENTER.replace(true);
+    let result = translate();
+    PER_VERTEX_CENTER.set(before);
+    result
+}
+
+fn per_vertex_center() -> bool {
+    PER_VERTEX_CENTER.get()
 }
 
 pub(super) fn host_max_wave() -> u32 {
@@ -11334,7 +11354,10 @@ impl<'a> Lower<'a> {
                 ..
             } => {
                 let mode = interp_mode(barycentric).ok_or("pull-model interpolation")?;
-                let eval = if !self.decoupled_per_vertex() && self.per_vertex(attribute.row) {
+                let eval = if !self.decoupled_per_vertex()
+                    && !per_vertex_center()
+                    && self.per_vertex(attribute.row)
+                {
                     // The element is read per vertex elsewhere, so it is
                     // constant: weigh its vertices with SV_Barycentrics.
                     let mut ij = [None; 2];
@@ -11376,12 +11399,20 @@ impl<'a> Lower<'a> {
             Interp::Vertex {
                 attribute,
                 vertex: 2,
+            } if per_vertex_center() && self.interpolated(attribute.row) => {
+                (attribute, Eval::Mode(2))
+            }
+            Interp::Vertex {
+                attribute,
+                vertex: 2,
             } => (attribute, Eval::Mode(1)),
             // P10 and P20: what the first and second halves weigh, P1 - P0
             // and P2 - P0, which is what the hardware holds for an
             // attribute the program also interpolates.
             Interp::Vertex { attribute, vertex }
-                if self.interpolated(attribute.row) || vertex_deltas_mode() =>
+                if self.interpolated(attribute.row)
+                    || vertex_deltas_mode()
+                    || per_vertex_center() =>
             {
                 let one = Some(self.s.m.f32(1f32.to_bits()));
                 let (i, j) = if vertex == 0 {
@@ -11563,6 +11594,23 @@ impl<'a> Lower<'a> {
             }
             let acc = acc.ok_or("an interpolation")?;
             return Ok(self.as_int(acc));
+        }
+        if per_vertex_center()
+            && let Eval::Weights { p0, .. } = eval
+        {
+            if !p0 {
+                // P1 - P0 = 0 and P2 - P0 = 0 when approximated at pixel center.
+                return Ok(self.s.m.i32(0));
+            }
+            let float = self.s.inputs[id].comp == 9;
+            let e = &mut self.s.inputs[id];
+            if e.usage == 0 {
+                e.interp = if float { 2 } else { 1 };
+            }
+            return match self.load_any_input(id, col) {
+                Val::I32(x) => Ok(x),
+                _ => Err("an input"),
+            };
         }
         let float = self.s.inputs[id].comp == 9;
         let mode = match eval {

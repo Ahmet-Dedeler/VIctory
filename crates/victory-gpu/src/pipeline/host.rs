@@ -710,12 +710,7 @@ impl HostPipeline {
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
             // looked up again.
-            let make = |ms: D3D12_SHADER_BYTECODE, ps: D3D12_SHADER_BYTECODE, paired: bool| {
-                let kind = if paired {
-                    "mesh triangles with primitive varyings"
-                } else {
-                    "mesh triangles"
-                };
+            let make = |ms: D3D12_SHADER_BYTECODE, ps: D3D12_SHADER_BYTECODE, kind: &str| {
                 // The emitted bytecode includes the payload mapping. No linked
                 // blob enters the shared stage cache or aliases an ordinary PSO.
                 let name = super::library::name(
@@ -793,7 +788,11 @@ impl HostPipeline {
                 {
                     return None;
                 }
-                match make(shader_code(&ms_l.dxil), shader_code(&ps_l.dxil), true) {
+                match make(
+                    shader_code(&ms_l.dxil),
+                    shader_code(&ps_l.dxil),
+                    "mesh triangles with primitive varyings",
+                ) {
                     Ok(pso) => Some(pso),
                     Err(error) => {
                         tracing::warn!(%error, ?shaders, "host refused linked mesh pipeline, trying ordinary stages");
@@ -801,7 +800,62 @@ impl HostPipeline {
                     }
                 }
             });
-            let used_linked = linked_pso.is_some();
+            let mut used_linked = linked_pso.is_some();
+            let center_pso = if !used_linked
+                && per_vertex_refused()
+                && crate::mac::per_vertex_center()
+                && let Some(ps) = find("pixel")
+            {
+                let base_ps_host = pruned
+                    .as_ref()
+                    .and_then(|(_, p)| p.as_ref())
+                    .unwrap_or(&ps.translated()?.host);
+                match victory_shader::emit::translate_linked_mesh_center(
+                    (&ms.container, &ms.translated()?.host),
+                    (&ps.container, base_ps_host),
+                ) {
+                    Ok((ms_c, ps_c)) => {
+                        let over = crate::mac::refuse_over_limit_mesh()
+                            && mesh_bytes_of(&ms_c.dxil)
+                                .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT);
+                        if over {
+                            tracing::warn!(
+                                ?shaders,
+                                bytes = ?mesh_bytes_of(&ms_c.dxil),
+                                "center-interpolated mesh still over Metal's 32 KiB limit"
+                            );
+                            None
+                        } else {
+                            match make(
+                                shader_code(&ms_c.dxil),
+                                shader_code(&ps_c.dxil),
+                                "mesh triangles center",
+                            ) {
+                                Ok(pso) => {
+                                    used_linked = true;
+                                    tracing::info!(
+                                        ?shaders,
+                                        bytes = ?mesh_bytes_of(&ms_c.dxil),
+                                        "linked mesh per-vertex center fallback"
+                                    );
+                                    Some(pso)
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, ?shaders, "host refused center-interpolated mesh pipeline");
+                                    None
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, ?shaders, "mesh center fallback unavailable");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let linked_pso = linked_pso.or(center_pso);
             if !used_linked && per_vertex_refused() {
                 return refuse("the pixel program reads per-vertex values (D3DMetal makes a no-op pipeline)", shaders);
             }
@@ -822,7 +876,7 @@ impl HostPipeline {
                 .as_ref()
                 .and_then(|(_, p)| p.as_ref())
                 .map_or_else(|| code(1), |p| shader_code(&p.dxil));
-            let pso = linked_pso.map_or_else(|| make(ordinary_ms, ordinary_ps, false), Ok);
+            let pso = linked_pso.map_or_else(|| make(ordinary_ms, ordinary_ps, "mesh triangles"), Ok);
             let pso = match pso {
                 Ok(pso) => pso,
                 Err(e) => {

@@ -539,6 +539,37 @@ pub fn translate_linked_mesh(
     Ok((linked_ms, linked_ps))
 }
 
+/// Last-resort fallback for mesh+pixel pipelines that use `attributeAtVertex`
+/// and still exceed Metal's 32 KiB output budget even with packed
+/// `VICTORY_VERTEX_DATA` (e.g. heavy vehicle/boat `PS_VehicleLivery*` and
+/// `PedPacked` pipelines): lowers the pixel shader's weighted per-vertex reads
+/// to hardware center interpolation (`P0 = P1 = P2 = here`) and prunes unread
+/// arbitrary mesh outputs so the pair fits Metal's 32 KiB limit while keeping
+/// the original root signature bindings.
+pub fn translate_linked_mesh_center(
+    mesh: (&[u8], &HostShader),
+    pixel: (&[u8], &HostShader),
+) -> Result<(HostShader, HostShader), ShaderError> {
+    let ps_center = lower::with_per_vertex_center(|| translate(pixel.0))?;
+    let reads = pixel_input_reads(&ps_center.dxil)?;
+    if let Ok((pruned_ms, pruned_ps)) = lower::with_kept_mesh_outputs(reads, || {
+        let m = translate(mesh.0)?;
+        let p = lower::with_per_vertex_center(|| translate(pixel.0))?;
+        Ok::<_, ShaderError>((m, p))
+    }) && primitive_varyings::same_bindings(mesh.1, &pruned_ms)
+        && primitive_varyings::same_bindings(pixel.1, &pruned_ps)
+    {
+        return Ok((pruned_ms, pruned_ps));
+    }
+    if !primitive_varyings::same_bindings(pixel.1, &ps_center) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "center-interpolated pixel shader changes a resource binding",
+        });
+    }
+    Ok((mesh.1.clone(), ps_center))
+}
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let p = Prepared::parse(container)?;
     emit(&p.container, &p.native, &p.ir, &p.structured, &p.io, &p.resources)

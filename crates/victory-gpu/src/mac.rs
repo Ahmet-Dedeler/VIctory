@@ -469,6 +469,16 @@ pub(crate) fn link_mesh_outputs() -> bool {
     *ON.get_or_init(|| switch("VICTORY_LINK_MESH_OUTPUTS", true, false))
 }
 
+/// Whether a mesh+pixel pipeline whose `attributeAtVertex` pixel shader still
+/// exceeds Metal's 32 KiB output budget after packed `VICTORY_VERTEX_DATA`
+/// linking falls back to hardware center interpolation (no `attributeAtVertex`,
+/// no extra primitive outputs; recovers heavy vehicle/boat/ped shaders).
+/// Default on on Darwin (`VICTORY_PER_VERTEX_CENTER=0`: off).
+pub(crate) fn per_vertex_center() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| switch("VICTORY_PER_VERTEX_CENTER", true, false))
+}
+
 /// Whether a mesh pipeline whose outputs still exceed Metal's 32 KiB limit
 /// (by packed or aligned Metal layout, `pragyaangaur/VIctory-macOS#282`) is
 /// refused instead of hanging D3DMetal. Default on on Darwin

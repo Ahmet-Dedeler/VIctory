@@ -307,7 +307,7 @@ pub fn link_mesh_primitive_varyings(
     Ok(Some((linked_mesh, linked_pixel)))
 }
 
-fn same_bindings(a: &HostShader, b: &HostShader) -> bool {
+pub(super) fn same_bindings(a: &HostShader, b: &HostShader) -> bool {
     let HostShader {
         stage,
         dxil: _,
