@@ -7,7 +7,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-use windows::Win32::Graphics::Direct3D12::ID3D12Fence;
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_FEATURE_D3D12_OPTIONS, D3D12_FEATURE_DATA_D3D12_OPTIONS, ID3D12Device, ID3D12Fence,
+};
 use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -292,6 +294,36 @@ pub(crate) fn wave_lanes(dxil: &[u8]) -> Option<u32> {
     })?;
     let (min, max) = (u32_at(info, 4 + 16)? as u32, u32_at(info, 4 + 20)? as u32);
     (min != 0 && min == max).then_some(min)
+}
+
+/// D3DMetal can abort in the converter on a double-precision wave operation.
+/// Respect the adapter's reported lack of FP64 before creating that pipeline.
+pub(crate) fn refuses_compute_doubles(device: &ID3D12Device, dxil: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+
+    if !is_darwin() {
+        return false;
+    }
+    let Ok(container) = Container::parse(dxil) else { return false };
+    let Some(features) = container.part(FourCC::SFI0) else { return false };
+    let Some(bits) = features.data.get(..8).and_then(|bytes| bytes.try_into().ok()) else { return false };
+    // D3D_SHADER_REQUIRES_DOUBLES in the container's feature mask.
+    if u64::from_le_bytes(bits) & 1 == 0 {
+        return false;
+    }
+    static NO_DOUBLES: OnceLock<bool> = OnceLock::new();
+    *NO_DOUBLES.get_or_init(|| {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: the feature query writes exactly the provided options structure.
+        let ok = unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                std::mem::size_of_val(&options) as u32,
+            )
+        };
+        ok.is_ok() && !options.DoublePrecisionFloatShaderOps.as_bool()
+    })
 }
 
 /// Diagnostics: every frame's time, logged every five seconds in the form the
