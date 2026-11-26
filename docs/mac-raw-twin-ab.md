@@ -1,6 +1,6 @@
 # Raw descriptor twin A/B and Metal attribution
 
-Use the diagnostics build from `codex/raw-twin-ab-ready`. Leave bake-name detection and packed slots at their defaults for this comparison. The packed-slot representation is chosen when the heap is built and stays fixed for the run.
+Use a diagnostics build of `agent/one`. `VICTORY_RAW_TWIN_COPY` is off by default; naming it in `VICTORY_AB` switches it per phase. (Codex's packed slot allocator was not ported.)
 
 ## One-run descriptor comparison
 
