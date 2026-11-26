@@ -111,6 +111,7 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, style, show) = quiet(ex_style, style);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -118,6 +119,10 @@ pub extern "system" fn CreateWindowExW(
         )
     };
     hook(hwnd);
+    if show {
+        ShowWindow(hwnd, wm::SW_SHOW);
+    }
+    placed(hwnd, parent);
     hwnd
 }
 
@@ -137,6 +142,7 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, style, show) = quiet(ex_style, style);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -144,7 +150,61 @@ pub extern "system" fn CreateWindowExA(
         )
     };
     hook(hwnd);
+    if show {
+        ShowWindow(hwnd, wm::SW_SHOW);
+    }
+    placed(hwnd, parent);
     hwnd
+}
+
+/// Says where a background run's top-level window is once made and shown
+/// (the host may have moved it from where we asked).
+fn placed(hwnd: HWND, parent: HWND) {
+    if hwnd.is_null() || !parent.is_null() || !victory_gpu::background() {
+        return;
+    }
+    let mut at = RECT::default();
+    // SAFETY: a window this thread just made; `at` receives its rectangle.
+    unsafe { wm::GetWindowRect(hwnd, &mut at) };
+    tracing::info!(
+        left = at.left,
+        top = at.top,
+        width = at.right - at.left,
+        height = at.bottom - at.top,
+        "background run: title window placed"
+    );
+}
+
+/// In a background run (`victory_gpu::background`) a title window never
+/// becomes the active one: its styles with `WS_EX_NOACTIVATE` and without
+/// `WS_VISIBLE`, and whether to show it (our [`ShowWindow`]) once made.
+fn quiet(ex_style: u32, style: u32) -> (u32, u32, bool) {
+    if !victory_gpu::background() {
+        return (ex_style, style, false);
+    }
+    (
+        ex_style | wm::WS_EX_NOACTIVATE,
+        style & !wm::WS_VISIBLE,
+        style & wm::WS_VISIBLE != 0,
+    )
+}
+
+/// The host's, except in a background run: there every way of showing a
+/// window shows it where it is in the window order, not activated, and
+/// behind the others.
+pub extern "system" fn ShowWindow(hwnd: HWND, command: i32) -> i32 {
+    let command = match command {
+        wm::SW_HIDE | wm::SW_MINIMIZE | wm::SW_SHOWMINNOACTIVE | wm::SW_FORCEMINIMIZE => command,
+        wm::SW_SHOWMINIMIZED if victory_gpu::background() => wm::SW_SHOWMINNOACTIVE,
+        _ if victory_gpu::background() => wm::SW_SHOWNOACTIVATE,
+        _ => command,
+    };
+    // SAFETY: the title's own call, forwarded.
+    let shown = unsafe { wm::ShowWindow(hwnd, command) };
+    if command == wm::SW_SHOWNOACTIVATE {
+        victory_gpu::background_behind(hwnd.cast());
+    }
+    shown
 }
 
 /// A console title sizes its window to its render target (
@@ -160,14 +220,22 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
         unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
     let limit = window_limit();
     let fitted = fit_with_limit(&area, width, height, limit);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
-        return (x, y, width, height);
+    let (x, y, width, height) = if !parent.is_null() || known == 0 || fitted == (width, height) {
+        (x, y, width, height)
+    } else {
+        tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
+        let (w, h) = fitted;
+        let left = area.left + (area.right - area.left - w) / 2;
+        let top = area.top + (area.bottom - area.top - h) / 2;
+        (left, top, w, h)
+    };
+    // Mac layer: a background run's windows are off the visible desktop.
+    if parent.is_null()
+        && let Some((left, top)) = victory_gpu::background_window()
+    {
+        return (left, top, width, height);
     }
-    tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
-    let (w, h) = fitted;
-    let left = area.left + (area.right - area.left - w) / 2;
-    let top = area.top + (area.bottom - area.top - h) / 2;
-    (left, top, w, h)
+    (x, y, width, height)
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
@@ -398,6 +466,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(UnregisterAppConstrainedChangeNotification),
             hle_export!(CreateWindowExW),
             hle_export!(CreateWindowExA),
+            hle_export!(ShowWindow),
         ],
     }
 }

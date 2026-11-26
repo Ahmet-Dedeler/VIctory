@@ -33,6 +33,8 @@ fn images() -> std::sync::MutexGuard<'static, Vec<Mapped>> {
 pub(crate) fn mapped(image: &LoadedImage) {
     // SAFETY: reads our own static, so the linker keeps it (and its section).
     unsafe { std::ptr::from_ref(&ON_THREAD).read_volatile() };
+    #[cfg(windows)]
+    crate::crash::note_image(image.base(), image.info().size_of_image as usize);
     let image = Arc::new(image.clone());
     let mut images = images();
     images.retain(|m| m.image.base() != image.base());
