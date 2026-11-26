@@ -331,6 +331,14 @@ pub(crate) fn presented() {
             (crate::draw::drawn() - f.drawn) / f.each.len() as u64,
             each.join(" ")
         );
+        // The line `xcl-mac/tools/phases.py` and the shared harness read draws from.
+        let mean = f.each.iter().map(|&m| f64::from(m)).sum::<f64>() / f.each.len() as f64;
+        tracing::info!(
+            target: "victory_gpu::framelog",
+            "usual frame (the mean of {}): {mean:.0} ms | {} draws |",
+            f.each.len(),
+            (crate::draw::drawn() - f.drawn) / f.each.len() as u64
+        );
         f.each.clear();
         f.began = now;
         f.drawn = crate::draw::drawn();
