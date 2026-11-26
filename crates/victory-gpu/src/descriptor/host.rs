@@ -524,11 +524,10 @@ pub(crate) struct Spans {
 /// When a view the title writes makes an older view of other memory stale.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Rule {
-    /// When it starts where the older one starts: at the same address
-    /// with another length, or within the older one's first [`HEAD`]
-    /// bytes (or the older within its own). No two textures share the
-    /// block of their smallest levels. A view that only reaches into the
-    /// address range of an older texture's larger levels says nothing.
+    /// When its range overlaps the older one's and either starts within
+    /// the other's first [`HEAD`] bytes. Small textures can be adjacent
+    /// within that distance. A view that only reaches into the address
+    /// range of an older texture's larger levels says nothing.
     #[default]
     Start,
     /// Whenever their spans at full size overlap (the rule until run
@@ -592,8 +591,8 @@ impl Spans {
         let clashing: Vec<u64> = match rule {
             Rule::Start => self
                 .by_start
-                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
-                .map(|(at, _)| *at)
+                .range(start.saturating_sub(HEAD - 1)..end.min(start.saturating_add(HEAD)))
+                .filter_map(|(at, span)| (span.0 > start).then_some(*at))
                 .collect(),
             Rule::Overlap | Rule::Never => self.overlapping(start, end),
         };
@@ -5143,6 +5142,29 @@ mod tests {
         // A draw makes a slot of the second texture: it is one of them.
         assert!(spans.note(9, b, b + 0x2c000, false).is_empty());
         assert_eq!(spans.by_slot.get(&9), Some(&b));
+    }
+
+    /// Two disjoint, sub-page textures can share a page without replacing
+    /// each other. A write of genuinely overlapping memory still replaces
+    /// its owner.
+    #[test]
+    fn adjacent_small_texture_views_stay() {
+        let first = (1, 0x10_000, 0x10_c00);
+        let second = (2, 0x10_c00, 0x11_700);
+        for order in [[first, second], [second, first]] {
+            let mut spans = Spans::default();
+            for (slot, start, end) in order {
+                assert!(spans.note(slot, start, end, true).is_empty());
+            }
+            assert_eq!(spans.slots_in(first.1, first.2), [first.0]);
+            assert_eq!(spans.slots_in(second.1, second.2), [second.0]);
+            // The draw sees another view of the same texture.
+            assert!(spans.note(3, first.1, first.2, false).is_empty());
+            assert_eq!(spans.slots_in(first.1, first.2), [1, 3]);
+            // This write stays within the first texture.
+            assert_eq!(spans.note(4, 0x10_100, first.2, true), [1, 3]);
+            assert_eq!(spans.slots_in(second.1, second.2), [second.0]);
+        }
     }
 
     /// A texture written where another starts replaces it: at the same
