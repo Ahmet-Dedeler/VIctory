@@ -301,7 +301,11 @@ pub(crate) fn wave_lanes(dxil: &[u8]) -> Option<u32> {
 pub(crate) fn refuses_compute_doubles(device: &ID3D12Device, dxil: &[u8]) -> bool {
     use victory_shader::{Container, FourCC};
 
-    if !is_darwin() {
+    // Only with the paired Wave64 form on (`VICTORY_WAVE_PAIRS`), which is
+    // what newly sends these programs to Apple's converter: without it the
+    // pipelines made before stay made.
+    static PAIRS: OnceLock<bool> = OnceLock::new();
+    if !is_darwin() || !*PAIRS.get_or_init(|| crate::switch::on("VICTORY_WAVE_PAIRS")) {
         return false;
     }
     let Ok(container) = Container::parse(dxil) else { return false };
