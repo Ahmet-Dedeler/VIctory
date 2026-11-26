@@ -463,6 +463,26 @@ pub fn mesh_output_bytes(dxil: &[u8]) -> Option<u64> {
     ))
 }
 
+/// Whether a console pixel shader's ordinary translation emits
+/// `dx.op.attributeAtVertex` (as opposed to only reading `SV_Barycentrics`,
+/// which sets the same `SFI0` `FEATURE_BARYCENTRICS` bit `0x2_0000` even though
+/// Apple's Metal IR Converter accepts `SV_Barycentrics` cleanly).
+pub fn uses_attribute_at_vertex(container: &[u8]) -> bool {
+    let Ok(p) = Prepared::parse(container) else {
+        return true;
+    };
+    if p.native.stage != HwStage::Ps {
+        return false;
+    }
+    p.io.interps.iter().any(|(_, i)| match *i {
+        io::Interp::Weighted { .. } => true,
+        io::Interp::Vertex { attribute, vertex } => {
+            vertex != 2 && primitive_varyings::interpolates(&p.io, attribute.row)
+        }
+        io::Interp::Interpolated { .. } => false,
+    })
+}
+
 /// Arbitrary (`kind == 0`) input channels read by an emitted pixel shader,
 /// keyed by `(UPPERCASE_NAME, semantic_index)` -> 4-bit absolute channel mask.
 fn pixel_input_reads(dxil: &[u8]) -> Result<lower::KeptOutputs, ShaderError> {

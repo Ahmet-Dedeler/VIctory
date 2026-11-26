@@ -11,7 +11,7 @@ use crate::io::{Interp, Io};
 use crate::native::{MeshIo, StageIo};
 use crate::{Container, FourCC, ShaderError};
 
-const SEMANTIC: &str = "VICTORY_VERTEX_DATA";
+pub(super) const SEMANTIC: &str = "VICTORY_VERTEX_DATA";
 const SIGNATURE_ROWS: u32 = 32;
 const SHARED_LIMIT: u32 = 28 * 1024;
 
@@ -20,10 +20,23 @@ pub(super) struct Field {
     /// Signature element ID and its relative component.
     pub mesh: (usize, u8),
     pub pixel: (usize, u8),
+    /// Console 16-bit float varying: pack two corners per u32 dword in
+    /// `VICTORY_VERTEX_DATA` (`legacyF32ToF16` / `legacyF16ToF32`) so linked
+    /// ped, gun, glass, and vehicle mesh pipelines stay within Metal's 32 KiB
+    /// output budget and 32 signature rows with exact 16-bit fidelity.
+    pub half: bool,
+    /// Starting slot: dword index for `!half` fields (3 dwords each), or
+    /// half-slot index for `half` fields (3 half-slots each, packed 2/dword
+    /// starting at `Layout::f32_dwords`).
+    pub slot: usize,
 }
 
 pub(super) struct Layout {
     pub fields: Vec<Field>,
+    /// Number of leading `u32` payload slots occupied by full 32-bit fields.
+    pub f32_dwords: usize,
+    /// Total `u32` payload dwords carried per primitive in `VICTORY_VERTEX_DATA`.
+    pub dwords: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -65,12 +78,25 @@ fn cannot_link(what: &'static str) -> ShaderError {
     ShaderError::Unsupported { offset: 0, what }
 }
 
-fn signature_rows(elements: &[SigElement]) -> u32 {
+fn used_row_mask(elements: &[SigElement]) -> u32 {
     elements
         .iter()
         .filter_map(|e| e.row)
-        .max()
-        .map_or(0, |r| r.saturating_add(1))
+        .filter(|&r| r < SIGNATURE_ROWS)
+        .fold(0u32, |m, r| m | (1u32 << r))
+}
+
+fn free_rows(used: u32, count: u32) -> Option<Vec<u32>> {
+    let mut rows = Vec::with_capacity(count as usize);
+    for r in 0..SIGNATURE_ROWS {
+        if used & (1u32 << r) == 0 {
+            rows.push(r);
+            if rows.len() == count as usize {
+                return Some(rows);
+            }
+        }
+    }
+    None
 }
 
 impl Layout {
@@ -115,12 +141,36 @@ impl Layout {
                     "a per-vertex channel without an unambiguous float varying",
                 ));
             }
+            let half = input.half
+                || output.half
+                || ms
+                    .outputs
+                    .iter()
+                    .any(|o| Some(u32::from(o.row)) == output.row && o.fp16);
             fields.push(Field {
                 mesh: (ms_id, column),
                 pixel: (ps_id, column),
+                half,
+                slot: 0,
             });
         }
-        Ok(Some(Self { fields }))
+        let mut f32_dwords = 0usize;
+        let mut half_slots = 0usize;
+        for field in &mut fields {
+            if field.half {
+                field.slot = half_slots;
+                half_slots += 3;
+            } else {
+                field.slot = f32_dwords;
+                f32_dwords += 3;
+            }
+        }
+        let dwords = f32_dwords + half_slots.div_ceil(2);
+        Ok(Some(Self {
+            fields,
+            f32_dwords,
+            dwords,
+        }))
     }
 
     pub fn shared_dwords(&self, ms: &MeshIo) -> u32 {
@@ -130,7 +180,7 @@ impl Layout {
     }
 
     pub fn rows(&self) -> usize {
-        (self.fields.len() * 3).div_ceil(4)
+        self.dwords.div_ceil(4)
     }
 
     pub fn extend_signatures(
@@ -140,21 +190,38 @@ impl Layout {
         outputs: &[SigElement],
         prims: &mut Vec<SigElement>,
     ) -> Result<(), ShaderError> {
-        let channels = (self.fields.len() as u32) * 3;
-        let (target, rows_elsewhere) = match stage {
-            StageIo::Ps { .. } => (inputs, 0),
-            StageIo::Ms(_) => (&mut *prims, signature_rows(outputs)),
+        let channels = self.dwords as u32;
+        let needed_rows = channels.div_ceil(4);
+        let mut active_outputs = outputs.to_vec();
+        let mut active_inputs = inputs.clone();
+        let mut active_prims = prims.clone();
+        if matches!(stage, StageIo::Ms(_)) {
+            lower::apply_kept_mesh_outputs(&mut active_outputs);
+            lower::apply_kept_mesh_outputs(&mut active_prims);
+        } else if matches!(stage, StageIo::Ps { .. }) {
+            lower::apply_kept_mesh_outputs(&mut active_inputs);
+        }
+        let (target, active_target, rows_elsewhere) = match stage {
+            StageIo::Ps { .. } => (inputs, active_inputs.as_slice(), 0u32),
+            StageIo::Ms(_) => (
+                &mut *prims,
+                active_prims.as_slice(),
+                used_row_mask(&active_outputs).count_ones(),
+            ),
             _ => {
                 return Err(cannot_link(
                     "a linked varying outside mesh and pixel stages",
                 ));
             }
         };
-        let start = signature_rows(target);
-        if start
-            .saturating_add(channels.div_ceil(4))
+        let used = used_row_mask(active_target);
+        let assigned = free_rows(used, needed_rows);
+        if used
+            .count_ones()
+            .saturating_add(needed_rows)
             .saturating_add(rows_elsewhere)
             > SIGNATURE_ROWS
+            || assigned.is_none()
             || target
                 .iter()
                 .chain(outputs)
@@ -164,22 +231,27 @@ impl Layout {
                 "a linked varying exceeds or conflicts with the signature layout",
             ));
         }
-        for row in 0..channels.div_ceil(4) {
-            target.push(SigElement {
+        let assigned = assigned.unwrap();
+        for (row, &reg) in assigned.iter().enumerate() {
+            let elem = SigElement {
                 name: SEMANTIC.into(),
-                index: row,
+                index: row as u32,
                 kind: 0,
-                comp: 9,
+                comp: 5,
                 interp: 1,
-                row: Some(start + row),
+                row: Some(reg),
                 col: 0,
-                cols: (channels - row * 4).min(4) as u8,
+                cols: (channels - row as u32 * 4).min(4) as u8,
                 usage: 0,
                 half: false,
-            });
+            };
+            target.push(elem.clone());
+            if matches!(stage, StageIo::Ms(_)) {
+                active_prims.push(elem);
+            }
         }
         if let StageIo::Ms(ms) = stage {
-            if mesh_output_bytes(outputs, prims, ms.max_vertices, ms.max_primitives)
+            if mesh_output_bytes(&active_outputs, &active_prims, ms.max_vertices, ms.max_primitives)
                 > MESH_OUTPUT_LIMIT
                 || ms
                     .lds_bytes
@@ -216,7 +288,15 @@ pub fn link_mesh_primitive_varyings(
     }
     let ps = Prepared::parse(pixel.0)?;
     let ms = Prepared::parse(mesh.0)?;
-    let Some((linked_mesh, linked_pixel)) = link_pair(ms, ps)? else {
+    let Some((linked_mesh, linked_pixel)) = link_pair(&ms, &ps, true)? else {
+        return Ok(None);
+    };
+    if same_bindings(mesh.1, &linked_mesh) && same_bindings(pixel.1, &linked_pixel) {
+        return Ok(Some((linked_mesh, linked_pixel)));
+    }
+    // If pruning an unread output dropped a resource binding, retry unpruned
+    // so the pipeline keeps its original root signature.
+    let Some((linked_mesh, linked_pixel)) = link_pair(&ms, &ps, false)? else {
         return Ok(None);
     };
     if !same_bindings(mesh.1, &linked_mesh) || !same_bindings(pixel.1, &linked_pixel) {
@@ -251,17 +331,21 @@ fn same_bindings(a: &HostShader, b: &HostShader) -> bool {
         && *half_views == b.half_views
 }
 
-fn link_pair(ms: Prepared, ps: Prepared) -> Result<Option<(HostShader, HostShader)>, ShaderError> {
+fn link_pair(
+    ms: &Prepared,
+    ps: &Prepared,
+    prune: bool,
+) -> Result<Option<(HostShader, HostShader)>, ShaderError> {
     let StageIo::Ms(mesh_io) = &ms.native.io else {
         return Ok(None);
     };
-    let outputs = ms
+    let mut outputs = ms
         .container
         .part(FourCC::OSG1)
         .map(|p| signature(p.data))
         .transpose()?
         .unwrap_or_default();
-    let inputs = ps
+    let mut inputs = ps
         .container
         .part(FourCC::ISG1)
         .map(|p| signature(p.data))
@@ -271,12 +355,57 @@ fn link_pair(ms: Prepared, ps: Prepared) -> Result<Option<(HostShader, HostShade
     // packed f16 attribute, GX register halves can map to different host
     // signature elements and columns. Carry the *expanded* producer values
     // and let the existing pixel code do the same f16 conversion as before.
-    let discovery = emit(&ps, Mode::Discover)?;
+    let discovery = emit(ps, Mode::Discover)?;
+    if discovery.vertex_fetches.is_empty() {
+        return Ok(None);
+    }
+    if prune {
+        let mut keep = super::pixel_input_reads(&discovery.host.dxil)?;
+        let mut fetch_keys = Vec::with_capacity(discovery.vertex_fetches.len());
+        for &(ps_id, col) in &discovery.vertex_fetches {
+            let inp = inputs
+                .get(ps_id)
+                .filter(|e| col < e.cols)
+                .ok_or_else(|| {
+                    cannot_link("a per-vertex channel missing from the pixel signature")
+                })?;
+            let key = (inp.name.to_ascii_uppercase(), inp.index);
+            let abs_col = inp.col + col;
+            *keep.entry(key.clone()).or_insert(0) |= 1u8 << abs_col;
+            fetch_keys.push((key, abs_col));
+        }
+        lower::prune_signature(&mut outputs, &keep);
+        lower::prune_signature(&mut inputs, &keep);
+        let mut pruned_fetches = Vec::with_capacity(fetch_keys.len());
+        for (key, abs_col) in fetch_keys {
+            let (ps_id, inp) = inputs
+                .iter()
+                .enumerate()
+                .find(|(_, e)| {
+                    e.name.to_ascii_uppercase() == key.0
+                        && e.index == key.1
+                        && abs_col >= e.col
+                        && abs_col < e.col + e.cols
+                })
+                .ok_or_else(|| {
+                    cannot_link("a per-vertex channel missing from the pixel signature")
+                })?;
+            pruned_fetches.push((ps_id, abs_col - inp.col));
+        }
+        let Some(layout) = Layout::new(mesh_io, &outputs, &inputs, &pruned_fetches)? else {
+            return Ok(None);
+        };
+        let mode = Mode::Linked(&layout);
+        let linked = lower::with_kept_mesh_outputs(keep, || {
+            Ok::<_, ShaderError>((emit(ms, mode)?.host, emit(ps, mode)?.host))
+        })?;
+        return Ok(Some(linked));
+    }
     let Some(layout) = Layout::new(mesh_io, &outputs, &inputs, &discovery.vertex_fetches)? else {
         return Ok(None);
     };
     let mode = Mode::Linked(&layout);
-    Ok(Some((emit(&ms, mode)?.host, emit(&ps, mode)?.host)))
+    Ok(Some((emit(ms, mode)?.host, emit(ps, mode)?.host)))
 }
 
 fn emit(p: &Prepared, mode: Mode<'_>) -> Result<Emitted, ShaderError> {
@@ -466,7 +595,7 @@ mod tests {
         let ordinary = emit(&pixel, Mode::Discover).unwrap();
         let expected: &[(usize, u8)] = if packed { &[(0, 0), (0, 1)] } else { &[(0, 0)] };
         assert_eq!(ordinary.vertex_fetches, expected);
-        let (mesh, pixel) = link_pair(mesh, pixel).unwrap().expect("linked fixture");
+        let (mesh, pixel) = link_pair(&mesh, &pixel, false).unwrap().expect("linked fixture");
         (mesh, pixel, ordinary.host)
     }
 
@@ -487,7 +616,8 @@ mod tests {
         };
         for (second, expected) in [
             (None, vec![(0, 3)]),
-            (Some(2 | (1 << 10) | (3 << 20)), vec![(0, 4), (1, 2)]),
+            // Two packed f16 channels (6 corners) pack 2/dword into 3 u32s.
+            (Some(2 | (1 << 10) | (3 << 20)), vec![(0, 3)]),
         ] {
             let (mesh, pixel, ordinary) = fixture((1 << 10) | (2 << 20), second);
             let mesh = Container::parse(&mesh.dxil).unwrap();

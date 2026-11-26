@@ -83,11 +83,6 @@ impl Lower<'_> {
         else {
             return Ok(());
         };
-        if self.abort.is_some() {
-            // An original loop-limit exit bypasses the ordinary returns.
-            // We cannot add a group barrier to this program safely.
-            return Err("a mesh loop can bypass the linked varying barrier");
-        }
         if stage.written.iter().any(|written| !written) {
             return Err("the mesh shader never writes a linked varying");
         }
@@ -117,20 +112,40 @@ impl Lower<'_> {
             let index = self.s.m.bin(c, Bin::LShr, packed, shift);
             self.s.m.bin(c, Bin::And, index, mask)
         });
-        let mut values = Vec::with_capacity(layout.fields.len() * 3);
-        for field in 0..layout.fields.len() {
-            let start = self.s.m.i32(field as u32 * mesh.max_vertices);
+        let mut dwords = Vec::with_capacity(layout.dwords);
+        let mut halves = Vec::new();
+        let i32t = self.s.t.i32;
+        for (idx, field) in layout.fields.iter().enumerate() {
+            let start = self.s.m.i32(idx as u32 * mesh.max_vertices);
             for &vertex in &vertices {
                 let index = self.s.m.bin(c, Bin::Add, start, vertex);
                 let ptr = self.s.m.element(c, scratch, index);
                 let bits = self.s.m.load(c, ptr);
-                values.push(self.as_float(bits));
+                if field.half {
+                    let f = self.as_float(bits);
+                    let h = self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    halves.push(h);
+                } else {
+                    dwords.push(bits);
+                }
             }
+        }
+        let shift16 = self.s.m.i32(16);
+        for pair in halves.chunks(2) {
+            let packed = match pair {
+                [lo, hi] => {
+                    let hi = self.s.m.bin(c, Bin::Shl, *hi, shift16);
+                    self.s.m.bin(c, Bin::Or, *lo, hi)
+                }
+                [lo] => *lo,
+                _ => unreachable!(),
+            };
+            dwords.push(packed);
         }
         // Define all components before storing a vector. Metal coalesces
         // the stores of one signature row at their first instruction.
         let first = self.s.prims.len() - layout.rows();
-        for (row, values) in values.chunks(4).enumerate() {
+        for (row, values) in dwords.chunks(4).enumerate() {
             let id = first + row;
             self.s.prims[id].usage = (1 << values.len()) - 1;
             for (column, &value) in values.iter().enumerate() {
@@ -139,7 +154,7 @@ impl Lower<'_> {
                 let column = self.s.m.i8(column as u8);
                 self.s.op(
                     c,
-                    "storePrimitiveOutput.f32",
+                    "storePrimitiveOutput.i32",
                     Attr::NoUnwind,
                     self.s.t.void,
                     172,

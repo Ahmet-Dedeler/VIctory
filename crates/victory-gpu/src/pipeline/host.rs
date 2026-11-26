@@ -688,7 +688,10 @@ impl HostPipeline {
             crate::mac::refuse_barycentrics()
                 && !crate::mac::per_vertex_solved()
                 && find("pixel").is_some_and(|ps| {
-                    ps.translated().is_some_and(|t| crate::mac::feature_bits(&t.host.dxil) & 0x2_0000 != 0)
+                    ps.translated().is_some_and(|t| {
+                        crate::mac::feature_bits(&t.host.dxil) & 0x2_0000 != 0
+                            && victory_shader::emit::uses_attribute_at_vertex(&ps.container)
+                    })
                 })
         };
         let host_topology = match g.topology.0 {
@@ -871,9 +874,7 @@ impl HostPipeline {
                         return None;
                     }
                 };
-                if crate::mac::feature_bits(&ps_d.dxil) & 0x2_0000 != 0
-                    || !victory_shader::emit::needs_vertex_deltas(&ps_d.dxil)
-                {
+                if !victory_shader::emit::needs_vertex_deltas(&ps_d.dxil) {
                     return None;
                 }
                 let vs = &stages[0].0.translated()?.host.dxil;

@@ -1418,10 +1418,11 @@ pub(super) type KeptOutputs = HashMap<(String, u32), u8>;
 
 /// Keeps only arbitrary (`kind == 0`) signature elements whose semantic has at
 /// least one channel read in `keep`, trimming unread leading and trailing
-/// channels. System values (`kind != 0`) stay untouched.
-fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
+/// channels. System values (`kind != 0`) and linked `VICTORY_VERTEX_DATA`
+/// elements stay untouched.
+pub(super) fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
     elements.retain_mut(|e| {
-        if e.kind != 0 {
+        if e.kind != 0 || e.name.eq_ignore_ascii_case(super::primitive_varyings::SEMANTIC) {
             return true;
         }
         if e.row.is_none() {
@@ -1460,6 +1461,15 @@ pub(super) fn with_kept_mesh_outputs<R>(keep: KeptOutputs, translate: impl FnOnc
     let result = translate();
     KEPT_MESH_OUTPUTS.set(before);
     result
+}
+
+/// Applies the active [`KEPT_MESH_OUTPUTS`] filter (if any) to `elements`.
+pub(super) fn apply_kept_mesh_outputs(elements: &mut Vec<SigElement>) {
+    KEPT_MESH_OUTPUTS.with_borrow(|keep| {
+        if let Some(keep) = keep.as_ref() {
+            prune_signature(elements, keep);
+        }
+    });
 }
 
 /// Runs `translate` with first halves of interpolations evaluated as the
@@ -3283,7 +3293,7 @@ impl<'a> Lower<'a> {
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
         let count = match (self.s.pixel, self.varyings) {
-            (true, Some(layout)) => self.x.inputs.len() - layout.rows(),
+            (true, Some(layout)) => self.s.inputs.len() - layout.rows(),
             _ => self.s.inputs.len(),
         };
         self.s.inputs.iter().take(count).enumerate().find_map(|(id, e)| {
@@ -11324,7 +11334,7 @@ impl<'a> Lower<'a> {
                 ..
             } => {
                 let mode = interp_mode(barycentric).ok_or("pull-model interpolation")?;
-                let eval = if self.per_vertex(attribute.row) {
+                let eval = if !self.decoupled_per_vertex() && self.per_vertex(attribute.row) {
                     // The element is read per vertex elsewhere, so it is
                     // constant: weigh its vertices with SV_Barycentrics.
                     let mut ij = [None; 2];
@@ -11347,11 +11357,15 @@ impl<'a> Lower<'a> {
                 (attribute, eval)
             }
             // P0, the provoking vertex: a flat (nointerpolation) input.
-            // (Solved with the row's other vertices, which interpolate it.)
+            // (Solved with the row's other vertices, which interpolate it;
+            // in decoupled mesh varyings mode, read P0 from the flat payload
+            // if the same row is also interpolated.)
             Interp::Vertex {
                 attribute,
                 vertex: 2,
-            } if per_vertex_solved() && self.per_vertex(attribute.row) => (
+            } if (per_vertex_solved() && self.per_vertex(attribute.row))
+                || (self.decoupled_per_vertex() && self.interpolated(attribute.row)) =>
+            (
                 attribute,
                 Eval::Weights {
                     p0: true,
@@ -11520,11 +11534,36 @@ impl<'a> Lower<'a> {
         super::primitive_varyings::interpolates(self.x.io, row)
     }
 
+    /// Whether per-vertex reads arrive through separate flat primitive varyings
+    /// (`Mode::Discover` / `Mode::Linked`), so ordinary interpolated channels on
+    /// the same row keep native hardware interpolation.
+    fn decoupled_per_vertex(&self) -> bool {
+        self.varyings.is_some() || self.vertex_fetches.is_some()
+    }
+
     /// Channel `ch` of input row `row` evaluated as `eval` says, as raw bits.
     fn eval_channel(&mut self, row: u8, ch: u8, eval: Eval) -> Result<V, Why> {
         let (id, col) = self
             .find_input(row, ch)
             .ok_or("an input the signature lacks")?;
+        if self.decoupled_per_vertex()
+            && let Eval::Weights { p0, i, j } = eval
+        {
+            let v0 = self.vertex_input(id, col, 0)?;
+            let c = self.cur;
+            let mut acc = p0.then_some(v0);
+            for (k, w) in [(1, i), (2, j)] {
+                let Some(w) = w else { continue };
+                let vk = self.vertex_input(id, col, k)?;
+                let d = self.s.m.bin(c, Bin::Sub, vk, v0);
+                acc = Some(match acc {
+                    Some(a) => self.fmad(w, d, a),
+                    None => self.s.m.bin(c, Bin::Mul, w, d),
+                });
+            }
+            let acc = acc.ok_or("an interpolation")?;
+            return Ok(self.as_int(acc));
+        }
         let float = self.s.inputs[id].comp == 9;
         let mode = match eval {
             Eval::Mode(mode) => mode,
@@ -11647,11 +11686,35 @@ impl<'a> Lower<'a> {
     /// of a constant input element's channel, as a float.
     fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> Result<V, Why> {
         if let Some(layout) = self.varyings {
-            let field = layout.fields.iter().position(|field| field.pixel == (id, col))
+            let field = layout
+                .fields
+                .iter()
+                .find(|field| field.pixel == (id, col))
                 .ok_or("a per-vertex value missing from the linked mesh payload")?;
-            let first = self.x.inputs.len() - layout.rows();
-            let component = field * 3 + usize::from(k);
-            let Val::I32(value) = self.load_any_input(first + component / 4, (component % 4) as u8) else {
+            let first = self.s.inputs.len() - layout.rows();
+            if field.half {
+                let half_idx = field.slot + usize::from(k);
+                let dword = layout.f32_dwords + half_idx / 2;
+                let Val::I32(value) =
+                    self.load_any_input(first + dword / 4, (dword % 4) as u8)
+                else {
+                    return Err("a linked mesh payload component that is not an integer");
+                };
+                let c = self.cur;
+                let half = if half_idx % 2 == 1 {
+                    let s16 = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::LShr, value, s16)
+                } else {
+                    let mask = self.s.m.i32(0xFFFF);
+                    self.s.m.bin(c, Bin::And, value, mask)
+                };
+                let f32t = self.s.t.f32;
+                return Ok(self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[half]));
+            }
+            let component = field.slot + usize::from(k);
+            let Val::I32(value) =
+                self.load_any_input(first + component / 4, (component % 4) as u8)
+            else {
                 return Err("a linked mesh payload component that is not a float");
             };
             return Ok(self.as_float(value));
@@ -13731,7 +13794,11 @@ impl<'a> Lower<'a> {
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
-        self.s.m.terminate(a, Term::Ret);
+        let term = match &self.mesh_varyings {
+            Some(stage) => Term::Br(stage.exit),
+            None => Term::Ret,
+        };
+        self.s.m.terminate(a, term);
         self.abort = Some(a);
         a
     }
