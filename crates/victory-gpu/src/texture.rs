@@ -1591,6 +1591,15 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     if len == 0 {
         return true;
     }
+    // Mac layer: from the runtime's record of its views first. Each page
+    // that is not there costs a fault through Wine and Rosetta (and
+    // `QueryWorkingSetEx` is a stub under Wine), 8,000-26,000 a frame while
+    // textures stream in (agent/next5 babb70c0).
+    if crate::mac::is_darwin()
+        && let Some(there) = crate::inplace::shown_bytes(at as usize, len)
+    {
+        return there >= len as u64;
+    }
     let (there, of) = readable(at as usize, len, true);
     there == of
 }

@@ -920,7 +920,11 @@ pub(crate) fn relay() -> bool {
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
+    // Mac layer: off by default on Darwin, where stage 2 lost characters'
+    // skin (fxceless/victory-fork#89) and cost more than it saved under Wine.
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_RELAY").map_or(!cfg!(test) && !crate::mac::is_darwin(), |v| v == "1" || v == "2") && !keeps()
+    })
 }
 
 /// The submission being prepared (its number among those started): what

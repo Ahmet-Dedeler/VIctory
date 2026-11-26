@@ -39,6 +39,29 @@ std::arch::global_asm!(
     "mov rsi, r10",
     "mov rdi, r11",
     "ret",
+    // Mac layer (`wide`): the same contract, eight bytes a step and a byte
+    // tail. A fault anywhere between `_at` and `_after` goes to
+    // `victory_safe_copy_failed` (the same two registers are kept).
+    ".globl victory_safe_copy_wide",
+    ".globl victory_safe_copy_wide_at",
+    ".globl victory_safe_copy_wide_after",
+    "victory_safe_copy_wide:",
+    "mov r10, rsi",
+    "mov r11, rdi",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, r8",
+    "shr rcx, 3",
+    "victory_safe_copy_wide_at:",
+    "rep movsq",
+    "mov rcx, r8",
+    "and ecx, 7",
+    "rep movsb",
+    "victory_safe_copy_wide_after:",
+    "mov eax, 1",
+    "mov rsi, r10",
+    "mov rdi, r11",
+    "ret",
     ".globl victory_safe_put",
     ".globl victory_safe_put_at",
     ".globl victory_safe_put_after",
@@ -58,6 +81,12 @@ std::arch::global_asm!(
     "je 3f",
     "vpxor ymm2, ymm2, ymm3",
     "victory_safe_put_at:",
+    // Mac layer (`MAC_PROBE`): touch the dword first with a store Rosetta
+    // can resume after a fault; a masked store it cannot (masked.rs).
+    "cmp byte ptr [rip + {probe}], 0",
+    "je 8f",
+    "lock or dword ptr [rcx], 0",
+    "8:",
     "vpmaskmovd ymmword ptr [rcx], ymm2, ymm1",
     "victory_safe_put_after:",
     "nop",
@@ -109,6 +138,10 @@ std::arch::global_asm!(
     "cmp eax, 255",
     "je 3f",
     "vpxor ymm4, ymm4, ymm5",
+    "cmp byte ptr [rip + {probe}], 0",
+    "je 8f",
+    "lock or dword ptr [rcx], 0",
+    "8:",
     "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3",
     "jmp 7f",
     "3:",
@@ -134,10 +167,18 @@ std::arch::global_asm!(
     "mov qword ptr [rax + 8], r11",
     "mov rax, r9",
     "ret",
+    probe = sym MAC_PROBE,
 );
+
+/// Mac layer: whether the masked stores into title memory above are preceded
+/// by a resumable touch of their block (on Darwin, see [`on`]).
+static MAC_PROBE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 unsafe extern "system" {
     fn victory_safe_copy(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    fn victory_safe_copy_wide(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    fn victory_safe_copy_wide_at();
+    fn victory_safe_copy_wide_after();
     fn victory_safe_copy_at();
     fn victory_safe_copy_after();
     fn victory_safe_copy_failed();
@@ -323,6 +364,9 @@ pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_SAFE_COPY").is_none_or(|v| v != "0");
+        if crate::mac::switch("VICTORY_MASKED_PROBE", true, false) {
+            MAC_PROBE.store(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if on {
             crate::watch::install();
         }
@@ -340,13 +384,41 @@ pub(crate) fn on() -> bool {
 pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
     // SAFETY: a fault on either side leaves through the failing exit
     // ([`failing_exit`]); the rest is the caller's.
-    unsafe { victory_safe_copy(dst, src, len) != 0 }
+    unsafe {
+        if len >= 64 && wide() {
+            victory_safe_copy_wide(dst, src, len) != 0
+        } else {
+            victory_safe_copy(dst, src, len) != 0
+        }
+    }
+}
+
+/// Mac layer: whether copies move eight bytes a step (`rep movsq` and a
+/// `rep movsb` tail) instead of `rep movsb`. Under Rosetta 2 `rep movsb`
+/// runs at about 3.7 GB/s and `rep movsq` at 25-30 GB/s; a world frame's
+/// in-place copies took 88 ms instead of 139 (agent/next5 83b2c6b9).
+/// `VICTORY_COPY_WIDE`: on by default on Darwin, off elsewhere (a native
+/// `rep movsb` is fast); `VICTORY_AB` can toggle it in a run.
+fn wide() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: OnceLock<Option<u32>> = OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_COPY_WIDE")) {
+            return crate::ab::on(bit);
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::mac::switch("VICTORY_COPY_WIDE", true, false))
 }
 
 /// For the fault handler: where a fault at instruction `at` is to go on, if
 /// it is [`copy`]'s.
 pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     let (from, to) = (victory_safe_copy_at as *const () as usize, victory_safe_copy_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_copy_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_copy_wide_at as *const () as usize, victory_safe_copy_wide_after as *const () as usize);
     if (from..to).contains(&at) {
         return Some(victory_safe_copy_failed as *const () as usize);
     }
