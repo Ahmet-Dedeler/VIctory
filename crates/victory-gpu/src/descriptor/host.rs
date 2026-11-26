@@ -3649,10 +3649,20 @@ fn twin_window(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bo
     Some((from / 4, dwords, (start - from) as u32))
 }
 
-/// Whether to copy identical raw twins (`VICTORY_RAW_TWIN_COPY=0` creates
-/// each twin). A diagnostics run can change this between presents.
+/// Whether to copy identical raw twins from the CPU-only slot just made
+/// instead of creating each twin (`VICTORY_RAW_TWIN_COPY=1`; off by default
+/// until an in-game A/B shows it is faster with the same picture). A
+/// diagnostics run naming it in `VICTORY_AB` changes it between presents.
 fn raw_twin_copy() -> bool {
-    crate::toggled!("VICTORY_RAW_TWIN_COPY")
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_RAW_TWIN_COPY")) {
+            return crate::ab::on(bit);
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_RAW_TWIN_COPY"))
 }
 
 /// Copies the main raw view into its identical twin. The caller has just
