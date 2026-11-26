@@ -81,12 +81,6 @@ std::arch::global_asm!(
     "je 3f",
     "vpxor ymm2, ymm2, ymm3",
     "victory_safe_put_at:",
-    // Mac layer (`MAC_PROBE`): touch the dword first with a store Rosetta
-    // can resume after a fault; a masked store it cannot (masked.rs).
-    "cmp byte ptr [rip + {probe}], 0",
-    "je 8f",
-    "lock or dword ptr [rcx], 0",
-    "8:",
     "vpmaskmovd ymmword ptr [rcx], ymm2, ymm1",
     "victory_safe_put_after:",
     "nop",
@@ -138,10 +132,6 @@ std::arch::global_asm!(
     "cmp eax, 255",
     "je 3f",
     "vpxor ymm4, ymm4, ymm5",
-    "cmp byte ptr [rip + {probe}], 0",
-    "je 8f",
-    "lock or dword ptr [rcx], 0",
-    "8:",
     "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3",
     "jmp 7f",
     "3:",
@@ -167,12 +157,7 @@ std::arch::global_asm!(
     "mov qword ptr [rax + 8], r11",
     "mov rax, r9",
     "ret",
-    probe = sym MAC_PROBE,
 );
-
-/// Mac layer: whether the masked stores into title memory above are preceded
-/// by a resumable touch of their block (on Darwin, see [`on`]).
-static MAC_PROBE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 unsafe extern "system" {
     fn victory_safe_copy(dst: *mut u8, src: *const u8, len: usize) -> u32;
@@ -220,6 +205,10 @@ pub(crate) struct Merged {
 /// [`copy`]'s. The stretch lies in one page of 4 KiB of title memory. [`on`]
 /// must have been asked.
 pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
+    if no_masked_stores() {
+        // SAFETY: the caller's.
+        return unsafe { merge_plain(title, now, held, len, take) };
+    }
     let mut out = Merged { there: true, ..Merged::default() };
     let mut at = 0;
     while at < len {
@@ -335,7 +324,7 @@ pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
     let blocks = (n - head) / 32;
     let tail = head + blocks * 32;
     let mut all = true;
-    if blocks > 0 {
+    if blocks > 0 && !no_masked_stores() {
         // SAFETY: the two slices hold the blocks; the destination's faults
         // leave through the failing exit.
         all &= unsafe { victory_safe_put(dst.add(head), was[head..].as_ptr(), now[head..].as_ptr(), blocks) != 0 };
@@ -355,8 +344,88 @@ pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
         all
     };
     all &= single(0, head);
+    if no_masked_stores() {
+        all &= single(head, tail);
+    }
     all &= single(tail, n);
     all
+}
+
+/// Mac layer: whether stores into title memory avoid `vpmaskmovd`. Rosetta 2
+/// cannot go on after a fault in a masked store ("unexpectedly need to
+/// EmulateForward on a synchronous exception", and the thread stops for good:
+/// runs nb-av-b and nb-av-c, 2026-11-26, at `victory_safe_put`), and these
+/// stores meet the guards on title memory all the time. On Darwin the
+/// changed dwords are stored one by one with [`copy`], which resumes.
+/// `VICTORY_MASKED_STORES=1` puts the masked stores back.
+fn no_masked_stores() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !crate::mac::switch("VICTORY_MASKED_STORES", false, true))
+}
+
+/// [`merge`] without masked stores ([`no_masked_stores`]): 32 bytes compared
+/// at a time, then each changed dword read from title memory and stored
+/// there if it differs, with [`copy`] both ways. The counts are as
+/// [`merge`]'s (blocks with new bytes, dwords stored).
+///
+/// # Safety
+/// As [`merge`]'s.
+unsafe fn merge_plain(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
+    let mut out = Merged { there: true, ..Merged::default() };
+    // One unit: `n` bytes at `at` (a whole aligned dword, or one byte);
+    // whether its bytes were new.
+    let unit = |at: usize, n: usize, out: &mut Merged| {
+        let mut new = [0u8; 4];
+        let mut was = [0u8; 4];
+        // SAFETY: inside the stretch, ours.
+        unsafe {
+            for i in 0..n {
+                new[i] = now.add(at + i).read_volatile();
+                was[i] = held.add(at + i).read();
+            }
+        }
+        if new[..n] == was[..n] {
+            return false;
+        }
+        let mut there = [0u8; 4];
+        // SAFETY: title memory, through the faulting copy.
+        let mut ok = unsafe { copy(there.as_mut_ptr(), title.add(at), n) };
+        if ok && there[..n] != new[..n] {
+            // SAFETY: as above.
+            ok = unsafe { copy(title.add(at), new.as_ptr(), n) };
+            out.dwords += u64::from(ok);
+        }
+        out.there &= ok;
+        if ok || take {
+            // SAFETY: inside the stretch, ours.
+            unsafe { std::ptr::copy_nonoverlapping(new.as_ptr(), held.add(at), n) };
+        }
+        true
+    };
+    let mut at = 0;
+    while at < len {
+        let address = title.addr() + at;
+        if address.is_multiple_of(32) && len - at >= 32 {
+            // SAFETY: 32 bytes of each, ours.
+            if !unsafe { differ(now.add(at), held.add(at), 32) } {
+                at += 32;
+                continue;
+            }
+            let mut any = false;
+            for k in 0..8 {
+                any |= unit(at + 4 * k, 4, &mut out);
+            }
+            out.new += u64::from(any);
+            at += 32;
+        } else if address.is_multiple_of(4) && len - at >= 4 {
+            out.new += u64::from(unit(at, 4, &mut out));
+            at += 4;
+        } else {
+            out.new += u64::from(unit(at, 1, &mut out));
+            at += 1;
+        }
+    }
+    out
 }
 
 /// Whether copies are made here and not by the kernel.
@@ -364,9 +433,6 @@ pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_SAFE_COPY").is_none_or(|v| v != "0");
-        if crate::mac::switch("VICTORY_MASKED_PROBE", true, false) {
-            MAC_PROBE.store(1, std::sync::atomic::Ordering::Relaxed);
-        }
         if on {
             crate::watch::install();
         }
