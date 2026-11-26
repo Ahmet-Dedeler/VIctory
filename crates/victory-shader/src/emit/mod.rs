@@ -2,7 +2,10 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it. On a host of
+//! 32-lane waves, `VICTORY_WAVE_PAIRS` (off by default) lets a wave64
+//! program take the paired form (`paired`): a host wave for each console
+//! wave, two console lanes a thread, half the threads.
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -92,6 +95,8 @@ mod intersect_tests;
 pub mod host;
 mod lower;
 mod own_bits;
+#[cfg(test)]
+mod paired_tests;
 #[cfg(all(test, windows))]
 mod permlane_tests;
 mod rect;
@@ -445,7 +450,61 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 /// Emits a program whose earlier stages already ran.
+///
+/// With `VICTORY_WAVE_PAIRS` off (the default) this is [`emit_forms`], unchanged. Asked for,
+/// a console wave64 compute program on a host of 32-lane waves may take the paired form
+/// ([`paired`], [`Pairs`]): before every form (`all`), at its place among the retries
+/// (`1`, `first`: [`emit_forms`]), and last of all where no form gives the host the program
+/// (it is refused, or still asks for 64-lane waves), as the old paired-lane branch did. Where
+/// the paired form refuses the program too, the result is what [`emit_forms`] gave.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let wave64_on_32 = native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32;
+    let mode = if wave64_on_32 { pairs_mode() } else { Pairs::Off };
+    // `VICTORY_WAVE_PAIRS=all`: every console wave64 compute program on a host of 32-lane waves
+    // tries the paired form before any other; one it does not take goes on as below.
+    if mode == Pairs::All {
+        let again = paired(c, native, p, io, res);
+        report_pairs("paired lanes, before every form", &again);
+        if let Ok((shader, _)) = again {
+            return Ok(shader);
+        }
+    }
+    let r = emit_forms(c, native, p, st, io, res);
+    let refused = match &r {
+        Ok(shader) => required_wave(shader) == Some(64),
+        Err(e) => matches!(e, ShaderError::Unsupported { .. }),
+    };
+    if refused && matches!(mode, Pairs::BeforeApproximate | Pairs::First) {
+        let again = paired(c, native, p, io, res);
+        report_pairs("paired lanes, last resort", &again);
+        if let Ok((shader, _)) = again {
+            return Ok(shader);
+        }
+    }
+    r
+}
+
+/// The wave size a translated compute program requires of the host (`PSV0`'s, where it is
+/// one size), for [`emit`]'s last resort.
+fn required_wave(shader: &HostShader) -> Option<u32> {
+    let c = Container::parse(&shader.dxil).ok()?;
+    let psv = c.part(FourCC::PSV0)?.data;
+    let at = |o: usize| psv.get(4 + o..8 + o).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let (min, max) = (at(16)?, at(20)?);
+    (min == max).then_some(min)
+}
+
+/// [`emit`]'s forms: the program as it is, then for a console wave64 compute program on a host
+/// of 32-lane waves the retries that may give it 32-lane waves, then the retries of threaded
+/// edges. Unchanged by the paired form when `VICTORY_WAVE_PAIRS` is off.
+fn emit_forms(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -480,6 +539,15 @@ pub fn emit(
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        // `VICTORY_WAVE_PAIRS=first`: the paired form before every other form for these
+        // programs (it is exact, and adds no group barrier inside branches).
+        if pairs_mode() == Pairs::First {
+            let again = paired(c, native, p, io, res);
+            report_pairs("paired lanes, before the other forms", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+        }
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -561,6 +629,15 @@ pub fn emit(
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
                         }
+                    }
+                }
+                // `VICTORY_WAVE_PAIRS=1`: the paired form after the exact forms above, before
+                // the approximate ones below (each half-wave its own results).
+                if pairs_mode() == Pairs::BeforeApproximate {
+                    let again = paired(c, native, p, io, res);
+                    report_pairs("paired lanes, before an approximate form", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
                     }
                 }
                 if strict {
@@ -703,6 +780,124 @@ fn widen(
             return r;
         }
         wide.extend(more);
+    }
+}
+
+/// Where console wave64 compute programs on a host of 32-lane waves may take the paired form
+/// ([`paired`]), from `VICTORY_WAVE_PAIRS`. Off unless asked for: with it off, [`emit`] is
+/// what it was before the paired form existed, every program's translation unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pairs {
+    /// Unset, `0` or anything not below: never.
+    Off,
+    /// `1`: for a program [`emit`]'s first form leaves needing 64-lane waves (or stopped where
+    /// not every lane runs), after the exact forms and before the approximate ones.
+    BeforeApproximate,
+    /// `first`: for those programs, before every other form.
+    First,
+    /// `all`: for every console wave64 compute program on such a host, before any other form
+    /// (also ones another form already gives as 32-lane waves). For tests on the host GPU.
+    All,
+}
+
+/// `VICTORY_WAVE_PAIRS` as [`Pairs`]. Pure, for testing.
+fn parse_pairs(value: Option<&str>) -> Pairs {
+    match value.map(str::trim) {
+        Some("1") => Pairs::BeforeApproximate,
+        Some("first") => Pairs::First,
+        Some("all") => Pairs::All,
+        _ => Pairs::Off,
+    }
+}
+
+/// The [`Pairs`] in effect: `VICTORY_WAVE_PAIRS` (read once), or a test's choice for its own
+/// thread.
+fn pairs_mode() -> Pairs {
+    #[cfg(test)]
+    if let Some(mode) = TEST_PAIRS.get() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<Pairs> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_pairs(std::env::var("VICTORY_WAVE_PAIRS").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`pairs_mode`], for its thread only.
+    static TEST_PAIRS: std::cell::Cell<Option<Pairs>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_WAVE_WHY=1`: one line on what the paired form did with a program.
+fn report_pairs(what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>) {
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        match r {
+            Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
+            Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+        }
+    }
+}
+
+/// `p` (a console wave64 compute program on a host of 32-lane waves) in the paired form
+/// ([`lower::with_paired_lanes`]): each console wave run by one host wave of 32 lanes, each
+/// thread two of its lanes, with every per-lane branch taken by the whole wave as the console
+/// takes it ([`structure::structure_wide`]), so that a host wave's threads go the same way and
+/// EXEC stays each lane's guard. The program's barriers are reached by whole host waves where
+/// the console's waves reach them; the only barriers added are on entry, before the program,
+/// where a group of several console waves numbers its waves (`Lower::wave_base`). A thread
+/// group whose console waves are not full would need the lanes past its end kept out of every
+/// effect: refused.
+/// Descriptors and addresses stay those traced on the lanes' own paths (`res`, as for every
+/// other form); a descriptor a lane picks by its own way through a join is refused in this
+/// form (`Lower::handle`), as is a branch the two lanes of a thread may take apart.
+/// Ported from the old paired-lane commit (fxceless#854's form) without its mesh linking,
+/// descriptor-data, 64-bit float and IR changes.
+fn paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes outside compute",
+        });
+    };
+    if !(native.wave64 && lower::host_max_wave() == 32) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes for a program the host's waves already fit",
+        });
+    }
+    if cs.threads.iter().product::<u32>() % 64 != 0 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes in a thread group that does not fill its console waves",
+        });
+    }
+    let st = wave_wide(p)?;
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res))
+}
+
+/// `p` structured with every per-lane branch taken by the whole wave
+/// ([`structure::structure_wide`]): again while that leaves another branch on a per-lane
+/// condition, until none is left. What [`paired`] lowers.
+fn wave_wide(p: &ir::Program) -> Result<structure::Structured, ShaderError> {
+    let mut wide = std::collections::HashSet::new();
+    loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let lanes: Vec<usize> = (0..st.exits.len())
+            .filter(|b| !wide.contains(b))
+            .filter(|&b| {
+                matches!(st.exits[b], structure::LaneExit::Branch { when, .. }
+                    if !st.bools.support(when).iter().all(|a| matches!(a, structure::Atom::Uniform(_))))
+            })
+            .collect();
+        if lanes.is_empty() {
+            return Ok(st);
+        }
+        wide.extend(lanes);
     }
 }
 
