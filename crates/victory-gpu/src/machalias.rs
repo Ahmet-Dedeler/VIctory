@@ -667,27 +667,47 @@ pub(crate) fn report() -> Option<String> {
 
 // Shader writes into aliased memory.
 
-/// `VICTORY_ALIAS_NOTIFY` (default on; `0` off): shader writes into aliased title memory are told
-/// to the write watching and the texture passes (`crate::watch::writing`: guarded blocks open,
-/// textures over those bytes are looked at again), as the copy-back told them for the bytes that
-/// changed. In place nobody knows which bytes changed, so a declared range is told whole, once per
-/// range between two submissions' starts. (After skakwy/victory-mac `zerocopy.rs`.)
-fn notify() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_NOTIFY").is_none_or(|v| v != "0"))
+/// `VICTORY_ALIAS_NOTIFY`: shader writes into aliased title memory are told to the write watching
+/// and the texture passes, as the copy-back told them for the bytes that changed. In place nobody
+/// knows which bytes changed, so a declared range is told whole, once per range between two
+/// submissions' starts. (After skakwy/victory-mac `zerocopy.rs`.)
+/// - unset or `1` (the default): [`crate::watch::gpu_wrote`] (guarded blocks there and at the
+///   pages' other views count as written, with no protection change) and the textures over those
+///   bytes are looked at again. (After Marvisak/VIctory 29decb37.)
+/// - `open`: [`crate::watch::writing`], as before: the guarded blocks are opened (two protection
+///   changes each, one now and one at the next check). 353 against 300 ms p50 with `0` (pp4).
+/// - `guards`: `gpu_wrote` alone, no texture told (for measuring; textures may go stale).
+/// - `0`: nothing told (for measuring: what shaders write is not seen by copies of it elsewhere).
+fn notify() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_ALIAS_NOTIFY").as_deref().map(str::trim) {
+        Ok("0") => 0,
+        Ok("open") => 2,
+        Ok("guards") => 3,
+        _ => 1,
+    })
 }
 
 static DECLARED: Mutex<std::collections::BTreeSet<(usize, usize)>> = Mutex::new(std::collections::BTreeSet::new());
 
 /// Shaders of a list being recorded may write aliased title memory `[address, address + len)`.
 pub(crate) fn declared_in_place(address: usize, len: usize) {
-    if !notify() || len == 0 {
+    let mode = notify();
+    if mode == 0 || len == 0 {
         return;
     }
     if !DECLARED.lock().unwrap_or_else(|e| e.into_inner()).insert((address, len)) {
         return;
     }
-    crate::watch::writing(address, len);
+    match mode {
+        2 => crate::watch::writing(address, len),
+        3 => crate::watch::gpu_wrote(address, len),
+        _ => {
+            crate::watch::gpu_wrote(address, len);
+            // A placed texture there changes with no descriptor written.
+            crate::descriptor::host::remapped(address, len);
+        }
+    }
 }
 
 /// A submission's preparing begins: declared ranges are told again from now on.

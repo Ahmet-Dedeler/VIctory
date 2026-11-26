@@ -2033,6 +2033,35 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
     }
 }
 
+/// Shaders wrote title memory `[at, at + len)` directly (aliased memory, `crate::machalias`): the
+/// guarded blocks there, and those of the same pages at their other views, count as written (out
+/// of `clean`, so [`guard`] reports them and guards them again with no protection change), and stay
+/// read-only. Unlike [`writing`] no guard is opened: a GPU write does not go through the CPU's page
+/// protection, so the title's own writes stay seen, and no block costs two protection changes.
+/// Textures are not told (the caller does that). (After Marvisak/VIctory 29decb37 `gpu_wrote`.)
+pub(crate) fn gpu_wrote(at: usize, len: usize) {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if first >= last || (light() && !PROTECTED.any(first, last)) {
+        return;
+    }
+    let mut g = guards_timed();
+    let blocks: Vec<usize> = g.protected.range(first..last).collect();
+    for block in blocks {
+        g.clean.remove(block);
+        PUBLISHED.clear(block);
+    }
+    let aliased: Vec<usize> = g.aliased.range(first..last).collect();
+    for block in aliased {
+        for other in crate::inplace::pages_of(block * BLOCK) {
+            let other = other / BLOCK;
+            if g.protected.contains(other) {
+                g.clean.remove(other);
+                PUBLISHED.clear(other);
+            }
+        }
+    }
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
