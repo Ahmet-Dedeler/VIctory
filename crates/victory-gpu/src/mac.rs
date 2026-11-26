@@ -293,3 +293,46 @@ pub(crate) fn wave_lanes(dxil: &[u8]) -> Option<u32> {
     let (min, max) = (u32_at(info, 4 + 16)? as u32, u32_at(info, 4 + 20)? as u32);
     (min != 0 && min == max).then_some(min)
 }
+
+/// Diagnostics: every frame's time, logged every five seconds in the form the
+/// Mac lanes' tools read (`framelog: frame times: ... each: <ms> <ms> ...`,
+/// `xcl-mac/lanes/gpu-overlap/frames.py`), so runs of this tree and of the
+/// older one are measured the same way. Called at the end of each present.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn presented() {
+    use std::sync::Mutex;
+    struct Frames {
+        last: std::time::Instant,
+        began: std::time::Instant,
+        each: Vec<u32>,
+        drawn: u64,
+    }
+    static FRAMES: Mutex<Option<Frames>> = Mutex::new(None);
+    let now = std::time::Instant::now();
+    let mut f = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(f) = f.as_mut() else {
+        *f = Some(Frames { last: now, began: now, each: Vec::new(), drawn: crate::draw::drawn() });
+        return;
+    };
+    f.each.push(now.duration_since(f.last).as_millis().min(u128::from(u32::MAX)) as u32);
+    f.last = now;
+    let span = now.duration_since(f.began).as_secs_f64();
+    if span >= 5.0 {
+        let mut sorted = f.each.clone();
+        sorted.sort_unstable();
+        let each: Vec<String> = f.each.iter().map(u32::to_string).collect();
+        tracing::info!(
+            target: "victory_gpu::framelog",
+            "frame times: {} frames in {span:.1} s: shortest {} ms, median {}, longest {}; {} draws a frame; each: {}",
+            f.each.len(),
+            sorted[0],
+            sorted[sorted.len() / 2],
+            sorted[sorted.len() - 1],
+            (crate::draw::drawn() - f.drawn) / f.each.len() as u64,
+            each.join(" ")
+        );
+        f.each.clear();
+        f.began = now;
+        f.drawn = crate::draw::drawn();
+    }
+}
