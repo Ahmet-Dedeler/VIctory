@@ -12,6 +12,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 BASE = "10e3c562"
 SOURCE = "crates/victory-gpu/src/descriptor/host.rs"
+ALLOCATOR = ROOT / "crates" / "victory-gpu" / "src" / "descriptor" / "dynamic.rs"
 
 
 def method(source, name):
@@ -41,6 +42,8 @@ def main():
         build = Path(tmp)
         (build / "baseline.rs").write_text(baseline)
         shutil.copy(HERE / "bench.rs", build)
+        shutil.copy(ALLOCATOR, build)
+        subprocess.run(["rustc", "--version"], cwd=build, check=True)
         for architecture in targets:
             print(f"baseline {BASE} | {architecture}-apple-darwin", flush=True)
             subprocess.run(

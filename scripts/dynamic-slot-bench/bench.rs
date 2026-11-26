@@ -168,122 +168,33 @@ impl Allocator for Indexed {
     }
 }
 
-struct Packed {
-    capacity: u32,
-    state: Mutex<PackedSlots>,
-}
+mod dynamic;
 
-struct PackedSlots {
-    taken: Vec<u64>,
-    cursor: u32,
-    available: u32,
-    too_long: u32,
-}
+struct RuntimeAllocator<const PACKED: bool>(Mutex<dynamic::DynamicSlots>);
 
-fn low_bits(width: u32) -> u64 {
-    u64::MAX >> (u64::BITS - width)
-}
+type Packed = RuntimeAllocator<true>;
+type RuntimeBytes = RuntimeAllocator<false>;
 
-impl PackedSlots {
-    fn first_run(&self, start: u32, end: u32, width: u32) -> Option<u32> {
-        let mut suffix = 0;
-        let mut at = start;
-        while at < end {
-            let offset = at % u64::BITS;
-            let valid = (u64::BITS - offset).min(end - at);
-            let free = !(self.taken[(at / u64::BITS) as usize] >> offset) & low_bits(valid);
-            let prefix = free.trailing_ones();
-            if suffix + prefix >= width {
-                return Some(at - suffix);
-            }
-            if prefix == valid {
-                suffix += valid;
-            } else {
-                if width <= valid && free != 0 {
-                    // Each doubling keeps starts with twice as many free bits.
-                    // Two overlapping power-of-two runs then cover `width`.
-                    let mut starts = free;
-                    let mut cover = 1;
-                    while cover * 2 <= width {
-                        starts &= starts >> cover;
-                        cover *= 2;
-                    }
-                    starts &= starts >> (width - cover);
-                    if starts != 0 {
-                        return Some(at + starts.trailing_zeros());
-                    }
-                }
-                suffix = (free << (u64::BITS - valid)).leading_ones();
-            }
-            at += valid;
-        }
-        None
-    }
-
-    fn update<const TAKE: bool>(&mut self, mut at: u32, end: u32) -> u32 {
-        let mut given = 0;
-        while at < end {
-            let offset = at % u64::BITS;
-            let valid = (u64::BITS - offset).min(end - at);
-            let mask = low_bits(valid) << offset;
-            let bits = &mut self.taken[(at / u64::BITS) as usize];
-            if TAKE {
-                *bits |= mask;
-            } else {
-                given += (*bits & mask).count_ones();
-                *bits &= !mask;
-            }
-            at += valid;
-        }
-        given
-    }
-}
-
-impl Allocator for Packed {
+impl<const PACKED: bool> Allocator for RuntimeAllocator<PACKED> {
     fn new(capacity: u32) -> Self {
-        Self {
-            capacity,
-            state: Mutex::new(PackedSlots {
-                taken: vec![0; capacity.div_ceil(u64::BITS) as usize],
-                cursor: 0,
-                available: capacity,
-                too_long: u32::MAX,
-            }),
-        }
+        Self(Mutex::new(dynamic::DynamicSlots::new(capacity, PACKED)))
     }
 
     fn allocate(&self, width: u32) -> Option<u32> {
-        if width == 0 || width > self.capacity {
-            return None;
-        }
-        let mut heap = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if width > heap.available || width >= heap.too_long {
-            return None;
-        }
-        let second_end = (heap.cursor + width - 1).min(self.capacity);
-        let first = heap
-            .first_run(heap.cursor, self.capacity, width)
-            .or_else(|| heap.first_run(0, second_end, width));
-        let Some(first) = first else {
-            heap.too_long = width;
-            return None;
-        };
-        let after = first + width;
-        heap.update::<true>(first, after);
-        heap.available -= width;
-        heap.cursor = if after == self.capacity { 0 } else { after };
-        Some(TITLE_SLOTS + first)
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .allocate::<false>(width)
+            .0
+            .map(|first| first + TITLE_SLOTS)
     }
 
     fn give_back(&self, first: u32, width: u32) {
-        let Some(start) = first.checked_sub(TITLE_SLOTS) else {
-            return;
-        };
-        if start <= self.capacity {
-            let mut heap = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let end = (start + width).min(self.capacity);
-            heap.available += heap.update::<false>(start, end);
-            heap.too_long = u32::MAX;
+        if let Some(first) = first.checked_sub(TITLE_SLOTS) {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .release(first, width);
         }
     }
 }
@@ -450,6 +361,7 @@ fn verify_small_cases() {
         }
         replay::<Indexed, true>(&Indexed::new(capacity), &trace.operations);
         replay::<Packed, true>(&Packed::new(capacity), &trace.operations);
+        replay::<RuntimeBytes, true>(&RuntimeBytes::new(capacity), &trace.operations);
     }
     println!("Verified 262144 mixed operations across 128 small heap sizes");
 }
@@ -481,21 +393,26 @@ fn report(label: &str, times: &mut [Duration]) {
 fn benchmark(w: &Workload) {
     verify_workload::<Indexed>(w);
     verify_workload::<Packed>(w);
+    verify_workload::<RuntimeBytes>(w);
     let scan = HostHeap::new(w.capacity);
     let index = Indexed::new(w.capacity);
     let packed = Packed::new(w.capacity);
+    let runtime_bytes = RuntimeBytes::new(w.capacity);
     replay::<HostHeap, false>(&scan, &w.setup);
     replay::<Indexed, false>(&index, &w.setup);
     replay::<Packed, false>(&packed, &w.setup);
+    replay::<RuntimeBytes, false>(&runtime_bytes, &w.setup);
     let mut scan_times = Vec::new();
     let mut index_times = Vec::new();
     let mut packed_times = Vec::new();
+    let mut byte_times = Vec::new();
     for (sample, frame) in w.frames.iter().enumerate() {
-        for position in 0..3 {
-            match (sample + position) % 3 {
+        for position in 0..4 {
+            match (sample + position) % 4 {
                 0 => scan_times.push(measure(&scan, frame)),
                 1 => index_times.push(measure(&index, frame)),
-                _ => packed_times.push(measure(&packed, frame)),
+                2 => packed_times.push(measure(&packed, frame)),
+                _ => byte_times.push(measure(&runtime_bytes, frame)),
             }
         }
     }
@@ -523,6 +440,7 @@ fn benchmark(w: &Workload) {
     report("base", &mut scan_times);
     report("indexed", &mut index_times);
     report("packed", &mut packed_times);
+    report("new byte", &mut byte_times);
 }
 
 fn main() {

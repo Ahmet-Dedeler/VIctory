@@ -1,6 +1,6 @@
 # Dynamic descriptor slot allocator benchmark
 
-This tests the CPU work of taking and releasing contiguous descriptor slots. It runs without VIctory, Wine, Direct3D, or game data. The driver extracts the original allocation and release methods from `10e3c562` at build time. The harness gives all three allocators the same slot count and operation sequence, and checks each returned slot index or refusal. It also verifies 262,144 mixed operations across 128 small heap sizes.
+This tests the CPU work of taking and releasing contiguous descriptor slots. It runs without VIctory, Wine, Direct3D, or game data. The driver extracts the original allocation and release methods from `10e3c562` at build time and compiles the current runtime allocator module. The harness gives the original allocator, free-interval prototype, and both runtime modes the same slot count and operation sequence. It checks each returned slot index or refusal and verifies 262,144 mixed operations across 128 small heap sizes.
 
 ```sh
 python3 scripts/dynamic-slot-bench/run.py
@@ -16,19 +16,23 @@ Both Rust Darwin targets, Apple Silicon and Rosetta are required for the default
 
 ## Results
 
-M5 Max, Rust 1.100.0 optimized, 61 paired samples per workload. Times are p50 / p95 in milliseconds per synthetic frame. Both prototypes matched the baseline on every requested allocation.
+M5 Max, Rust 1.98.1 optimized, 61 paired samples per workload. Times are p50 / p95 in milliseconds per synthetic frame. All three alternatives matched the original allocator on every requested allocation.
 
-| CPU | Workload | Current byte scan | Free intervals | Packed occupancy |
-| --- | --- | ---: | ---: | ---: |
-| Rosetta | Steady | 0.792 / 0.924 | 0.855 / 0.943 | **0.448 / 0.532** |
-| Rosetta | High load | 1.544 / 1.711 | 1.695 / 1.890 | **0.911 / 1.113** |
-| Rosetta | Fragmented, 256 holes | 25.931 / 29.020 | **0.040 / 0.055** | 0.823 / 1.020 |
-| Rosetta | Fragmented, 65,536 holes | 25.158 / 26.278 | 6.172 / 6.554 | **1.192 / 1.341** |
-| Arm64 | Steady | 0.549 / 0.758 | 0.543 / 0.827 | **0.291 / 0.361** |
-| Arm64 | High load | 1.191 / 1.468 | 1.167 / 1.560 | **0.639 / 0.892** |
-| Arm64 | Fragmented, 256 holes | 18.301 / 19.960 | **0.034 / 0.057** | 0.586 / 0.671 |
-| Arm64 | Fragmented, 65,536 holes | 16.651 / 18.328 | 4.704 / 5.347 | **0.798 / 0.966** |
+| CPU | Workload | Original byte scan | Runtime byte scan | Free intervals | Runtime packed |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Rosetta | Steady | 0.607 / 0.724 | 0.517 / 0.623 | 0.676 / 0.798 | **0.340 / 0.389** |
+| Rosetta | High load | 1.221 / 1.482 | 1.050 / 1.159 | 1.347 / 1.528 | **0.685 / 0.885** |
+| Rosetta | Fragmented, 256 holes | 18.694 / 21.311 | 9.120 / 10.016 | **0.032 / 0.040** | 0.562 / 0.881 |
+| Rosetta | Fragmented, 65,536 holes | 19.081 / 21.792 | 9.466 / 10.319 | 4.849 / 5.174 | **0.821 / 1.318** |
+| Arm64 | Steady | 0.432 / 0.562 | 0.394 / 0.544 | 0.422 / 0.575 | **0.226 / 0.307** |
+| Arm64 | High load | 0.852 / 0.869 | 0.784 / 0.805 | 0.821 / 0.849 | **0.449 / 0.460** |
+| Arm64 | Fragmented, 256 holes | 11.595 / 13.604 | 5.641 / 7.118 | **0.025 / 0.030** | 0.350 / 0.398 |
+| Arm64 | Fragmented, 65,536 holes | 11.110 / 13.297 | 5.481 / 6.935 | 3.063 / 3.405 | **0.471 / 0.586** |
 
-The packed implementation groups occupancy into 64-bit words and searches up to 64 slots at a time. It keeps counters inside the existing lock. At the Mac capacity ceiling the occupancy array takes 128 KiB per heap, down from 1 MiB. The free-interval implementation excels on sparse failures but adds overhead to ordinary Rosetta workloads and takes longer than packed occupancy in the dense control.
+The packed implementation groups occupancy into 64-bit words and searches up to 64 slots at a time. Both runtime modes keep their free-slot count and failed-width cache inside the existing lock. At the Mac capacity ceiling the packed occupancy array takes 128 KiB per heap, down from 1 MiB. The free-interval implementation excels on sparse failures but adds overhead to ordinary Rosetta workloads and takes longer than packed occupancy in the dense control.
 
-**Decision:** keep the packed allocator as a candidate for high-pressure frames. The ordinary Rosetta gain is under 1 ms per tested frame. Track actual scans, scanned slots, and time waiting for the allocator mutex in the next gameplay capture to decide whether to port it. The latest base-family archive does not establish steady-gameplay time for this isolated search or show whether the 52.8 ms came from repeated long scans. The native versus Rosetta difference on the packed path is too small to justify an out-of-process worker here. This branch changes only the benchmark.
+## Runtime check
+
+`VICTORY_PACKED_DYNAMIC_SLOTS=1` opts into packed occupancy. The heap keeps the mode it began with. In a diagnostics build, `VICTORY_DYNAMIC_SLOT_STATS=1` reports mean per-frame allocation mutex wait, hold time, slots or words examined, and searches that failed after actually looking. This supplements the existing aggregate allocation clock without timing individual slots.
+
+Keep packed occupancy opt-in. The latest base-family archive does not establish steady-gameplay time for the isolated search or show whether the 52.8 ms came from repeated long scans. To promote it, compare the same save and route across both modes with the new counters enabled. In windows with repeated long searches, require at least 25% and 1 ms/frame less allocator lock hold time at p95 across comparable counter windows. Keep draw and allocation counts comparable, verify output and refusal counts, and require steady frame p95 within 5%. The expected ordinary gain from the standalone test is under 1 ms/frame. The measured native versus Rosetta gap on the packed path is too small to justify moving this allocator out of process.
