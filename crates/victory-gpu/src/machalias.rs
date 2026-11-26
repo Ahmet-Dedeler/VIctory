@@ -44,7 +44,7 @@ pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let asked = std::env::var("VICTORY_ALIAS").is_ok_and(|v| v.trim() == "1");
-        let on = asked && crate::host::is_darwin();
+        let on = asked && crate::is_darwin();
         if asked && !on {
             tracing::warn!("VICTORY_ALIAS=1 needs Wine on macOS: off");
         }
