@@ -95,7 +95,7 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
-/// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
+/// `ShaderFlags` bits in the DXIL metadata.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
@@ -112,6 +112,9 @@ pub(crate) mod flags {
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
 }
+
+/// Barycentrics support required in a container's SFI0 feature mask.
+pub(super) const FEATURE_BARYCENTRICS: u64 = 0x2_0000;
 
 pub(crate) struct Types {
     pub void: Ty,
@@ -910,7 +913,7 @@ impl Shader {
             features |= 0x8000;
         }
         if self.flags & flags::BARYCENTRICS != 0 {
-            features |= 0x2_0000;
+            features |= FEATURE_BARYCENTRICS;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

@@ -671,18 +671,58 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
-        if mesh.is_some() {
+        if let Some(ms) = mesh {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
             // looked up again.
-            let name = super::library::name(
-                "mesh triangles",
-                &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
-            );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
+            let make = |ms: D3D12_SHADER_BYTECODE, ps: D3D12_SHADER_BYTECODE, paired: bool| {
+                let kind = if paired {
+                    "mesh triangles with primitive varyings"
+                } else {
+                    "mesh triangles"
+                };
+                // The emitted bytecode includes the payload mapping. No linked
+                // blob enters the shared stage cache or aliases an ordinary PSO.
+                let name = super::library::name(
+                    kind, &root_blob, &[&code_bytes(&ms), &code_bytes(&ps)], &state,
+                );
+                mesh_pipeline(&host.device, &root, ms, ps, g, depth_bounds, &name)
+            };
+            let linked = if crate::mac::is_darwin()
+                && std::env::var_os("VICTORY_MAC_PRIMITIVE_VARYINGS")
+                    .is_some_and(|value| value == "1")
+                && let Some(ps) = find("pixel")
+            {
+                match victory_shader::emit::link_mesh_primitive_varyings(
+                    (&ms.container, &ms.translated()?.host),
+                    (&ps.container, &ps.translated()?.host),
+                ) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        tracing::debug!(%error, ?shaders, "mesh primitive varyings unavailable");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let shader_code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: bytes.as_ptr().cast(),
+                BytecodeLength: bytes.len(),
+            };
+            let linked_pso = linked.as_ref().and_then(|(ms, ps)| {
+                match make(shader_code(&ms.dxil), shader_code(&ps.dxil), true) {
+                    Ok(pso) => Some(pso),
+                    Err(error) => {
+                        tracing::warn!(%error, ?shaders, "host refused linked mesh pipeline, trying ordinary stages");
+                        None
+                    }
+                }
+            });
+            let used_linked = linked_pso.is_some();
+            let pso = linked_pso.map_or_else(|| make(code(0), code(1), false), Ok);
+            let pso = match pso {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -690,7 +730,7 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host mesh pipeline");
+            tracing::info!(?shaders, primitive_varyings = used_linked, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
