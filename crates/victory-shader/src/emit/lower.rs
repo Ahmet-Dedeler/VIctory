@@ -1545,6 +1545,15 @@ fn mesh_output_row(rows: &MeshOutputRows, element: &SigElement) -> Option<u32> {
     element.row
 }
 
+pub(super) fn order_mesh_outputs(elements: &mut [SigElement]) {
+    MESH_OUTPUT_ROWS.with_borrow(|rows| {
+        if let Some(rows) = rows {
+            // Metal lays out varying storage in DXIL signature element order.
+            elements.sort_by_key(|element| mesh_output_row(rows, element).unwrap_or(u32::MAX));
+        }
+    });
+}
+
 /// Runs `translate` with arbitrary mesh outputs / pixel inputs pruned to `keep`.
 pub(super) fn with_kept_mesh_outputs<R>(keep: KeptOutputs, translate: impl FnOnce() -> R) -> R {
     let before = KEPT_MESH_OUTPUTS.replace(Some(keep));
@@ -1830,13 +1839,11 @@ impl<'a> Lower<'a> {
                 }
             }
         });
-        MESH_OUTPUT_ROWS.with_borrow(|rows| {
-            if let Some(rows) = rows {
-                let elements = if s.pixel { &mut s.inputs } else { &mut s.outputs };
-                // Metal lays out varying storage in DXIL signature element order.
-                elements.sort_by_key(|element| mesh_output_row(rows, element).unwrap_or(u32::MAX));
-            }
-        });
+        if x.native.stage == HwStage::Ms {
+            order_mesh_outputs(&mut s.outputs);
+        } else if s.pixel && matches!(mode, Mode::Ordinary) {
+            order_mesh_outputs(&mut s.inputs);
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })

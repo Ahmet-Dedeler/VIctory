@@ -375,6 +375,7 @@ fn link_pair(
             fetch_keys.push((key, abs_col));
         }
         lower::prune_signature(&mut outputs, &keep);
+        lower::order_mesh_outputs(&mut outputs);
         lower::prune_signature(&mut inputs, &keep);
         let mut pruned_fetches = Vec::with_capacity(fetch_keys.len());
         for (key, abs_col) in fetch_keys {
@@ -401,6 +402,7 @@ fn link_pair(
         })?;
         return Ok(Some(linked));
     }
+    lower::order_mesh_outputs(&mut outputs);
     let Some(layout) = Layout::new(mesh_io, &outputs, &inputs, &discovery.vertex_fetches)? else {
         return Ok(None);
     };

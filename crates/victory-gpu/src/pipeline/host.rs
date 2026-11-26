@@ -731,6 +731,11 @@ impl HostPipeline {
                 victory_shader::emit::mesh_output_bytes(dxil)
                     .max(metal_mesh_bytes(dxil))
             };
+            let over_limit = |dxil: &[u8]| {
+                crate::mac::refuse_over_limit_mesh()
+                    && mesh_bytes_of(dxil)
+                        .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT)
+            };
             let pruned = if crate::mac::link_mesh_outputs()
                 && mesh_bytes_of(&ms.translated()?.host.dxil)
                     .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT)
@@ -768,10 +773,21 @@ impl HostPipeline {
                     .as_ref()
                     .and_then(|(_, p)| p.as_ref())
                     .unwrap_or(&ps.translated()?.host);
-                match victory_shader::emit::link_mesh_primitive_varyings(
-                    (&ms.container, base_ms_host),
-                    (&ps.container, base_ps_host),
-                ) {
+                let mesh = (ms.container.as_slice(), base_ms_host);
+                let pixel = (ps.container.as_slice(), base_ps_host);
+                match victory_shader::emit::link_mesh_primitive_varyings(mesh, pixel) {
+                    Ok(Some(pair)) if over_limit(&pair.0.dxil) => {
+                        match victory_shader::emit::compact_linked_mesh_primitive_varyings(
+                            mesh, pixel, &pair,
+                        ) {
+                            Ok(Some(compact)) => Some(compact),
+                            Ok(None) => None,
+                            Err(error) => {
+                                tracing::debug!(%error, ?shaders, "exact mesh output packing unavailable");
+                                None
+                            }
+                        }
+                    }
                     Ok(pair) => pair,
                     Err(error) => {
                         tracing::debug!(%error, ?shaders, "mesh primitive varyings unavailable");
@@ -782,10 +798,7 @@ impl HostPipeline {
                 None
             };
             let linked_pso = linked.as_ref().and_then(|(ms_l, ps_l)| {
-                if crate::mac::refuse_over_limit_mesh()
-                    && mesh_bytes_of(&ms_l.dxil)
-                        .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT)
-                {
+                if over_limit(&ms_l.dxil) {
                     return None;
                 }
                 match make(
@@ -815,11 +828,6 @@ impl HostPipeline {
                     (&ps.container, base_ps_host),
                 ) {
                     Ok((ms_c, ps_c)) => {
-                        let over_limit = |dxil: &[u8]| {
-                            crate::mac::refuse_over_limit_mesh()
-                                && mesh_bytes_of(dxil)
-                                    .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT)
-                        };
                         let compact = if over_limit(&ms_c.dxil) {
                             match victory_shader::emit::compact_linked_mesh_center(
                                 (&ms.container, &ms_c),

@@ -578,9 +578,6 @@ pub fn compact_linked_mesh_center(
 ) -> Result<Option<(HostShader, HostShader)>, ShaderError> {
     let ms = Container::parse(&mesh.1.dxil)?;
     let ps = Container::parse(&pixel.1.dxil)?;
-    let (Some(outputs), Some(inputs)) = (ms.part(FourCC::OSG1), ps.part(FourCC::ISG1)) else {
-        return Ok(None);
-    };
     // Per-primitive inputs share the pixel signature but have a separate
     // producer signature and layout. Keep those pairs on their existing path.
     if let Some(prims) = ms.part(FourCC::PSG1)
@@ -588,6 +585,44 @@ pub fn compact_linked_mesh_center(
     {
         return Ok(None);
     }
+    let Some(rows) = mesh_output_rows(&ms, &ps)? else {
+        return Ok(None);
+    };
+    let reads = pixel_input_reads(&pixel.1.dxil)?;
+    let (mesh_compact, pixel_compact) = lower::with_kept_mesh_outputs(reads, || {
+        lower::with_mesh_output_rows(rows, || {
+            let mesh = translate(mesh.0)?;
+            let pixel = lower::with_per_vertex_center(|| translate(pixel.0))?;
+            Ok::<_, ShaderError>((mesh, pixel))
+        })
+    })?;
+    Ok((primitive_varyings::same_bindings(mesh.1, &mesh_compact)
+        && primitive_varyings::same_bindings(pixel.1, &pixel_compact))
+        .then_some((mesh_compact, pixel_compact)))
+}
+
+/// Reorder the ordinary vertex outputs of an exact linked mesh/pixel pair.
+/// Its per-primitive payload keeps the same layout and interpolation.
+pub fn compact_linked_mesh_primitive_varyings(
+    mesh: (&[u8], &HostShader),
+    pixel: (&[u8], &HostShader),
+    linked: &(HostShader, HostShader),
+) -> Result<Option<(HostShader, HostShader)>, ShaderError> {
+    let ms = Container::parse(&linked.0.dxil)?;
+    let ps = Container::parse(&linked.1.dxil)?;
+    let Some(rows) = mesh_output_rows(&ms, &ps)? else {
+        return Ok(None);
+    };
+    lower::with_mesh_output_rows(rows, || link_mesh_primitive_varyings(mesh, pixel))
+}
+
+fn mesh_output_rows(
+    ms: &Container<'_>,
+    ps: &Container<'_>,
+) -> Result<Option<lower::MeshOutputRows>, ShaderError> {
+    let (Some(outputs), Some(inputs)) = (ms.part(FourCC::OSG1), ps.part(FourCC::ISG1)) else {
+        return Ok(None);
+    };
     let outputs = signature(outputs.data)?;
     let inputs = signature(inputs.data)?;
     let key = |element: &container::SigElement| (element.name.to_ascii_uppercase(), element.index);
@@ -617,17 +652,7 @@ pub fn compact_linked_mesh_center(
             return Ok(None);
         }
     }
-    let reads = pixel_input_reads(&pixel.1.dxil)?;
-    let (mesh_compact, pixel_compact) = lower::with_kept_mesh_outputs(reads, || {
-        lower::with_mesh_output_rows(rows, || {
-            let mesh = translate(mesh.0)?;
-            let pixel = lower::with_per_vertex_center(|| translate(pixel.0))?;
-            Ok::<_, ShaderError>((mesh, pixel))
-        })
-    })?;
-    Ok((primitive_varyings::same_bindings(mesh.1, &mesh_compact)
-        && primitive_varyings::same_bindings(pixel.1, &pixel_compact))
-        .then_some((mesh_compact, pixel_compact)))
+    Ok(Some(rows))
 }
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
