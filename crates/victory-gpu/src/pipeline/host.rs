@@ -608,20 +608,25 @@ impl HostPipeline {
             )
         };
         if compute.is_some() {
+            let cs = code(0);
+            let bytes = code_bytes(&cs);
             // Mac layer: D3DMetal accepts a WaveSize(64) program on a 32-lane
             // GPU and then hangs or does nothing; refuse it instead.
-            if let Some(need) = crate::mac::wave_lanes(&code_bytes(&code(0)))
+            if let Some(need) = crate::mac::wave_lanes(&bytes)
                 && need > crate::mac::host_max_wave()
             {
                 return refuse("the compute program needs wider waves than the host GPU runs", shaders);
             }
+            if crate::mac::refuses_compute_doubles(&host.device, &bytes) {
+                return refuse("the host GPU does not support double-precision compute shaders", shaders);
+            }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-                CS: code(0),
+                CS: cs,
                 ..Default::default()
             };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let name = super::library::name("compute", &root_blob, &[&bytes], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
