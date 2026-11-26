@@ -513,7 +513,13 @@ fn record_clamp_as(
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
+            #[cfg(feature = "diagnostics")]
+            let bracket = crate::timeline::metal::start();
             l.Dispatch(records.div_ceil(64), 1, 1);
+            #[cfg(feature = "diagnostics")]
+            crate::timeline::metal::command(
+                bracket, "indirect_clamp", l, || None, records,
+            );
         }
         l.ResourceBarrier(&second[skip..]);
     }

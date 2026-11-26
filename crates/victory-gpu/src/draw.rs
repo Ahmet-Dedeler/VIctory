@@ -2673,8 +2673,15 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let bracket = crate::timeline::metal::start();
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        crate::timeline::metal::command(
+            bracket, "dispatch", &list.list,
+            || p.stages.first().map(|s| s.shader.hash.as_str()), x,
+        );
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -3020,8 +3027,17 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
+                    #[cfg(feature = "diagnostics")]
+                    let bracket = crate::timeline::metal::start();
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    crate::timeline::metal::command(
+                        bracket, "dispatch_mesh", &list.list,
+                        || crate::pipeline::host_pipeline(self.pipeline as This)
+                            .and_then(|p| p.stages.first()).map(|s| s.shader.hash.as_str()),
+                        x.min(65_535),
+                    );
                     self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -3895,6 +3911,8 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        #[cfg(feature = "diagnostics")]
+        let bracket = crate::timeline::metal::start();
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -3907,6 +3925,16 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        crate::timeline::metal::command(
+            bracket,
+            match kind {
+                DISPATCH => "indirect_compute",
+                MESH => "indirect_mesh",
+                _ => "indirect_draw",
+            },
+            &list.list, || p.stages.first().map(|s| s.shader.hash.as_str()), max,
+        );
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

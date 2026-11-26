@@ -23,6 +23,8 @@
 #[cfg(all(windows, feature = "diagnostics"))]
 mod hooks;
 #[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod metal;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod record;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod report;

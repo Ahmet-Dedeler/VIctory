@@ -5638,7 +5638,11 @@ impl Host {
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
+                    #[cfg(feature = "diagnostics")]
+                    let bracket = crate::timeline::metal::start();
                     self.queue.ExecuteCommandLists(&lists[from..to]);
+                    #[cfg(feature = "diagnostics")]
+                    crate::timeline::metal::submitted(bracket, *submitted, &lists[from..to]);
                     from = to;
                 }
                 self.queue.Signal(&self.fence, *submitted)
@@ -5693,7 +5697,11 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                #[cfg(feature = "diagnostics")]
+                let bracket = crate::timeline::metal::start();
                 self.queue.ExecuteCommandLists(group);
+                #[cfg(feature = "diagnostics")]
+                crate::timeline::metal::submitted(bracket, *submitted, group);
                 self.card_sent();
                 let waited = self
                     .queue
