@@ -54,9 +54,19 @@ std::arch::global_asm!(
     "shr rcx, 3",
     "victory_safe_copy_wide_at:",
     "rep movsq",
+    // The tail byte by byte with plain moves, not `rep movsb`: Rosetta can
+    // mis-resume a `rep movsb` after a fault (see `wide`).
     "mov rcx, r8",
     "and ecx, 7",
-    "rep movsb",
+    "jz 9f",
+    "8:",
+    "mov al, byte ptr [rsi]",
+    "mov byte ptr [rdi], al",
+    "inc rsi",
+    "inc rdi",
+    "dec rcx",
+    "jnz 8b",
+    "9:",
     "victory_safe_copy_wide_after:",
     "mov eax, 1",
     "mov rsi, r10",
@@ -451,7 +461,7 @@ pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
     // SAFETY: a fault on either side leaves through the failing exit
     // ([`failing_exit`]); the rest is the caller's.
     unsafe {
-        if len >= 64 && wide() {
+        if wide() {
             victory_safe_copy_wide(dst, src, len) != 0
         } else {
             victory_safe_copy(dst, src, len) != 0
@@ -459,22 +469,19 @@ pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
     }
 }
 
-/// Mac layer: whether copies move eight bytes a step (`rep movsq` and a
-/// `rep movsb` tail) instead of `rep movsb`. Under Rosetta 2 `rep movsb`
-/// runs at about 3.7 GB/s and `rep movsq` at 25-30 GB/s; a world frame's
-/// in-place copies took 88 ms instead of 139 (agent/next5 83b2c6b9).
-/// `VICTORY_COPY_WIDE`: on by default on Darwin, off elsewhere (a native
-/// `rep movsb` is fast); `VICTORY_AB` can toggle it in a run.
+/// Mac layer: whether copies move eight bytes a step (`rep movsq`, then
+/// the tail a byte at a time with plain moves) instead of `rep movsb`.
+/// Under Rosetta 2 `rep movsb` runs at about 3.7 GB/s and `rep movsq` at
+/// 25-30 GB/s (a world frame's in-place copies 88 ms instead of 139,
+/// agent/next5 83b2c6b9); and every run that copied with `rep movsb` here
+/// (`VICTORY_AB` turning this off for a phase: nb-av-d to -l, nb-base-m)
+/// died within minutes in D3DMetal on a pipeline object holding garbage,
+/// while the run with this on throughout (nb-base-i) did not: a `rep movsb`
+/// resumed after a guard fault is taken to write past its end. Always on on
+/// Darwin; elsewhere `VICTORY_COPY_WIDE=1` (a native `rep movsb` is fast).
 fn wide() -> bool {
-    #[cfg(feature = "diagnostics")]
-    {
-        static BIT: OnceLock<Option<u32>> = OnceLock::new();
-        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_COPY_WIDE")) {
-            return crate::ab::on(bit);
-        }
-    }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::mac::switch("VICTORY_COPY_WIDE", true, false))
+    *ON.get_or_init(|| crate::mac::is_darwin() || std::env::var_os("VICTORY_COPY_WIDE").is_some_and(|v| v != "0"))
 }
 
 /// For the fault handler: where a fault at instruction `at` is to go on, if
