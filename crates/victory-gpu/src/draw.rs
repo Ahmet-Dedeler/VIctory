@@ -1139,6 +1139,20 @@ impl State {
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
+    /// Mac layer: the title's pipeline set again right before a draw or
+    /// dispatch (`crate::mac::pipeline_every_draw`). D3DMetal keeps one
+    /// current pipeline; what runs between `bind` and the draw (refreshes
+    /// that record steps on the card, clamps) may set one of ours, and
+    /// D3DMetal then read it as the draw's (runs nb-av-d to -j).
+    fn mac_pipeline(&self, list: &HostList) {
+        if crate::mac::pipeline_every_draw()
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            // SAFETY: an open list and a live pipeline (the list keeps it).
+            unsafe { list.list.SetPipelineState(&p.pso) };
+        }
+    }
+
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -2682,6 +2696,7 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        self.mac_pipeline(list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
@@ -3029,6 +3044,7 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
+                    self.mac_pipeline(list);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
                     self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
@@ -3516,6 +3532,7 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            self.mac_pipeline(list);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -3621,6 +3638,7 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            self.mac_pipeline(list);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -3904,6 +3922,7 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        self.mac_pipeline(list);
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
