@@ -25,6 +25,9 @@ pub(super) enum Kind {
     Sent,
     /// A present came back: a frame ends.
     Frame,
+    /// A D3D12 call on a list during Metal attribution. a is the list,
+    /// b identifies its shader or fence, and stack holds a call argument.
+    MetalCall,
     /// The title is told something: `b` is stored at `a` (a fence, or what
     /// a list writes when it has run).
     Told,
@@ -65,6 +68,7 @@ const STACKS: usize = 1 << 16;
 pub(super) const DEPTH: usize = 14;
 
 static ON: AtomicBool = AtomicBool::new(false);
+static METAL: AtomicBool = AtomicBool::new(false);
 static SLOTS: AtomicPtr<Slot> = AtomicPtr::new(std::ptr::null_mut());
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 static STACK: AtomicPtr<[usize; DEPTH]> = AtomicPtr::new(std::ptr::null_mut());
@@ -91,6 +95,12 @@ pub(crate) fn ticks() -> u64 {
 
 pub(super) fn micros(ticks: u64) -> u64 {
     ticks.saturating_mul(1_000_000) / frequency()
+}
+
+/// Whether Metal attribution is collecting D3D12 call brackets.
+#[inline(always)]
+pub(super) fn metal() -> bool {
+    METAL.load(Ordering::Acquire)
 }
 
 /// Whether events are recorded now.
@@ -439,6 +449,7 @@ fn keep(frames: [usize; DEPTH]) -> u32 {
 /// What was asked for.
 struct Asked {
     file: std::path::PathBuf,
+    metal: bool,
     /// Seconds after which a recording begins, for each.
     after: Vec<f64>,
     frames: u64,
@@ -464,10 +475,22 @@ fn asked() -> Option<&'static Asked> {
     static ASKED: OnceLock<Option<Asked>> = OnceLock::new();
     ASKED
         .get_or_init(|| {
-            let file = std::env::var_os("VICTORY_TIMELINE").filter(|v| !v.is_empty())?;
+            let metal = std::env::var_os("VICTORY_METAL_BRACKETS").filter(|v| !v.is_empty());
+            let file = metal.clone().or_else(|| std::env::var_os("VICTORY_TIMELINE"))
+                .filter(|v| !v.is_empty())?;
             let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<f64>().ok());
             let text = file.to_string_lossy();
             let (when, file) = parse(&text);
+            if metal.is_some()
+                && !when.as_ref().is_some_and(|(after, frames)| {
+                    matches!(after.as_slice(), [at] if at.is_finite() && *at >= 0.0)
+                        && (1..=6).contains(frames)
+                        && !file.is_empty()
+                })
+            {
+                tracing::warn!("VICTORY_METAL_BRACKETS requires seconds,1–6 frames,file");
+                return None;
+            }
             let (after, frames) = when.unwrap_or_else(|| {
                 (
                     vec![number("VICTORY_TIMELINE_AT").unwrap_or(60.0)],
@@ -476,6 +499,7 @@ fn asked() -> Option<&'static Asked> {
             });
             Some(Asked {
                 file: file.into(),
+                metal: metal.is_some(),
                 after,
                 frames: frames.clamp(1, 60),
                 started: std::time::Instant::now(),
@@ -486,7 +510,7 @@ fn asked() -> Option<&'static Asked> {
 
 /// Whether a timeline was asked for.
 pub(super) fn wanted() -> bool {
-    asked().is_some()
+    asked().is_some_and(|config| !config.metal)
 }
 
 /// Where the recording is.
@@ -525,18 +549,26 @@ pub(crate) fn presented() {
         // while: the recording begins two frames later.
         stage.ready = true;
         make_room();
-        crate::host::timeline_ready();
+        if !asked.metal {
+            crate::host::timeline_ready();
+        }
         return;
     }
     if !stage.began {
         stage.began = true;
-        stage.before = Some(super::report::Threads::now());
-        tracing::info!(file = %asked.file.display(), frames = asked.frames, "the timeline begins (VICTORY_TIMELINE)");
-        begin();
-        if std::thread::Builder::new().name("victory-sample".into()).spawn(sample).is_err() {
-            tracing::warn!("the timeline is without samples of the title's threads");
+        if asked.metal {
+            tracing::info!(file = %asked.file.display(), frames = asked.frames, "Metal attribution begins");
+            frame();
+            METAL.store(true, Ordering::Release);
+        } else {
+            stage.before = Some(super::report::Threads::now());
+            tracing::info!(file = %asked.file.display(), frames = asked.frames, "the timeline begins (VICTORY_TIMELINE)");
+            begin();
+            if std::thread::Builder::new().name("victory-sample".into()).spawn(sample).is_err() {
+                tracing::warn!("the timeline is without samples of the title's threads");
+            }
+            frame();
         }
-        frame();
         return;
     }
     frame();
@@ -545,6 +577,9 @@ pub(crate) fn presented() {
         return;
     }
     stage.writing = true;
+    if asked.metal {
+        METAL.store(false, Ordering::Release);
+    }
     let before = stage.before.take().unwrap_or_default();
     // Several recordings: a file each.
     let file = match asked.after.len() {
@@ -556,12 +591,18 @@ pub(crate) fn presented() {
     };
     drop(stage);
     let write = move || {
-        let after = super::report::Threads::now();
-        // The spans under way at the last present end first.
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        let data = end();
-        super::report::write(&file, data, &before, &after, crate::host::timeline_stamps());
-        crate::host::timeline_restart();
+        if asked.metal {
+            if let Err(error) = super::metal::write(&file, end()) {
+                tracing::warn!(%error, "Metal attribution file could not be written");
+            }
+        } else {
+            let after = super::report::Threads::now();
+            // The spans under way at the last present end first.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let data = end();
+            super::report::write(&file, data, &before, &after, crate::host::timeline_stamps());
+            crate::host::timeline_restart();
+        }
         let mut stage = STAGE.lock().unwrap_or_else(|e| e.into_inner());
         (stage.began, stage.frames, stage.writing) = (false, 0, false);
         stage.made += 1;

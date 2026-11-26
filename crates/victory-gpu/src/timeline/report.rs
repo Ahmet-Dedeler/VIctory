@@ -310,7 +310,7 @@ impl Trace {
                     trace.spans.entry(e.thread).or_default().push(i);
                 }
                 Kind::Frame => trace.frames.push((e.t1, e.thread)),
-                Kind::Told | Kind::Poll | Kind::Sample => {}
+                Kind::Told | Kind::Poll | Kind::Sample | Kind::MetalCall => {}
             }
         }
         for waits in trace.waits.values_mut() {
