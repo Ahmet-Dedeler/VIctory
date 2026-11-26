@@ -129,6 +129,11 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Dynamic slot allocator details (VICTORY_DYNAMIC_SLOT_STATS).
+    DynamicWaitNs,
+    DynamicHeldNs,
+    DynamicExamined,
+    DynamicSearchMiss,
 }
 const COUNTERS: usize = 80;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -159,6 +164,11 @@ fn bank() -> usize {
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[bank()].0[c as usize].fetch_add(n, Relaxed);
+}
+
+pub(crate) fn dynamic_slots_detail() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_DYNAMIC_SLOT_STATS"))
 }
 
 /// The counter, all sets together, as it is now (it goes back to 0 with
@@ -1204,6 +1214,16 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    if dynamic_slots_detail() {
+        let units = if crate::descriptor::host::packed_dynamic_slots() { "words" } else { "slots" };
+        tracing::info!(
+            "dynamic slot allocator per frame: {:.2} ms locking, {:.2} ms under lock, {:.0} {units} examined, {:.1} searches found no run",
+            c[C::DynamicWaitNs as usize] / 1e6,
+            c[C::DynamicHeldNs as usize] / 1e6,
+            c[C::DynamicExamined as usize],
+            c[C::DynamicSearchMiss as usize],
+        );
+    }
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
