@@ -118,6 +118,9 @@ pub fn title_memory_aliasable(at: usize, len: usize) {
         STATS[2].fetch_add(1, Ordering::Relaxed);
         return;
     };
+    // An allocation still noted here overlaps the new one: it was freed unseen (the host's
+    // `NtFreeVirtualMemory`), so what is placed over it shows its old buffers. Let it go first.
+    title_memory_alias_freed(at as usize, len as usize, true);
     let mut chunks = BTreeMap::new();
     let mut offset = 0;
     while offset < len {
