@@ -949,7 +949,17 @@ extern "system" fn present(
             None
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource });
+        // The second plane, its state taken as the first's is.
+        let over = texture.as_ref().and_then(|t| {
+            // SAFETY: the title passes `planes` plane descriptions.
+            let second = unsafe { second_plane(planes, plane_parameters, t.0 as This) }?;
+            let copy = crate::resource::host_copy(second)?;
+            let state = crate::resource::host_transition(second, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+            crate::resource::host_transition(second, state);
+            let state = if crate::list::thin::wanted() { u32::MAX } else { state };
+            Some((copy, state))
+        });
+        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), over, Shown { frame, resource });
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -969,7 +979,14 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        show(texture, state, Shown { frame, resource: resource as usize });
+        // SAFETY: the title passes `planes` plane descriptions.
+        let over = unsafe { second_plane(planes, plane_parameters, resource) }.and_then(|second| {
+            let texture = crate::resource::host_resource(second)?;
+            let state = crate::resource::host_transition(second, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+            crate::resource::host_transition(second, state);
+            Some((texture, state))
+        });
+        show(texture, state, over, Shown { frame, resource: resource as usize });
         crate::resource::host_transition(resource, state);
         let _ = host;
     }
@@ -1002,13 +1019,122 @@ struct Shown {
     resource: usize,
 }
 
-/// Shows `texture`, in host state `state`, in our window.
+/// Bytes between a present's plane descriptions: each is 0x48 bytes and
+/// starts as [`Plane`] does (after soldsawn's fork, 82231c33).
+const PLANE_STRIDE: usize = 0x48;
+
+/// Whether a present's second plane is drawn over its first
+/// (`VICTORY_PRESENT_PLANES=0`: the first alone, as before).
+fn second_planes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PRESENT_PLANES").map_or(true, |v| v.trim() != "0"))
+}
+
+/// The first resource of a present's second plane: the title's interface
+/// over its game image in its Series S mode (`crate::host::Host::present`).
+/// `None` with one plane, an empty one, or the first plane's resource again.
+///
+/// # Safety
+///
+/// `parameters` is null or points at `planes` plane descriptions,
+/// [`PLANE_STRIDE`] bytes apart, each listing `count` resources.
+unsafe fn second_plane(planes: u32, parameters: *const Plane, first: This) -> Option<This> {
+    #[cfg(feature = "diagnostics")]
+    {
+        static PLANES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+        let was = PLANES.swap(planes, Ordering::Relaxed);
+        if was != planes {
+            tracing::info!(planes, was, frame = FRAMES.load(Ordering::Relaxed), "the title's presents now have this many planes");
+        }
+    }
+    if planes < 2 || parameters.is_null() || !second_planes() {
+        return None;
+    }
+    // SAFETY: the caller's: a second description follows the first.
+    let plane = unsafe { &*parameters.cast::<u8>().add(PLANE_STRIDE).cast::<Plane>() };
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    #[cfg(feature = "diagnostics")]
+    {
+        // Each new pair of planes once, with their sizes and formats.
+        static LAST: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != (first as usize, resource as usize) {
+            *last = (first as usize, resource as usize);
+            #[cfg(windows)]
+            {
+                let desc = |r: This| {
+                    crate::resource::host_copy(r).map(|c| {
+                        // SAFETY: a live host texture.
+                        let d = unsafe { c.texture.GetDesc() };
+                        (d.Width, d.Height, d.Format.0)
+                    })
+                };
+                tracing::info!(planes, first = ?first, second = ?resource, first_is = ?desc(first), second_is = ?desc(resource), "a present's planes (width, height, format)");
+            }
+        }
+    }
+    (!resource.is_null() && resource != first).then_some(resource)
+}
+
+#[cfg(test)]
+mod plane_tests {
+    use super::*;
+
+    /// Two plane descriptions as a title lays them out, [`PLANE_STRIDE`]
+    /// bytes apart, the second naming `count` resources at `resources`.
+    fn two(count: u32, resources: *const This) -> [u64; 2 * PLANE_STRIDE / 8] {
+        let mut words = [0u64; 2 * PLANE_STRIDE / 8];
+        let second = PLANE_STRIDE / 8;
+        words[second] = 7; // frame token
+        words[second + 1] = u64::from(count);
+        words[second + 2] = resources as u64;
+        words
+    }
+
+    #[test]
+    fn the_second_plane_is_chosen_only_when_it_names_another_resource() {
+        let (a, b) = (0x1000 as This, 0x2000 as This);
+        let other = [b];
+        let same = [a];
+        let none = [std::ptr::null::<crate::object::Object>()];
+        // SAFETY: each description is a whole local array laid out as the
+        // title's; resource lists are local arrays of one.
+        unsafe {
+            let with_other = two(1, other.as_ptr());
+            let p = with_other.as_ptr().cast::<Plane>();
+            assert_eq!(second_plane(2, p, a), Some(b));
+            assert_eq!(second_plane(1, p, a), None);
+            assert_eq!(second_plane(0, p, a), None);
+            assert_eq!(second_plane(2, std::ptr::null(), a), None);
+            let with_same = two(1, same.as_ptr());
+            assert_eq!(second_plane(2, with_same.as_ptr().cast(), a), None);
+            let empty = two(0, other.as_ptr());
+            assert_eq!(second_plane(2, empty.as_ptr().cast(), a), None);
+            let unlisted = two(1, std::ptr::null());
+            assert_eq!(second_plane(2, unlisted.as_ptr().cast(), a), None);
+            let with_null = two(1, none.as_ptr());
+            assert_eq!(second_plane(2, with_null.as_ptr().cast(), a), None);
+        }
+    }
+}
+
+/// Shows `texture`, in host state `state`, in our window, with a second
+/// plane in its own state over it.
 #[cfg(windows)]
-fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, what: Shown) {
+fn show(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    state: u32,
+    over: Option<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+    what: Shown,
+) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present(texture, state, what.frame);
+    let shown = host.present(texture, state, over, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]
