@@ -36,7 +36,8 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
 /// `VICTORY_ALIAS`: 0 off (the default); 1 alias committed title allocations of at least
 /// `VICTORY_ALIAS_MIN_KB` (1024) under Wine on macOS, and place title buffers and windows in them.
@@ -197,6 +198,18 @@ pub(crate) fn placed(start: u64, len: u64) -> Option<(ID3D12Resource, u64, u64)>
     if !enabled() {
         return None;
     }
+    if let Some(p) = placed_private(start, len) {
+        STATS[4].fetch_add(1, Ordering::Relaxed);
+        return Some(p);
+    }
+    if let Some(p) = placed_in_view(start, len) {
+        POOL[6].fetch_add(1, Ordering::Relaxed);
+        return Some(p);
+    }
+    placed_scattered(start, len)
+}
+
+fn placed_private(start: u64, len: u64) -> Option<(ID3D12Resource, u64, u64)> {
     let t = table();
     let (a_start, (a_len, chunks)) = t.allocations.range(..=start).next_back()?;
     if start + len.max(1) > a_start + a_len {
@@ -206,16 +219,404 @@ pub(crate) fn placed(start: u64, len: u64) -> Option<(ID3D12Resource, u64, u64)>
     if start + len.max(1) > c_start + chunk.len {
         return None;
     }
-    STATS[4].fetch_add(1, Ordering::Relaxed);
     let bias = start - c_start;
     Some((chunk.buffer.clone(), chunk.gpu + bias, bias))
 }
 
-/// Whether `[start, start + len)` lies in aliased memory.
+/// `[start, start + len)` as one run of an aliased section's bytes (title views of consecutive
+/// pages of it, [`crate::inplace::cover`]) inside one of its chunks: that chunk's buffer at the
+/// run's offset.
+fn placed_in_view(start: u64, len: u64) -> Option<(ID3D12Resource, u64, u64)> {
+    if !pool_enabled() {
+        return None;
+    }
+    let crate::inplace::Cover::Run(section, offset) = crate::inplace::cover(start as usize, len as usize) else {
+        return None;
+    };
+    let s = sections();
+    let aliased = s.get(&section)?;
+    let (c_off, chunk) = aliased.chunks.range(..=offset).next_back()?;
+    if offset + len.max(1) > c_off + chunk.len {
+        return None;
+    }
+    let bias = offset - c_off;
+    Some((chunk.buffer.clone(), chunk.gpu + bias, bias))
+}
+
+/// Whether `[start, start + len)` lies in aliased memory (an aliased allocation, or one run of an
+/// aliased section's bytes in one chunk).
 pub(crate) fn covers(start: u64, len: u64) -> bool {
-    enabled() && {
-        let t = table();
-        t.allocations.range(..=start).next_back().is_some_and(|(s, (l, _))| start + len.max(1) <= s + l)
+    enabled()
+        && ({
+            let t = table();
+            t.allocations.range(..=start).next_back().is_some_and(|(s, (l, _))| start + len.max(1) <= s + l)
+        } || placed_in_view(start, len).is_some()
+            || (tiles_enabled() && scattered_plan(start, len).is_some()))
+}
+
+// The title's physical pages (`VICTORY_ALIAS_POOL`).
+//
+// The runtime backs the title's physical pages with pagefile sections and maps them as views
+// (`xmem`: `XMemMapPhysicalPages`, the GPU's page-mapping copies, DirectStorage's view of a whole
+// section). With the switch, each section is backed by buffers of the card's from its creation, and
+// every view of it the runtime maps is pointed at those buffers' pages right after Wine maps it
+// (one `mach_vm_remap` a view), so all views of a page show the very bytes the GPU reads. Wine
+// still believes it mapped the section (its `VirtualQuery`, `VirtualProtect` and unmapping work as
+// before); the section's own file pages are never touched. A title buffer over one run of a
+// section's pages is then that section's buffer at the run's offset ([`placed`]).
+
+/// `VICTORY_ALIAS_POOL`: 1 back the title's physical pages (sections) by the card's buffers and
+/// alias every view of them (needs `VICTORY_ALIAS=1`); 0 (the default) not.
+pub fn pool_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| enabled() && std::env::var("VICTORY_ALIAS_POOL").is_ok_and(|v| v.trim() == "1"))
+}
+
+struct SectionChunk {
+    len: u64,
+    buffer: ID3D12Resource,
+    gpu: u64,
+    /// The buffer's mapping (where views are pointed).
+    data: u64,
+    /// With `VICTORY_ALIAS_TILES`: the heap the buffer is placed over (all of it), which reserved
+    /// buffers' tiles are mapped onto.
+    heap: Option<ID3D12Heap>,
+}
+
+struct AliasedSection {
+    len: u64,
+    /// Chunks by offset in the section.
+    chunks: BTreeMap<u64, SectionChunk>,
+}
+
+static SECTIONS: Mutex<BTreeMap<usize, AliasedSection>> = Mutex::new(BTreeMap::new());
+
+/// Heaps of sections let go while reserved buffers may still map them.
+static HEAPS_KEPT: Mutex<Vec<ID3D12Heap>> = Mutex::new(Vec::new());
+
+fn sections() -> std::sync::MutexGuard<'static, BTreeMap<usize, AliasedSection>> {
+    SECTIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Sections aliased, their bytes, sections turned down, views pointed at their buffers, the
+/// microseconds that took, view remap failures, placements in views.
+/// Then (`VICTORY_ALIAS_TILES`): placements over scattered pages, their tiles, the microseconds
+/// mapping them took (made, mapped, waited for), placements turned down.
+static POOL: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+/// `VICTORY_ALIAS_TILES`: 1 a title buffer over scattered pages of aliased sections is a reserved
+/// buffer whose 64 KiB tiles are mapped onto the sections' heaps page by page (needs
+/// `VICTORY_ALIAS_POOL=1`); 0 (the default) such buffers are copied.
+pub fn tiles_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pool_enabled() && std::env::var("VICTORY_ALIAS_TILES").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// A heap of `bytes` in the PC's memory (write-back, pool L0, as `Host::shared_buffer`'s) with a
+/// buffer placed over all of it and mapped: the heap, the buffer and its mapping.
+fn heap_buffer(device: &ID3D12Device, bytes: u64) -> windows::core::Result<(ID3D12Heap, ID3D12Resource, *mut u8)> {
+    let props = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_CUSTOM,
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+        MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+        ..Default::default()
+    };
+    let desc = D3D12_HEAP_DESC { SizeInBytes: bytes, Properties: props, Alignment: 64 << 10, Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS };
+    let mut heap: Option<ID3D12Heap> = None;
+    let mut buffer: Option<ID3D12Resource> = None;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: plain creation, placement over the whole new heap, and mapping of a CPU-visible buffer.
+    unsafe {
+        device.CreateHeap(&desc, &mut heap)?;
+        let heap = heap.ok_or_else(windows::core::Error::empty)?;
+        device.CreatePlacedResource(&heap, 0, &buffer_desc(bytes), D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)?;
+        let buffer = buffer.ok_or_else(windows::core::Error::empty)?;
+        buffer.Map(0, None, Some(&mut data))?;
+        Ok((heap, buffer, data.cast()))
+    }
+}
+
+fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes.max(1),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    }
+}
+
+/// Most pages one reserved buffer covers (1 GiB).
+const MOST_TILES: usize = 16384;
+
+/// Where `[start, start + len)`'s pages are, if every one is shown by a title view of an aliased
+/// section with a heap: the first page's address, the number of pages, and the tile runs (chunk
+/// key: section and chunk offset; first tile; first heap page; tiles).
+fn scattered_plan(start: u64, len: u64) -> Option<(u64, usize, Vec<((usize, u64), u32, u32, u32)>)> {
+    const K64: u64 = 64 << 10;
+    let page0 = start & !(K64 - 1);
+    let n = (start + len.max(1) - page0).div_ceil(K64) as usize;
+    if n > MOST_TILES {
+        return None;
+    }
+    let shown = crate::inplace::pages_shown(page0 as usize, n)?;
+    let s = sections();
+    let mut runs: Vec<((usize, u64), u32, u32, u32)> = Vec::new();
+    for (k, (section, offset)) in shown.into_iter().enumerate() {
+        let aliased = s.get(&section)?;
+        let (&c_off, chunk) = aliased.chunks.range(..=offset).next_back()?;
+        if chunk.heap.is_none() || offset + K64 > c_off + chunk.len {
+            return None;
+        }
+        let page = ((offset - c_off) / K64) as u32;
+        match runs.last_mut() {
+            Some((key, first, heap_first, count)) if *key == (section, c_off) && *first + *count == k as u32 && *heap_first + *count == page => *count += 1,
+            _ => runs.push(((section, c_off), k as u32, page, 1)),
+        }
+    }
+    Some((page0, n, runs))
+}
+
+/// Our queue for tile mappings, its fence and event, and the last value signalled.
+struct TileQueue {
+    queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
+    event: windows::Win32::Foundation::HANDLE,
+    value: u64,
+}
+
+// SAFETY: D3D12 objects and an event handle are free-threaded; the mutex orders their use.
+unsafe impl Send for TileQueue {}
+
+static TILE_QUEUE: Mutex<Option<TileQueue>> = Mutex::new(None);
+
+/// A reserved buffer over `[start, start + len)`'s scattered pages, its tiles mapped onto the
+/// sections' heaps and the mapping finished before it is handed out (so lists on any queue may use
+/// it): the buffer, the GPU address of `start`, and `start`'s offset in it.
+fn placed_scattered(start: u64, len: u64) -> Option<(ID3D12Resource, u64, u64)> {
+    if !tiles_enabled() {
+        return None;
+    }
+    let (page0, n, runs) = scattered_plan(start, len)?;
+    let began = std::time::Instant::now();
+    let host = crate::host::host()?;
+    let device = &host.device;
+    let turned_down = || {
+        POOL[10].fetch_add(1, Ordering::Relaxed);
+        None
+    };
+    let mut reserved: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation.
+    if unsafe { device.CreateReservedResource(&buffer_desc(n as u64 * (64 << 10)), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved) }.is_err() {
+        return turned_down();
+    }
+    let reserved = reserved?;
+    // Runs by heap: one UpdateTileMappings a heap.
+    let mut by_heap: BTreeMap<(usize, u64), Vec<(u32, u32, u32)>> = BTreeMap::new();
+    for (key, first, heap_first, count) in runs {
+        by_heap.entry(key).or_default().push((first, heap_first, count));
+    }
+    let heaps: Vec<(ID3D12Heap, Vec<(u32, u32, u32)>)> = {
+        let s = sections();
+        let mut out = Vec::new();
+        for (key, runs) in by_heap {
+            let heap = s.get(&key.0).and_then(|a| a.chunks.get(&key.1)).and_then(|c| c.heap.clone());
+            let Some(heap) = heap else {
+                return turned_down();
+            };
+            out.push((heap, runs));
+        }
+        out
+    };
+    let mut tq = TILE_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    if tq.is_none() {
+        // SAFETY: plain creation.
+        let made = unsafe {
+            device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).and_then(|queue| {
+                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
+                Ok(TileQueue { queue, fence, event, value: 0 })
+            })
+        };
+        match made {
+            Ok(q) => *tq = Some(q),
+            Err(e) => {
+                tracing::warn!(error = %e, "no queue for tile mappings: scattered pages are copied");
+                return turned_down();
+            }
+        }
+    }
+    let q = tq.as_mut()?;
+    for (heap, runs) in &heaps {
+        let coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = runs.iter().map(|r| D3D12_TILED_RESOURCE_COORDINATE { X: r.0, ..Default::default() }).collect();
+        let sizes: Vec<D3D12_TILE_REGION_SIZE> = runs.iter().map(|r| D3D12_TILE_REGION_SIZE { NumTiles: r.2, ..Default::default() }).collect();
+        let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; runs.len()];
+        let starts: Vec<u32> = runs.iter().map(|r| r.1).collect();
+        let counts: Vec<u32> = runs.iter().map(|r| r.2).collect();
+        // SAFETY: a live reserved buffer and heap; `runs.len()` regions and ranges in arrays of that
+        // length, living through the call; each region lies in the buffer, each range in the heap.
+        unsafe {
+            q.queue.UpdateTileMappings(
+                &reserved,
+                runs.len() as u32,
+                Some(coords.as_ptr()),
+                Some(sizes.as_ptr()),
+                heap,
+                runs.len() as u32,
+                Some(flags.as_ptr()),
+                Some(starts.as_ptr()),
+                Some(counts.as_ptr()),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+    }
+    q.value += 1;
+    // SAFETY: our queue, fence and event.
+    let waited = unsafe {
+        q.queue.Signal(&q.fence, q.value).is_ok()
+            && q.fence.SetEventOnCompletion(q.value, q.event).is_ok()
+            && windows::Win32::System::Threading::WaitForSingleObject(q.event, 5_000).0 == 0
+    };
+    drop(tq);
+    if !waited {
+        tracing::warn!("a tile mapping did not finish in 5 s: that buffer is copied");
+        return turned_down();
+    }
+    crate::host::name(&reserved, || format!("title memory {start:#x}+{len:#x} over scattered aliased pages"));
+    POOL[7].fetch_add(1, Ordering::Relaxed);
+    POOL[8].fetch_add(n as u64, Ordering::Relaxed);
+    POOL[9].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    // SAFETY: a live buffer.
+    let gpu = unsafe { reserved.GetGPUVirtualAddress() };
+    let bias = start - page0;
+    Some((reserved, gpu + bias, bias))
+}
+
+/// The runtime made a section of `bytes` (fresh, all zero) for physical pages, and has mapped no
+/// view of it yet: back it by buffers of the card's.
+pub fn title_section_made(section: usize, bytes: u64) {
+    if !pool_enabled() {
+        return;
+    }
+    // A handle number that came round again: the old section is gone (its views with it).
+    title_section_gone(section);
+    if bytes % (16 << 10) != 0 || STATS[1].load(Ordering::Relaxed) + POOL[1].load(Ordering::Relaxed) + bytes > most_bytes() {
+        POOL[2].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let Some(host) = crate::host::host() else {
+        POOL[2].fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(section, mb = bytes >> 20, "a section of physical pages made before the host: not aliased");
+        return;
+    };
+    let mut chunks = BTreeMap::new();
+    let mut offset = 0;
+    while offset < bytes {
+        let part = (bytes - offset).min(chunk_bytes());
+        let made = if tiles_enabled() {
+            match heap_buffer(&host.device, part) {
+                Ok((heap, buffer, data)) => Some((buffer, data, Some(heap))),
+                Err(e) => {
+                    tracing::warn!(error = %e, part, "no heap for aliased physical pages");
+                    None
+                }
+            }
+        } else {
+            host.shared_buffer(part).map(|(buffer, data)| (buffer, data, None))
+        };
+        let Some((buffer, data, heap)) = made else {
+            POOL[2].fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        // A fresh section reads zero. Fresh pages from the kernel are, but a buffer D3DMetal hands
+        // out again from its own pool might not be (pragyaangaur/VIctory-macOS#207 probes for
+        // this): one word a MiB is looked at, and the buffer cleared if any is not zero.
+        // SAFETY: `data` maps `part` bytes of a live buffer of ours.
+        unsafe {
+            let words = data.cast::<u64>();
+            if (0..part as usize).step_by(1 << 20).any(|at| words.add(at / 8).read_volatile() != 0) {
+                tracing::warn!(section, part, "a buffer for physical pages did not read zero: cleared");
+                std::ptr::write_bytes(data, 0, part as usize);
+            }
+        }
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        crate::host::name(&buffer, || format!("physical pages, section {section:#x}+{offset:#x} aliased"));
+        chunks.insert(offset, SectionChunk { len: part, buffer, gpu, data: data as u64, heap });
+        offset += part;
+    }
+    POOL[0].fetch_add(1, Ordering::Relaxed);
+    POOL[1].fetch_add(bytes, Ordering::Relaxed);
+    tracing::info!(section, mb = bytes >> 20, chunks = chunks.len(), "physical pages backed by the card's buffers (VICTORY_ALIAS_POOL)");
+    sections().insert(section, AliasedSection { len: bytes, chunks });
+}
+
+/// Wine just mapped `[at, at + len)` as a view of `section` from `offset` on (nothing has used the
+/// view yet): point it at the section's buffers. False if the section is aliased and a part could
+/// not be pointed (that part then shows the section's own pages, which nothing else shows: a
+/// warning says so).
+pub fn title_section_view(at: usize, len: usize, section: usize, offset: u64) -> bool {
+    if !pool_enabled() || len == 0 {
+        return true;
+    }
+    let s = sections();
+    let Some(aliased) = s.get(&section) else {
+        return true;
+    };
+    let (at, len) = (at as u64, len as u64);
+    if offset + len > aliased.len || at % (16 << 10) != 0 || offset % (16 << 10) != 0 {
+        POOL[5].fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(at = format_args!("{at:#x}"), len, offset, "a view of aliased physical pages outside its section or not aligned: not pointed at the card's buffer");
+        return false;
+    }
+    let began = std::time::Instant::now();
+    let mut ok = true;
+    for (&c_off, chunk) in aliased.chunks.range(..offset + len) {
+        let from = offset.max(c_off);
+        let to = (offset + len).min(c_off + chunk.len);
+        if from >= to {
+            continue;
+        }
+        let target = at + (from - offset);
+        // SAFETY: `[target, + to - from)` is a view Wine just mapped for the runtime, unused yet;
+        // the source is the mapping of a live buffer the table keeps, inside it.
+        let r = unsafe { remap_shared(target, chunk.data + (from - c_off), to - from) };
+        if r.msg != 0 || r.kr != 0 || r.address != target {
+            ok = false;
+            if POOL[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::error!(
+                    at = format_args!("{target:#x}"),
+                    bytes = to - from,
+                    msg = format_args!("{:#x}", r.msg),
+                    kr = r.kr,
+                    "a view of aliased physical pages not pointed at the card's buffer: it shows stale bytes"
+                );
+            }
+        }
+    }
+    POOL[3].fetch_add(1, Ordering::Relaxed);
+    POOL[4].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    ok
+}
+
+/// The runtime closed `section` (no view of it is left): its buffers go when the last list or
+/// placement holding them does.
+pub fn title_section_gone(section: usize) {
+    if !pool_enabled() {
+        return;
+    }
+    if let Some(gone) = sections().remove(&section) {
+        // Reserved buffers may still have tiles on these heaps: kept for good (sections live as
+        // long as the title, so this is rare).
+        KEPT.lock().unwrap_or_else(|e| e.into_inner()).extend(gone.chunks.values().filter(|c| c.heap.is_some()).map(|c| c.buffer.clone()));
+        HEAPS_KEPT.lock().unwrap_or_else(|e| e.into_inner()).extend(gone.chunks.values().filter_map(|c| c.heap.clone()));
+        POOL[0].fetch_sub(1, Ordering::Relaxed);
+        POOL[1].fetch_sub(gone.len, Ordering::Relaxed);
+        tracing::info!(section, mb = gone.len >> 20, "aliased physical pages let go");
     }
 }
 
@@ -225,7 +626,7 @@ pub(crate) fn report() -> Option<String> {
         return None;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
-    Some(format!(
+    let mut line = format!(
         "title memory aliased onto the card's buffers (VICTORY_ALIAS): {} allocations {} MB; turned down {}; remap failures {}; placements {}; let go {}",
         s[0],
         s[1] >> 20,
@@ -233,7 +634,32 @@ pub(crate) fn report() -> Option<String> {
         s[3],
         s[4],
         s[5]
-    ))
+    );
+    if pool_enabled() {
+        let p: Vec<u64> = POOL.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        line += &format!(
+            " | physical pages (VICTORY_ALIAS_POOL): {} sections {} MB, turned down {}; {} views pointed at them in {} ms ({:.1} us each), failures {}; placements in views {}",
+            p[0],
+            p[1] >> 20,
+            p[2],
+            p[3],
+            p[4] / 1000,
+            p[4] as f64 / p[3].max(1) as f64,
+            p[5],
+            p[6]
+        );
+        if tiles_enabled() {
+            line += &format!(
+                "; over scattered pages (VICTORY_ALIAS_TILES): {} placements {} tiles in {} ms ({:.0} us each), turned down {}",
+                p[7],
+                p[8],
+                p[9] / 1000,
+                p[9] as f64 / p[7].max(1) as f64,
+                p[10]
+            );
+        }
+    }
+    Some(line)
 }
 
 // Shader writes into aliased memory.
@@ -420,8 +846,6 @@ unsafe fn remap_shared(target: u64, src: u64, size: u64) -> Remapped {
 /// macOS (a CrossOver bottle with the D3DMetal backend). Panics with what failed.
 pub mod check {
     use super::*;
-    use windows::Win32::Graphics::Direct3D12::*;
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     use windows::core::Interface;
     use windows_sys::Win32::System::Memory as mem;
@@ -506,7 +930,263 @@ pub mod check {
             assert!(!covers(base as u64 + AT as u64, 4096));
             assert_ne!(mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE), 0);
             assert!(device.GetDeviceRemovedReason().is_ok());
+            if pool_enabled() {
+                pool(&device);
+            }
+            if std::env::var_os("VICTORY_ALIAS_CHECK_TILES").is_some() {
+                tiles(&device);
+            }
             println!("{}", report().unwrap_or_default());
+        }
+    }
+
+    /// For pages scattered over the title's address space (`VICTORY_ALIAS_CHECK_TILES=1`): a heap of
+    /// the card's in the PC's memory, a buffer placed over all of it and kept mapped (the CPU's
+    /// side, where views would point), and a reserved buffer whose 64 KiB tiles are mapped onto
+    /// pages of that heap out of order. Checks that the GPU sees CPU writes through the reserved
+    /// buffer and the CPU sees GPU writes into it, and what one tile mapping update costs.
+    unsafe fn tiles(device: &ID3D12Device) {
+        const K64: u64 = 64 << 10;
+        const PAGES: u64 = 256;
+        // SAFETY (whole body): objects of the check's own; accesses lie in the mapped buffer.
+        unsafe {
+            let props = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            let hd = D3D12_HEAP_DESC { SizeInBytes: PAGES * K64, Properties: props, Alignment: K64, Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS };
+            device.CreateHeap(&hd, &mut heap).expect("CreateHeap custom write-back L0");
+            let heap = heap.unwrap();
+            let desc = |size: u64, layout| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: layout,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut whole: Option<ID3D12Resource> = None;
+            device.CreatePlacedResource(&heap, 0, &desc(PAGES * K64, D3D12_TEXTURE_LAYOUT_ROW_MAJOR), D3D12_RESOURCE_STATE_COMMON, None, &mut whole).expect("placed buffer over the heap");
+            let whole = whole.unwrap();
+            let mut p = std::ptr::null_mut();
+            whole.Map(0, None, Some(&mut p)).expect("Map of a placed buffer in a custom heap");
+            let base = p.cast::<u8>();
+            println!("tiles check: heap {} MiB, placed buffer mapped at {:p}", (PAGES * K64) >> 20, base);
+            let mut reserved: Option<ID3D12Resource> = None;
+            device.CreateReservedResource(&desc(8 * K64, D3D12_TEXTURE_LAYOUT_ROW_MAJOR), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).expect("reserved buffer");
+            let reserved = reserved.unwrap();
+            let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            let mut value = 0;
+            let mut wait = |queue: &ID3D12CommandQueue| {
+                value += 1;
+                queue.Signal(&fence, value).unwrap();
+                fence.SetEventOnCompletion(value, event).unwrap();
+                assert_eq!(WaitForSingleObject(event, 10_000).0, 0, "queue timed out");
+            };
+            // Tiles 0..8 of the reserved buffer onto heap pages 7, 3, 7, 200, 5, 6, 100, 1.
+            let map = |queue: &ID3D12CommandQueue, tile: u32, page: u32| {
+                let at = D3D12_TILED_RESOURCE_COORDINATE { X: tile, ..Default::default() };
+                let size = D3D12_TILE_REGION_SIZE { NumTiles: 1, ..Default::default() };
+                let flags = D3D12_TILE_RANGE_FLAG_NONE;
+                let count = 1u32;
+                queue.UpdateTileMappings(&reserved, 1, Some(&at), Some(&size), &heap, 1, Some(&flags), Some(&page), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+            };
+            let pages = [7u32, 3, 7, 200, 5, 6, 100, 1];
+            for (t, &pg) in pages.iter().enumerate() {
+                map(&queue, t as u32, pg);
+            }
+            wait(&queue);
+            for round in 0..8u8 {
+                for (t, &pg) in pages.iter().enumerate() {
+                    if t == 2 {
+                        continue; // page 7 again
+                    }
+                    std::ptr::write_bytes(base.add((pg as u64 * K64) as usize), round.wrapping_mul(16) ^ t as u8, 4096);
+                }
+                let back = committed(device, D3D12_HEAP_TYPE_READBACK, 8 * K64, D3D12_RESOURCE_STATE_COPY_DEST);
+                copy(device, &back, 0, &reserved, 0, 8 * K64);
+                let mut q = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut q)).unwrap();
+                for (t, &_pg) in pages.iter().enumerate() {
+                    let want = round.wrapping_mul(16) ^ if t == 2 { 0 } else { t as u8 };
+                    let got = *q.cast::<u8>().add(t * K64 as usize);
+                    assert_eq!(got, want, "GPU read of reserved tile {t} wrong, round {round}");
+                }
+                back.Unmap(0, None);
+                // The GPU writes reserved tile 3; the CPU sees heap page 200.
+                let up = committed(device, D3D12_HEAP_TYPE_UPLOAD, 4096, D3D12_RESOURCE_STATE_GENERIC_READ);
+                up.Map(0, None, Some(&mut q)).unwrap();
+                std::ptr::write_bytes(q.cast::<u8>(), 0xa0 ^ round, 4096);
+                up.Unmap(0, None);
+                copy(device, &reserved, 3 * K64 + 8192, &up, 0, 4096);
+                assert_eq!(*base.add((200 * K64 + 8192) as usize), 0xa0 ^ round, "CPU did not see the GPU's write through a tile, round {round}");
+            }
+            // A Wine view pointed at heap page 5 through the mapping; the GPU reads it via tile 4.
+            let view = mem::VirtualAlloc(std::ptr::null(), K64 as usize, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            let r = remap_shared(view as u64, base as u64 + 5 * K64, K64);
+            assert!(r.msg == 0 && r.kr == 0, "remap onto the placed buffer's mapping: {:#x} {}", r.msg, r.kr);
+            std::ptr::write_bytes(view, 0x5e, 4096);
+            let back = committed(device, D3D12_HEAP_TYPE_READBACK, K64, D3D12_RESOURCE_STATE_COPY_DEST);
+            copy(device, &back, 0, &reserved, 4 * K64, K64);
+            let mut q = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut q)).unwrap();
+            assert_eq!(*q.cast::<u8>(), 0x5e, "GPU did not see a write through a view pointed at the heap");
+            back.Unmap(0, None);
+            // Cost: remapping one tile and waiting, and 64 tiles in one call (one range each).
+            let n = 500;
+            let t = std::time::Instant::now();
+            for i in 0..n {
+                map(&queue, (i % 8) as u32, 10 + (i % 64) as u32);
+            }
+            let calls = t.elapsed();
+            wait(&queue);
+            println!(
+                "tiles check: {n} single-tile UpdateTileMappings {:.1} us a call, all done {:.1} ms after the first",
+                calls.as_secs_f64() * 1e6 / n as f64,
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                wait(&queue);
+            }
+            println!("tiles check: an empty signal + wait {:.1} us", t.elapsed().as_secs_f64() * 1e6 / 20.0);
+            assert!(device.GetDeviceRemovedReason().is_ok(), "device removed");
+            println!("tiles check: passed");
+        }
+    }
+
+    /// The physical-page path (`VICTORY_ALIAS_POOL=1`): a section backed by the card's buffer, views
+    /// of it in placeholders as `xmem` maps them, two views of one page, a run placed through
+    /// `place_for`, both directions of coherence, `VirtualQuery` / `VirtualProtect` on a view, and
+    /// what one 64 KiB view costs with and without being pointed at the buffer.
+    unsafe fn pool(device: &ID3D12Device) {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const K64: usize = 64 << 10;
+        const PAGES: usize = 64;
+        // SAFETY (whole body): a section and a placeholder of the check's own; every access lies
+        // in a view mapped just before.
+        unsafe {
+            let section = mem::CreateFileMappingW(-1isize as _, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, (PAGES * K64) as u32, std::ptr::null()) as usize;
+            assert_ne!(section, 0);
+            crate::inplace::title_memory_section(section, (PAGES * K64) as u64, true);
+            assert!(sections().contains_key(&section), "section not aliased: {:?}", report());
+            let base = mem::VirtualAlloc2(GetCurrentProcess(), std::ptr::null(), 16 * K64, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize;
+            assert_ne!(base, 0);
+            // As xmem's `map`: split the placeholder, map the view, point it at the buffer, tell the census.
+            let map = |at: usize, page: usize, n: usize, alias: bool| {
+                mem::VirtualFree(at as *mut _, n * K64, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER);
+                let view = mem::MapViewOfFile3(section as _, GetCurrentProcess(), at as *const _, (page * K64) as u64, n * K64, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+                assert_eq!(view.Value as usize, at, "MapViewOfFile3: {}", std::io::Error::last_os_error());
+                if alias {
+                    assert!(title_section_view(at, n * K64, section, (page * K64) as u64));
+                }
+                crate::inplace::title_memory_view(at, n * K64, section, (page * K64) as u64);
+            };
+            let unmap = |at: usize, n: usize| {
+                crate::inplace::views_gone(at, n * K64);
+                assert_ne!(mem::UnmapViewOfFile2(GetCurrentProcess(), mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }, mem::MEM_PRESERVE_PLACEHOLDER), 0);
+            };
+            // Page 3 at slot 0 and at slot 5; pages 10..13 as one run at slots 1..4.
+            map(base, 3, 1, true);
+            map(base + 5 * K64, 3, 1, true);
+            map(base + K64, 10, 4, true);
+            let slot = |k: usize| (base + k * K64) as *mut u8;
+            for round in 0..8u8 {
+                let fill: Vec<u8> = (0..K64).map(|i| (i as u8).wrapping_mul(7) ^ round).collect();
+                std::ptr::copy_nonoverlapping(fill.as_ptr(), slot(0), K64);
+                assert_eq!(std::slice::from_raw_parts(slot(5), K64), &fill[..], "the other view of a page differs, round {round}");
+            }
+            // A title buffer over the run is the section's buffer at page 10.
+            let placed = crate::inplace::place_for((base + K64 + 4096) as u64, 2 * K64 as u64, false).expect("run placed");
+            assert_eq!(placed.bias, (10 * K64 + 4096) as u64);
+            assert!(covers((base + K64) as u64, 4 * K64 as u64));
+            assert!(tiles_enabled() || !covers(base as u64, 2 * K64 as u64), "page 3 then page 10 is not one run");
+            for round in 0..8u8 {
+                let fill: Vec<u8> = (0..4096).map(|i| (i as u8).wrapping_mul(13) ^ round).collect();
+                std::ptr::copy_nonoverlapping(fill.as_ptr(), slot(1).add(4096), 4096);
+                let back = committed(device, D3D12_HEAP_TYPE_READBACK, 4096, D3D12_RESOURCE_STATE_COPY_DEST);
+                copy(device, &back, 0, &placed.buffer, placed.bias, 4096);
+                let mut p = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut p)).unwrap();
+                assert_eq!(std::slice::from_raw_parts(p.cast::<u8>(), 4096), &fill[..], "GPU did not see a write through a view, round {round}");
+                back.Unmap(0, None);
+                let new: Vec<u8> = (0..4096).map(|i| (i as u8) ^ round ^ 0x3c).collect();
+                let up = committed(device, D3D12_HEAP_TYPE_UPLOAD, 4096, D3D12_RESOURCE_STATE_GENERIC_READ);
+                up.Map(0, None, Some(&mut p)).unwrap();
+                std::ptr::copy_nonoverlapping(new.as_ptr(), p.cast::<u8>(), 4096);
+                up.Unmap(0, None);
+                // Into page 12 (slot 3) through the buffer.
+                copy(device, &placed.buffer, placed.bias + 2 * K64 as u64 - 4096, &up, 0, 4096);
+                assert_eq!(std::slice::from_raw_parts(slot(3), 4096), &new[..], "a view did not see the GPU's write, round {round}");
+            }
+            // Scattered pages (page 3, then 10, 11 at slots 0..3): a reserved buffer over them.
+            if tiles_enabled() {
+                assert!(covers(base as u64, 3 * K64 as u64), "scattered pages not coverable: {:?}", report());
+                let placed = crate::inplace::place_for((base + 100) as u64, (3 * K64 - 200) as u64, false).expect("scattered placed");
+                assert_eq!(placed.bias, 100);
+                for round in 0..4u8 {
+                    for k in 0..3 {
+                        std::ptr::write_bytes(slot(k).add(4096), 0x11 * (k as u8 + 1) ^ round, 4096);
+                    }
+                    let back = committed(device, D3D12_HEAP_TYPE_READBACK, 3 * K64 as u64, D3D12_RESOURCE_STATE_COPY_DEST);
+                    copy(device, &back, 0, &placed.buffer, 0, 3 * K64 as u64);
+                    let mut p = std::ptr::null_mut();
+                    back.Map(0, None, Some(&mut p)).unwrap();
+                    for k in 0..3 {
+                        assert_eq!(*p.cast::<u8>().add(k * K64 + 4096), 0x11 * (k as u8 + 1) ^ round, "GPU read of scattered page {k} wrong, round {round}");
+                    }
+                    back.Unmap(0, None);
+                    // The GPU writes page 10 through the reserved buffer; the view at slot 1 sees it.
+                    let up = committed(device, D3D12_HEAP_TYPE_UPLOAD, 4096, D3D12_RESOURCE_STATE_GENERIC_READ);
+                    up.Map(0, None, Some(&mut p)).unwrap();
+                    std::ptr::write_bytes(p.cast::<u8>(), 0xc3 ^ round, 4096);
+                    up.Unmap(0, None);
+                    copy(device, &placed.buffer, K64 as u64 + 8192, &up, 0, 4096);
+                    assert_eq!(*slot(1).add(8192), 0xc3 ^ round, "a view did not see the GPU's write through a tile, round {round}");
+                }
+                println!("pool check: scattered pages through a reserved buffer: passed ({:?})", report());
+            }
+            // Wine still sees a mapped, committed, read-write view; guards work.
+            let mut info: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(mem::VirtualQuery(slot(1) as *const _, &mut info, size_of_val(&info)), 0);
+            assert!(info.State == mem::MEM_COMMIT && info.Type == mem::MEM_MAPPED && info.Protect == mem::PAGE_READWRITE, "VirtualQuery: state {:#x} type {:#x} protect {:#x}", info.State, info.Type, info.Protect);
+            let mut old = 0;
+            assert_ne!(mem::VirtualProtect(slot(1).cast(), K64, mem::PAGE_READONLY, &mut old), 0);
+            assert_ne!(mem::VirtualProtect(slot(1).cast(), K64, mem::PAGE_READWRITE, &mut old), 0);
+            // Remapping a slot: what the page held is still there in the new view.
+            let held = std::slice::from_raw_parts(slot(3), 4096).to_vec();
+            unmap(base + K64, 4);
+            map(base + 8 * K64, 12, 1, true);
+            assert_eq!(std::slice::from_raw_parts(slot(8), 4096), &held[..], "a page remapped elsewhere lost its bytes");
+            // Cost of one 64 KiB view: map + unmap, with and without the remap.
+            for alias in [false, true, false, true] {
+                let n = 2000;
+                let t = std::time::Instant::now();
+                for i in 0..n {
+                    map(base + 10 * K64, 20 + i % 40, 1, alias);
+                    unmap(base + 10 * K64, 1);
+                }
+                println!("pool check: map + unmap of one 64 KiB view{}: {:.1} us", if alias { " + remap" } else { "" }, t.elapsed().as_secs_f64() * 1e6 / n as f64);
+            }
+            let p: Vec<u64> = POOL.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+            println!("pool check: {} views pointed, {:.1} us each on average, failures {}", p[3], p[4] as f64 / p[3].max(1) as f64, p[5]);
+            assert_eq!(p[5], 0);
+            for at in [base, base + 5 * K64, base + 8 * K64] {
+                unmap(at, 1);
+            }
+            drop(placed);
+            title_section_gone(section);
+            assert!(device.GetDeviceRemovedReason().is_ok());
+            windows_sys::Win32::Foundation::CloseHandle(section as _);
+            println!("pool check: passed");
         }
     }
 }

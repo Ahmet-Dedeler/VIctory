@@ -421,7 +421,12 @@ impl Section {
         }
         let base = *self.window.get_or_init(|| {
             // SAFETY: the whole of a section we own.
-            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
+            let at = unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize;
+            if at != 0 {
+                // macOS, `VICTORY_ALIAS_POOL`: the view shows the card's buffer of the section.
+                victory_gpu::title_section_view(at, self.pages * PAGE, self.handle as usize, 0);
+            }
+            at
         });
         if base == 0 {
             return None;
@@ -756,6 +761,7 @@ impl View {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not mapped for a write");
             return None;
         }
+        victory_gpu::title_section_view(at.Value as usize, len, slice.section.handle as usize, offset);
         let view = View { at, len };
         if !commit(at.Value as usize, len) {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
@@ -1665,6 +1671,8 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
         );
         return false;
     }
+    // macOS, `VICTORY_ALIAS_POOL`: the view shows the card's buffer of the section.
+    victory_gpu::title_section_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     if !slice.section.commit_shown(slice.index, base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };

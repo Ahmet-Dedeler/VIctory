@@ -4901,6 +4901,29 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     spans
 }
 
+/// Of [`spans`]' title buffers and windows: those with a host copy now (made and not in place),
+/// and the count and bytes of those in place.
+pub(crate) fn copied_spans() -> (Vec<(u64, u64, bool)>, (u64, u64)) {
+    let mut placed = (0, 0);
+    let mut spans = Vec::new();
+    let mut take = |start: u64, len: u64, window: bool, shadow: Option<&Arc<Shadow>>| match shadow {
+        Some(s) if s.place.is_some() => {
+            placed.0 += 1;
+            placed.1 += len;
+        }
+        Some(_) => spans.push((start, len, window)),
+        None => {}
+    };
+    for (key, entry) in buffers_read().iter() {
+        take(key.0, entry.end - key.0, false, entry.shadow.as_ref());
+    }
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    for (&(start, len), shadow) in loose.iter() {
+        take(start, len, true, Some(shadow));
+    }
+    (spans, placed)
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
