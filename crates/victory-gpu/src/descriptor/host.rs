@@ -3649,6 +3649,12 @@ fn twin_window(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bo
     Some((from / 4, dwords, (start - from) as u32))
 }
 
+/// Whether to copy identical raw twins (`VICTORY_RAW_TWIN_COPY=0` creates
+/// each twin). A diagnostics run can change this between presents.
+fn raw_twin_copy() -> bool {
+    crate::toggled!("VICTORY_RAW_TWIN_COPY")
+}
+
 /// Copies the main raw view into its identical twin. The caller has just
 /// made it in a CPU-only slot for the same resource; both views are held
 /// by the original lifetime bookkeeping.
@@ -3744,6 +3750,7 @@ fn buffer_srv(
             && stride == 0
             && exact_raw_flags
             && window == Some((first, count, 0))
+            && raw_twin_copy()
         {
             copy_raw_twin(&host.device, at, twin);
             return Some(Some(shadow.buffer.clone()));
@@ -3879,6 +3886,7 @@ fn buffer_uav(
             && stride == 0
             && exact_raw_flags
             && window == Some((first, count, 0))
+            && raw_twin_copy()
         {
             copy_raw_twin(&host.device, at, twin);
             return Some(Some(shadow.buffer.clone()));
