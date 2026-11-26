@@ -368,11 +368,15 @@ pub(crate) fn pipeline_every_draw() -> bool {
     *ON.get_or_init(|| switch("VICTORY_PIPELINE_EVERY_DRAW", true, false))
 }
 
-/// Whether pipelines whose pixel program needs barycentrics are refused
-/// (`VICTORY_REFUSE_BARYCENTRICS=1`; an experiment, off by default).
+/// Whether pipelines whose pixel program needs barycentrics are refused: on
+/// by default on Darwin (`VICTORY_REFUSE_BARYCENTRICS=0`: made). D3DMetal 4.0b3
+/// makes no-op pipelines of them, and binding one killed 17 of 19 runs at
+/// world load (a vertex slot count of 0xFFFF read in SetRenderVertexBuffers);
+/// with them refused, 2 of 2 ran clean (nb-bary-x, -y). Their draws draw
+/// nothing either way.
 pub(crate) fn refuse_barycentrics() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| is_darwin() && std::env::var_os("VICTORY_REFUSE_BARYCENTRICS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| switch("VICTORY_REFUSE_BARYCENTRICS", true, false))
 }
 
 /// The feature bits of a DXIL container's `SFI0` part (0 without one).

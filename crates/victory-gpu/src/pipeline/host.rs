@@ -671,11 +671,10 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
-        // Mac layer (experiment, `VICTORY_REFUSE_BARYCENTRICS=1`): pixel
-        // programs that read per-vertex values (`attributeAtVertex`, flagged
-        // in SFI0 as barycentrics) come out of D3DMetal 4.0b3 as no-op
-        // pipelines (offline-shader-scan lane); one bound may be what D3DMetal
-        // read a vertex slot count of 0xFFFF from (xcl-mac/lanes/new-base.md).
+        // Mac layer (`crate::mac::refuse_barycentrics`): pixel programs that
+        // read per-vertex values (`attributeAtVertex`, flagged in SFI0 as
+        // barycentrics) come out of D3DMetal 4.0b3 as no-op pipelines
+        // (offline-shader-scan lane), and binding one killed the process.
         if crate::mac::refuse_barycentrics()
             && let Some(ps) = find("pixel")
             && ps.translated().is_some_and(|t| crate::mac::feature_bits(&t.host.dxil) & 0x2_0000 != 0)
