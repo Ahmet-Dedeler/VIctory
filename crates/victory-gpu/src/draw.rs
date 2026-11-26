@@ -4002,6 +4002,7 @@ impl State {
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
+        let finding = crate::timeline::span("indirect: finding the arguments' copy");
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
             return false;
@@ -4016,6 +4017,7 @@ impl State {
             },
             None => None,
         };
+        drop(finding);
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()
@@ -4029,6 +4031,7 @@ impl State {
         }
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
+            let _batch = crate::timeline::span("indirect: refresh and clamp in a batch");
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -4084,10 +4087,13 @@ impl State {
                     }
                     _ => (stride, max),
                 };
+                let refreshing = crate::timeline::span("indirect: refreshing the arguments");
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
+                drop(refreshing);
+                let _clamp = crate::timeline::span("indirect: the clamp");
                 // Bounded first: the clamp binds a compute pipeline of its
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
@@ -4118,6 +4124,7 @@ impl State {
                 (bounded, 0)
             }
         };
+        let preparing = crate::timeline::span("indirect: preparing the draw");
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -4128,12 +4135,18 @@ impl State {
             why("prepare failed");
             return false;
         }
+        drop(preparing);
+        #[cfg(feature = "diagnostics")]
+        let noting = crate::timeline::span("indirect: diagnostics' notes");
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
         #[cfg(feature = "diagnostics")]
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+        #[cfg(feature = "diagnostics")]
+        drop(noting);
+        let _host = crate::timeline::span("indirect: the host's ExecuteIndirect and after");
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
