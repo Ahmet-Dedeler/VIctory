@@ -51,14 +51,26 @@ thread_local! {
     static WRITTEN: RefCell<Vec<(usize, u64, Census)>> = const { RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Counts this thread's modules whatever `VICTORY_SHADER_CENSUS` says (a test that reads
+    /// what a translation emitted).
+    pub(crate) static FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
 }
 
-/// Whether modules are counted (`VICTORY_SHADER_CENSUS` set).
+/// Whether modules are counted (`VICTORY_SHADER_CENSUS` set, or a test's choice for its
+/// own thread: [`FORCE`]).
 pub fn enabled() -> bool {
+    #[cfg(test)]
+    if FORCE.get() {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_CENSUS").is_some())
 }
