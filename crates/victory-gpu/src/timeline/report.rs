@@ -103,6 +103,21 @@ impl Symbols {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         type Initialize = unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, i32) -> i32;
         type Options = unsafe extern "system" fn(u32) -> u32;
+        // Under Wine its dbghelp reads past the end of what it maps of our
+        // debug information and the process dies (SymFromAddr on the diag
+        // build, 2026-11-26): there our functions are named by their place in
+        // the program, for addr2line afterwards. `VICTORY_TIMELINE_SYMBOLS=1`
+        // asks for them anyway, `=0` leaves them out on Windows too.
+        let asked = std::env::var("VICTORY_TIMELINE_SYMBOLS").ok();
+        // SAFETY: a module of the process and one of its exports, by name.
+        let wine = unsafe {
+            use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        };
+        if asked.as_deref() == Some("0") || (wine && asked.as_deref() != Some("1")) {
+            return None;
+        }
         // SAFETY: the system's own library and functions, by their names and
         // signatures.
         unsafe {
