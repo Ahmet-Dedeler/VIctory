@@ -8360,6 +8360,17 @@ impl Host {
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        // Mac layer: on Darwin a write-back buffer in system memory instead
+        // (`shared_buffer`, which D3DMetal maps directly: one memory).
+        // Mapping a read-back heap buffer goes through a copy D3DMetal makes
+        // in its own heap, and its texture copies into one read past the end
+        // of that copy: the process died 1-4 s after the base's texture
+        // read-back began (runs nb-av-d, -e, -f). `VICTORY_READBACK_SHARED=0`:
+        // the read-back heap.
+        static SHARED: OnceLock<bool> = OnceLock::new();
+        if *SHARED.get_or_init(|| crate::mac::switch("VICTORY_READBACK_SHARED", true, false)) {
+            return self.shared_buffer(size).map(|(buffer, _)| buffer);
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
