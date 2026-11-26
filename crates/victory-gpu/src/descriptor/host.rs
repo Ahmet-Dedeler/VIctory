@@ -939,7 +939,16 @@ impl TextureQueue {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         let mut rechecks: Vec<(u64, u32, u64)> = Vec::new();
+        // Live slots ([`VIEW_TEXTURE_LIVE`]: a video the title rewrites
+        // every frame) go first of all: behind a streaming backlog the pass
+        // runs out of time or bytes before the rechecks, and a TV's planes
+        // fell behind each other.
+        let mut live: Vec<(u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
+            if w.checked.2 != 0 && w.checked.5 & VIEW_TEXTURE_LIVE != 0 {
+                live.push((index, w.write));
+                continue;
+            }
             let class = if w.checked.2 != 0 {
                 &mut rechecks
             } else if w.looks > 0 || w.mapped > 0 {
@@ -954,7 +963,8 @@ impl TextureQueue {
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
         rechecks.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut order = live;
+        order.extend(again.iter().map(|&(_, index, write)| (index, write)));
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
             order.push((fresh[new].1, fresh[new].2));
@@ -1130,6 +1140,13 @@ impl TextureQueue {
 /// palette tables the title rewrites in place; they are cheap enough to
 /// fingerprint again for as long as their slot lives.
 pub(crate) const VIEW_TEXTURE_SMALL_LINEAR: u64 = 1;
+
+/// Bit in a rechecked slot's kind: a texture found changed after its upload
+/// with nothing to tell of it, that is, one the title keeps rewriting in
+/// place (the video planes behind TV and phone screens). Looked at every
+/// frame and fingerprinted whole (`crate::texture::fingerprint_for`) until
+/// it stays unchanged for a while (`crate::draw`).
+pub(crate) const VIEW_TEXTURE_LIVE: u64 = 2;
 
 /// Whether resource-less texture views found by the heap sweep are put back
 /// into the indexed-texture queue even when that queue is long, and small

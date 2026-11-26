@@ -852,7 +852,11 @@ fn emit_forms(
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0")
+                    && !deep_skips_wrong_for(c.entry_name());
+                if why && !deep_on {
+                    eprintln!("WAVE64-RETRY without skips, scalars followed: off for this program");
+                }
                 let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
@@ -1051,6 +1055,24 @@ enum Pairs {
 }
 
 /// `VICTORY_WAVE_PAIRS` as [`Pairs`]. Pure, for testing.
+/// Whether the wave64 form "without skips, scalars followed" ([`ir::without_skips`] with
+/// `deep`) is known to give the wrong picture for the program named `entry` (its `PSV0`
+/// entry point), so it goes on to the next exact form (the paired one with
+/// `VICTORY_WAVE_PAIRS=1`).
+///
+/// The title's tiled sun shadows (`CS_ShadowRenderTiledCascades*`, 14 variants: plain, `CB`,
+/// `Alpha`, `PPPC` and their mixes) are wrong in it: on M5 Max under D3DMetal the open world
+/// showed 16x16-pixel square blocks along every shadow's edge (lit squares in shadow, dark
+/// squares on sunlit ground and on Jason's arms, moving with the camera) with all eight seen
+/// variants in this form, on 7e106c20, fcca35bc and cb423ccf alike. On an RTX 4080 keeping
+/// exactly these programs out of it gave the best picture (fxceless/victory-fork 1c7ded3f,
+/// #62). `VICTORY_SHADOW_TILES_DEEP=1` lets them take it again.
+fn deep_skips_wrong_for(entry: Option<&str>) -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let allowed = *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_SHADOW_TILES_DEEP").is_some_and(|v| v == "1"));
+    !allowed && entry.is_some_and(|name| name.starts_with("CS_ShadowRenderTiled"))
+}
+
 fn parse_pairs(value: Option<&str>) -> Pairs {
     match value.map(str::trim) {
         Some("last") => Pairs::Last,

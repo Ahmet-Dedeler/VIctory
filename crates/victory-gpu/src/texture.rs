@@ -1504,6 +1504,43 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     u64::from_le_bytes(first) | 1
 }
 
+/// Largest texture [`fingerprint_for`] reads whole when its slot is live.
+const LIVE_WHOLE_BYTES: u64 = 4 << 20;
+
+/// [`fingerprint`], or for a slot found changing after its upload
+/// (`kind` has [`crate::descriptor::host::VIEW_TEXTURE_LIVE`]) and no larger
+/// than 4 MiB, one of all of its memory. The three 16 KiB windows miss a
+/// video plane's change when its start, middle and end rows are a still
+/// background (the TV news: the reporter moves between them), so a plane
+/// looked unchanged and waited 12-40 frames while the other planes of the
+/// same video frame were uploaded: the luma of one frame under the chroma
+/// of another, a colour ghost of the picture before.
+pub(crate) fn fingerprint_for(at: u64, len: u64, kind: u64) -> u64 {
+    if kind & crate::descriptor::host::VIEW_TEXTURE_LIVE == 0 || len > LIVE_WHOLE_BYTES {
+        return fingerprint(at, len);
+    }
+    const CHUNK: usize = 64 << 10;
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let len = len as usize;
+    let mut print = 0u128;
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(CHUNK, 0);
+        let mut from = 0;
+        while from < len {
+            let bytes = CHUNK.min(len - from);
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+            from += bytes;
+        }
+    });
+    let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
+    u64::from_le_bytes(first) | 1
+}
+
 /// Whether a title texture has a staging buffer: a list recorded its
 /// upload, and the lists that sample it check it at submission.
 /// For the frame listing: whether a list has uploaded `resource`'s staging
