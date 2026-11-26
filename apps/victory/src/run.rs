@@ -168,6 +168,14 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
+    // `VICTORY_CONSOLE=series-s|series-x` overrides `--console`, so launch scripts
+    // and the test harness (fixed arguments) can pick Series S mode: 1280x720
+    // rendered, the title's FidelityFX upscaler to 1920x1080 (see `victory_gpu::ffx`).
+    let console = match std::env::var("VICTORY_CONSOLE").ok().as_deref().map(str::trim) {
+        Some("series-s" | "s" | "S") => Console::SeriesS,
+        Some("series-x" | "x" | "X") => Console::SeriesX,
+        _ => console,
+    };
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,
         Console::SeriesS => victory_hle::console::Console::SeriesS,

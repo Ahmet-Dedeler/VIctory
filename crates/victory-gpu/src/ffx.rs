@@ -139,7 +139,15 @@ struct Api {
 /// Whether the title's FidelityFX calls come here: `VICTORY_FFX_DIR` or
 /// `VICTORY_FFX_SIMPLE=1` set.
 pub fn enabled() -> bool {
-    std::env::var_os("VICTORY_FFX_DIR").is_some() || simple_mode()
+    std::env::var_os("VICTORY_FFX_DIR").is_some() || fsr_dll().is_some() || simple_mode()
+}
+
+/// (Neptune) `VICTORY_FSR_DLL=<file>`: one PC FidelityFX DLL that exports the
+/// five calls itself (`amd_fidelityfx_upscaler_dx12.dll` from the SDK's
+/// signedbin, an OptiScaler release or a PC game; or the SDK loader). Used in
+/// place of `VICTORY_FFX_DIR`'s loader.
+fn fsr_dll() -> Option<std::path::PathBuf> {
+    std::env::var_os("VICTORY_FSR_DLL").filter(|p| !p.is_empty()).map(Into::into)
 }
 
 /// `VICTORY_FFX_SIMPLE=1`: no upscaler, the colour input scaled to the
@@ -164,16 +172,26 @@ const SIMPLE_CONTEXT: usize = 0x5157_0001;
 fn api() -> Option<&'static Api> {
     static API: OnceLock<Option<Api>> = OnceLock::new();
     API.get_or_init(|| {
-        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_FFX_DIR")?);
-        let load = |name: &str| {
-            let path: Vec<u16> = dir.join(name).as_os_str().encode_wide_nul();
+        let load_path = |path: &std::path::Path| {
+            let path: Vec<u16> = path.as_os_str().encode_wide_nul();
             // SAFETY: a nul-terminated path.
             unsafe { LoadLibraryW(PCWSTR(path.as_ptr())) }.ok()
         };
-        let _ = load("amd_fidelityfx_upscaler_dx12.dll");
-        let Some(loader) = load("amd_fidelityfx_loader_dx12.dll") else {
-            tracing::error!(?dir, "ffx: amd_fidelityfx_loader_dx12.dll not found; set VICTORY_FFX_DIR to the SDK's signedbin");
-            return None;
+        let loader = if let Some(file) = fsr_dll() {
+            let Some(module) = load_path(&file) else {
+                tracing::error!(?file, "ffx: VICTORY_FSR_DLL could not be loaded");
+                return None;
+            };
+            tracing::info!(?file, "ffx: the title's upscaler calls go to this PC FidelityFX DLL");
+            module
+        } else {
+            let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_FFX_DIR")?);
+            let _ = load_path(&dir.join("amd_fidelityfx_upscaler_dx12.dll"));
+            let Some(loader) = load_path(&dir.join("amd_fidelityfx_loader_dx12.dll")) else {
+                tracing::error!(?dir, "ffx: amd_fidelityfx_loader_dx12.dll not found; set VICTORY_FFX_DIR to the SDK's signedbin");
+                return None;
+            };
+            loader
         };
         let get = |name: &[u8]| {
             // SAFETY: a loaded module and a nul-terminated name.

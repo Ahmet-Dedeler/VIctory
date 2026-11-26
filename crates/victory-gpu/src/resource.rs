@@ -1728,10 +1728,18 @@ pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
+        // (Neptune) The 3,072 MB are the Series X title's targets at 4K. As a Series S
+        // it renders 1280x720: its targets, depth and unordered textures came to
+        // 1,420 MB two minutes into the world there (run ve135), and room kept for
+        // targets never made left the texture queue refused (textures black or late).
+        let default = match crate::console::current() {
+            crate::console::Console::SeriesS => 1536,
+            crate::console::Console::SeriesX => 3072,
+        };
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or(default << 20, |mb| mb.min(8192) << 20)
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
