@@ -92,6 +92,7 @@ mod intersect_tests;
 pub mod host;
 mod lower;
 mod own_bits;
+mod primitive_varyings;
 #[cfg(all(test, windows))]
 mod permlane_tests;
 mod rect;
@@ -119,6 +120,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
+pub use primitive_varyings::link_mesh_primitive_varyings;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -402,31 +404,45 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
-    let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .or(c.part(FourCC::ACCC))
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
-        })
-        .ok_or(ShaderError::Unsupported {
-            offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
-        })?;
-    let p = crate::spill::build(&native)?;
-    // Structurisation first: tracing per-lane descriptors needs it (its
-    // failure is reported after the earlier stages').
-    let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
-    let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    let p = Prepared::parse(container)?;
+    emit(&p.container, &p.native, &p.ir, &p.structured, &p.io, &p.resources)
+}
+
+struct Prepared<'a> {
+    container: Container<'a>,
+    native: NativeProgram,
+    ir: ir::Program,
+    structured: structure::Structured,
+    io: io::Io,
+    resources: resource::Resources,
+}
+
+impl<'a> Prepared<'a> {
+    fn parse(bytes: &'a [u8]) -> Result<Self, ShaderError> {
+        let container = Container::parse(bytes)?;
+        let dxil = container
+            .part(FourCC::DXIL)
+            .or(container.part(FourCC::ACCC))
+            .ok_or(ShaderError::Malformed("no DXIL part"))?;
+        let native = crate::native_programs(dxil.data)?
+            .into_iter()
+            .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms))
+            .ok_or(ShaderError::Unsupported {
+                offset: 0,
+                what: "a container without a vertex, pixel, compute or mesh program",
+            })?;
+        Self::from_native(container, native)
+    }
+
+    fn from_native(container: Container<'a>, native: NativeProgram) -> Result<Self, ShaderError> {
+        let ir = crate::spill::build(&native)?;
+        // Descriptor tracking uses the structured program when available.
+        // Report its error after the earlier analysis, as in ordinary translation.
+        let structured = structure::structure(&ir);
+        let resources = resource::track(&ir, &native.layout, native.stage, structured.as_ref().ok())?;
+        let io = io::raise(&ir, &native)?;
+        Ok(Self { container, native, ir, structured: structured?, io, resources })
+    }
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -700,6 +716,18 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    emit_program_with_varyings(c, native, p, st, io, res, None)
+}
+
+fn emit_program_with_varyings(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    varyings: Option<&primitive_varyings::Layout>,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -746,6 +774,9 @@ fn emit_program(
     for e in &mut prims {
         e.interp = 1;
     }
+    if let Some(layout) = varyings {
+        layout.extend_signatures(&native.io, &mut inputs, &outputs, &mut prims)?;
+    }
     // A mesh group's id arrives multiplied by max(threads, vertices,
     // primitives) (the code divides by that); the thread count is in PSV0
     // from runtime info version 2 on.
@@ -763,7 +794,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let l = lower::lower_with_varyings(&lower::Parts {
         native,
         p,
         st,
@@ -773,7 +804,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    }, varyings)?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

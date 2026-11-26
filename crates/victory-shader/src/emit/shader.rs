@@ -226,6 +226,8 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// Compiler-generated mesh staging, in a separate shared variable.
+    pub extra_lds_dwords: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -279,6 +281,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            extra_lds_dwords: 0,
             lds: None,
             main,
             entry,
@@ -935,7 +938,7 @@ impl Shader {
             inputs: &self.inputs,
             outputs: &self.outputs,
             prims: &self.prims,
-            mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            mesh: self.mesh.map(|m| (m, (self.lds_dwords + self.extra_lds_dwords) * 4)),
             geometry: self.geometry.map(|g| g.max_vertices),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),

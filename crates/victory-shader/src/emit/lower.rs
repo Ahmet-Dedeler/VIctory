@@ -24,6 +24,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+#[path = "mesh_varyings.rs"]
+mod mesh_varyings;
 
 type Why = &'static str;
 
@@ -111,9 +113,20 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
+    lower_impl(parts, counted, None)
+}
+
+pub(super) fn lower_with_varyings(parts: &Parts, varyings: Option<&super::primitive_varyings::Layout>) -> Result<Lowered, ShaderError> {
+    match varyings {
+        Some(varyings) => lower_impl(parts, false, Some(varyings)),
+        None => lower(parts),
+    }
+}
+
+fn lower_impl(parts: &Parts, counted: bool, varyings: Option<&super::primitive_varyings::Layout>) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run(counted) {
+        match Lower::new(parts, &bad, varyings).run(counted) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -263,6 +276,8 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
+    varyings: Option<&'a super::primitive_varyings::Layout>,
+    mesh_varyings: Option<mesh_varyings::Staging>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
@@ -1460,7 +1475,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, varyings: Option<&'a super::primitive_varyings::Layout>) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1702,6 +1717,8 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
+            varyings,
+            mesh_varyings: None,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
@@ -2454,6 +2471,7 @@ impl<'a> Lower<'a> {
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
+            self.begin_mesh_varyings();
             self.block[order[0]] = Some(self.cur);
         }
         for &b in &order {
@@ -2505,6 +2523,7 @@ impl<'a> Lower<'a> {
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
+        self.end_mesh_varyings().map_err(|w| unsupported(0, w))?;
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
@@ -2702,7 +2721,11 @@ impl<'a> Lower<'a> {
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
-        self.s.inputs.iter().enumerate().find_map(|(id, e)| {
+        let count = match (self.s.pixel, self.varyings) {
+            (true, Some(layout)) => self.x.inputs.len() - layout.rows(),
+            _ => self.s.inputs.len(),
+        };
+        self.s.inputs.iter().take(count).enumerate().find_map(|(id, e)| {
             let r = e.row?;
             // `then`, not `then_some`: the channel is only past `col` when
             // the condition holds.
@@ -10667,24 +10690,13 @@ impl<'a> Lower<'a> {
     /// interpolation with computed barycentrics, or P10 or P20): then its
     /// element is declared constant and read with `attributeAtVertex`.
     fn per_vertex(&self, row: u8) -> bool {
-        self.x.io.interps.iter().any(|(_, i)| match *i {
-            Interp::Weighted { attribute } => attribute.row == row,
-            Interp::Vertex { attribute, vertex } => {
-                attribute.row == row && vertex != 2 && self.interpolated(row)
-            }
-            Interp::Interpolated { .. } => false,
-        })
+        super::primitive_varyings::per_vertex(self.x.io, row)
     }
 
     /// Whether the program interpolates attribute row `row` (so the
     /// hardware holds P1 - P0 and P2 - P0 for it).
     fn interpolated(&self, row: u8) -> bool {
-        self.x.io.interps.iter().any(|(_, i)| match *i {
-            Interp::Interpolated { attribute, .. } | Interp::Weighted { attribute } => {
-                attribute.row == row
-            }
-            Interp::Vertex { .. } => false,
-        })
+        super::primitive_varyings::interpolates(self.x.io, row)
     }
 
     /// Channel `ch` of input row `row` evaluated as `eval` says, as raw bits.
@@ -10707,12 +10719,12 @@ impl<'a> Lower<'a> {
                 _ => Err("an input"),
             };
         };
-        let v0 = self.vertex_input(id, col, 0);
+        let v0 = self.vertex_input(id, col, 0)?;
         let c = self.cur;
         let mut acc = p0.then_some(v0);
         for (k, w) in [(1, i), (2, j)] {
             let Some(w) = w else { continue };
-            let vk = self.vertex_input(id, col, k);
+            let vk = self.vertex_input(id, col, k)?;
             let d = self.s.m.bin(c, Bin::Sub, vk, v0);
             acc = Some(match acc {
                 Some(a) => self.fmad(w, d, a),
@@ -10725,7 +10737,17 @@ impl<'a> Lower<'a> {
 
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
     /// of a constant input element's channel, as a float.
-    fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+    fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> Result<V, Why> {
+        if let Some(layout) = self.varyings {
+            let field = layout.fields.iter().position(|field| field.pixel == (id, col))
+                .ok_or("a per-vertex value missing from the linked mesh payload")?;
+            let first = self.x.inputs.len() - layout.rows();
+            let component = field * 3 + usize::from(k);
+            let Val::I32(value) = self.load_any_input(first + component / 4, (component % 4) as u8) else {
+                return Err("a linked mesh payload component that is not a float");
+            };
+            return Ok(self.as_float(value));
+        }
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let int = e.comp != 9;
@@ -10750,11 +10772,11 @@ impl<'a> Lower<'a> {
             137,
             &args,
         );
-        if int {
+        Ok(if int {
             self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.f32)
         } else {
             v
-        }
+        })
     }
 
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
@@ -12189,9 +12211,10 @@ impl<'a> Lower<'a> {
         let mut stores = Vec::new();
         let primitive = matches!(e.target, Target::PrimitiveParam { .. });
         let outputs = if primitive {
-            &self.s.prims
+            let length = self.s.prims.len() - self.varyings.map_or(0, |layout| layout.rows());
+            &self.s.prims[..length]
         } else {
-            &self.s.outputs
+            &self.s.outputs[..]
         };
         let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
         // 16-bit vertex outputs: the halves each dword carries, as (output
@@ -12375,6 +12398,11 @@ impl<'a> Lower<'a> {
             ready.push((id, col, suffix, x));
         }
         let thread = (mesh && !ready.is_empty()).then(|| self.mesh_thread());
+        if !primitive && let Some(thread) = thread {
+            for &(id, col, _, value) in &ready {
+                self.stage_mesh_varying(thread, (id, col), value);
+            }
+        }
         // Stable: two stores to the same channel keep their order.
         ready.sort_by_key(|&(id, col, ..)| (id, col));
         for (id, col, suffix, x) in ready {
@@ -12449,6 +12477,10 @@ impl<'a> Lower<'a> {
         let mut args = vec![flat];
         for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
+        }
+        if self.mesh_varyings.is_some() {
+            let packed = self.s.m.select(c, culled, z, x);
+            self.stage_mesh_indices(flat, packed);
         }
         let void = self.s.t.void;
         self.s
@@ -12558,7 +12590,7 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                 }
-                Term::Ret
+                self.mesh_varyings.as_ref().map_or(Term::Ret, |v| Term::Br(v.exit))
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
