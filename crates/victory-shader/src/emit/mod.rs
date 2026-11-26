@@ -570,6 +570,66 @@ pub fn translate_linked_mesh_center(
     Ok((mesh.1.clone(), ps_center))
 }
 
+/// Re-emit an over-budget center-interpolated pair with wider mesh vertex
+/// outputs first, reducing the padding Metal adds between elements.
+pub fn compact_linked_mesh_center(
+    mesh: (&[u8], &HostShader),
+    pixel: (&[u8], &HostShader),
+) -> Result<Option<(HostShader, HostShader)>, ShaderError> {
+    let ms = Container::parse(&mesh.1.dxil)?;
+    let ps = Container::parse(&pixel.1.dxil)?;
+    let (Some(outputs), Some(inputs)) = (ms.part(FourCC::OSG1), ps.part(FourCC::ISG1)) else {
+        return Ok(None);
+    };
+    // Per-primitive inputs share the pixel signature but have a separate
+    // producer signature and layout. Keep those pairs on their existing path.
+    if let Some(prims) = ms.part(FourCC::PSG1)
+        && crate::dxbc::u32_at(prims.data, 0)? != 0
+    {
+        return Ok(None);
+    }
+    let outputs = signature(outputs.data)?;
+    let inputs = signature(inputs.data)?;
+    let key = |element: &container::SigElement| (element.name.to_ascii_uppercase(), element.index);
+    let mut fields: Vec<_> = outputs
+        .iter()
+        .filter(|element| element.kind == 0 && element.row.is_some())
+        .map(|element| (key(element), element.cols))
+        .collect();
+    let vertex_outputs: std::collections::HashSet<_> =
+        fields.iter().map(|(semantic, _)| semantic).collect();
+    let reserved_rows = outputs
+        .iter()
+        .filter(|element| element.kind != 0)
+        .chain(inputs.iter().filter(|element| {
+            element.kind != 0 || !vertex_outputs.contains(&key(element))
+        }))
+        .filter_map(|element| element.row)
+        .fold(0u32, |used, row| used | 1u32.checked_shl(row).unwrap_or(0));
+    let mut available = (0..32).filter(|row| reserved_rows & (1 << row) == 0);
+    fields.sort_by_key(|&(_, cols)| std::cmp::Reverse(cols));
+    let mut rows = lower::MeshOutputRows::new();
+    for (semantic, _) in fields {
+        let Some(row) = available.next() else {
+            return Ok(None);
+        };
+        if rows.insert(semantic, row).is_some() {
+            return Ok(None);
+        }
+    }
+    let reads = pixel_input_reads(&pixel.1.dxil)?;
+    let (mesh_compact, pixel_compact) = lower::with_kept_mesh_outputs(reads, || {
+        lower::with_mesh_output_rows(rows, || {
+            let mesh = translate(mesh.0)?;
+            let pixel = lower::with_per_vertex_center(|| translate(pixel.0))?;
+            Ok::<_, ShaderError>((mesh, pixel))
+        })
+    })?;
+    Ok((primitive_varyings::same_bindings(mesh.1, &mesh_compact)
+        && primitive_varyings::same_bindings(pixel.1, &pixel_compact))
+        .then_some((mesh_compact, pixel_compact)))
+}
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let p = Prepared::parse(container)?;
     emit(&p.container, &p.native, &p.ir, &p.structured, &p.io, &p.resources)

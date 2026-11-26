@@ -1479,6 +1479,9 @@ pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
 /// (`Marvisak/VIctory#2398`, `pragyaangaur/VIctory-macOS#161`).
 pub(super) type KeptOutputs = HashMap<(String, u32), u8>;
 
+/// Host register row for each ordinary varying in a compact mesh/pixel pair.
+pub(super) type MeshOutputRows = HashMap<(String, u32), u32>;
+
 /// Keeps only arbitrary (`kind == 0`) signature elements whose semantic has at
 /// least one channel read in `keep`, trimming unread leading and trailing
 /// channels. System values (`kind != 0`) and linked `VICTORY_VERTEX_DATA`
@@ -1522,6 +1525,24 @@ thread_local! {
     /// When set, arbitrary mesh outputs / pixel inputs not in this map are
     /// pruned so >32 KiB character mesh shaders fit Metal's 32 KiB limit.
     static KEPT_MESH_OUTPUTS: std::cell::RefCell<Option<KeptOutputs>> = const { std::cell::RefCell::new(None) };
+    static MESH_OUTPUT_ROWS: std::cell::RefCell<Option<MeshOutputRows>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn with_mesh_output_rows<R>(rows: MeshOutputRows, translate: impl FnOnce() -> R) -> R {
+    let before = MESH_OUTPUT_ROWS.replace(Some(rows));
+    let result = translate();
+    MESH_OUTPUT_ROWS.set(before);
+    result
+}
+
+fn mesh_output_row(rows: &MeshOutputRows, element: &SigElement) -> Option<u32> {
+    if element.kind == 0
+        && let Some(&row) = rows.get(&(element.name.to_ascii_uppercase(), element.index))
+    {
+        return Some(row);
+    }
+    element.row
 }
 
 /// Runs `translate` with arbitrary mesh outputs / pixel inputs pruned to `keep`.
@@ -1807,6 +1828,13 @@ impl<'a> Lower<'a> {
                 } else if x.native.stage == HwStage::Ms {
                     prune_signature(&mut s.outputs, keep);
                 }
+            }
+        });
+        MESH_OUTPUT_ROWS.with_borrow(|rows| {
+            if let Some(rows) = rows {
+                let elements = if s.pixel { &mut s.inputs } else { &mut s.outputs };
+                // Metal lays out varying storage in DXIL signature element order.
+                elements.sort_by_key(|element| mesh_output_row(rows, element).unwrap_or(u32::MAX));
             }
         });
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -3161,6 +3189,20 @@ impl<'a> Lower<'a> {
         let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        MESH_OUTPUT_ROWS.with_borrow(|rows| {
+            if let Some(rows) = rows {
+                let elements = if self.s.pixel {
+                    &mut self.s.inputs
+                } else {
+                    &mut self.s.outputs
+                };
+                // Apply after lowering: the console instructions use the
+                // original row numbers, while DXIL uses signature element IDs.
+                for element in elements {
+                    element.row = mesh_output_row(rows, element);
+                }
+            }
+        });
         Ok(Lowered {
             wave_size,
             vertex_fetches: self.vertex_fetches.into_iter().flatten().collect(),

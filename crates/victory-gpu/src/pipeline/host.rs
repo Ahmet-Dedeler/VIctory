@@ -815,10 +815,28 @@ impl HostPipeline {
                     (&ps.container, base_ps_host),
                 ) {
                     Ok((ms_c, ps_c)) => {
-                        let over = crate::mac::refuse_over_limit_mesh()
-                            && mesh_bytes_of(&ms_c.dxil)
-                                .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT);
-                        if over {
+                        let over_limit = |dxil: &[u8]| {
+                            crate::mac::refuse_over_limit_mesh()
+                                && mesh_bytes_of(dxil)
+                                    .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT)
+                        };
+                        let compact = if over_limit(&ms_c.dxil) {
+                            match victory_shader::emit::compact_linked_mesh_center(
+                                (&ms.container, &ms_c),
+                                (&ps.container, &ps_c),
+                            ) {
+                                Ok(pair) => pair,
+                                Err(error) => {
+                                    tracing::debug!(%error, ?shaders, "mesh output packing unavailable");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let (ms_c, ps_c) =
+                            compact.as_ref().map_or((&ms_c, &ps_c), |(m, p)| (m, p));
+                        if over_limit(&ms_c.dxil) {
                             tracing::warn!(
                                 ?shaders,
                                 bytes = ?mesh_bytes_of(&ms_c.dxil),
@@ -836,6 +854,7 @@ impl HostPipeline {
                                     tracing::info!(
                                         ?shaders,
                                         bytes = ?mesh_bytes_of(&ms_c.dxil),
+                                        compact = compact.is_some(),
                                         "linked mesh per-vertex center fallback"
                                     );
                                     Some(pso)
