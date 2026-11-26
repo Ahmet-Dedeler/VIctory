@@ -55,7 +55,18 @@ pub(crate) fn on() -> bool {
 /// Whether it is asked for.
 pub(crate) fn wanted() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1");
+        // Mac layer: not on Darwin unless `VICTORY_THIN_MAC=1` too. With it
+        // the process died in D3DMetal within a minute of the world (run
+        // nb-thin-n: base defaults plus this alone), on a command list's
+        // pipeline holding garbage; without it, never (nb-base-i).
+        if asked && crate::mac::is_darwin() && std::env::var_os("VICTORY_THIN_MAC").is_none_or(|v| v != "1") {
+            tracing::warn!("VICTORY_THIN is off under D3DMetal (VICTORY_THIN_MAC=1 forces it)");
+            return false;
+        }
+        asked
+    })
 }
 
 /// What a title list keeps: the recording being written and the words of it
