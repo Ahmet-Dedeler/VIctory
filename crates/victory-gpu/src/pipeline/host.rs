@@ -675,7 +675,9 @@ impl HostPipeline {
         // read per-vertex values (`attributeAtVertex`, flagged in SFI0 as
         // barycentrics) come out of D3DMetal 4.0b3 as no-op pipelines
         // (offline-shader-scan lane), and binding one killed the process.
+        // With `crate::mac::per_vertex_solved` (default) no program calls it.
         if crate::mac::refuse_barycentrics()
+            && !crate::mac::per_vertex_solved()
             && let Some(ps) = find("pixel")
             && ps.translated().is_some_and(|t| crate::mac::feature_bits(&t.host.dxil) & 0x2_0000 != 0)
         {

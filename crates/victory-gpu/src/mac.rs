@@ -379,6 +379,15 @@ pub(crate) fn refuse_barycentrics() -> bool {
     *ON.get_or_init(|| switch("VICTORY_REFUSE_BARYCENTRICS", true, false))
 }
 
+/// Whether pixel programs read per-vertex inputs without `attributeAtVertex`
+/// (`victory_shader::emit::set_per_vertex_solved`): on by default on Darwin
+/// (`VICTORY_PER_VERTEX_SOLVED=0`: the op, and its pipelines refused), so
+/// hair, doors and the rest of those draws are drawn.
+pub(crate) fn per_vertex_solved() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| switch("VICTORY_PER_VERTEX_SOLVED", true, false))
+}
+
 /// The feature bits of a DXIL container's `SFI0` part (0 without one).
 pub(crate) fn feature_bits(dxil: &[u8]) -> u64 {
     let u32_at = |b: &[u8], at: usize| b.get(at..at + 4).map(|v| u32::from_le_bytes(v.try_into().expect("4 bytes")) as usize);

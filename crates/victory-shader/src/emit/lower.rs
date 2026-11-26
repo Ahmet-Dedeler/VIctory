@@ -307,6 +307,8 @@ struct Lower<'a> {
     half_views: std::collections::BTreeSet<(u8, u32)>,
     /// [`Self::places_read_as_halves`], found before the code is lowered.
     halves_only: std::collections::BTreeSet<(u8, u32)>,
+    /// Vertex values solved per input channel ([`per_vertex_solved`]).
+    solved: HashMap<(usize, u8), [V; 3]>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1215,8 +1217,47 @@ fn own_bits_on() -> bool {
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+pub fn host_settings() -> [u32; 5] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        u32::from(per_vertex_solved()),
+    ]
+}
+
+static PER_VERTEX_SOLVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator that the host has no per-vertex attribute fetch
+/// (`attributeAtVertex`): D3DMetal makes a pipeline that draws nothing of a
+/// pixel program with one (Apple's converter refuses the op), and those are
+/// hair, doors and a third of the title's pixel programs. Then a pixel
+/// program that reads an input per vertex reads it interpolated and solves
+/// the three vertex values from it and `SV_Barycentrics` across its quad
+/// ([`Lower::solved_vertex_input`]); integer inputs read the provoking
+/// vertex's value for all three.
+pub fn set_per_vertex_solved(on: bool) {
+    PER_VERTEX_SOLVED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`per_vertex_solved`], for its thread only.
+    pub(super) static TEST_PER_VERTEX_SOLVED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// See [`set_per_vertex_solved`].
+pub(super) fn per_vertex_solved() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PER_VERTEX_SOLVED.get() {
+        return on;
+    }
+    // (`VICTORY_PER_VERTEX_SOLVED=1` also turns it on where no host tells,
+    // as in offline translation.)
+    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    PER_VERTEX_SOLVED.load(std::sync::atomic::Ordering::Relaxed)
+        || *ASKED.get_or_init(|| std::env::var_os("VICTORY_PER_VERTEX_SOLVED").is_some_and(|v| v == "1"))
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1751,6 +1792,7 @@ impl<'a> Lower<'a> {
             user_reads: BTreeMap::new(),
             half_views: Default::default(),
             halves_only: Default::default(),
+            solved: HashMap::new(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -10570,6 +10612,18 @@ impl<'a> Lower<'a> {
                 (attribute, eval)
             }
             // P0, the provoking vertex: a flat (nointerpolation) input.
+            // (Solved with the row's other vertices, which interpolate it.)
+            Interp::Vertex {
+                attribute,
+                vertex: 2,
+            } if per_vertex_solved() && self.per_vertex(attribute.row) => (
+                attribute,
+                Eval::Weights {
+                    p0: true,
+                    i: None,
+                    j: None,
+                },
+            ),
             Interp::Vertex {
                 attribute,
                 vertex: 2,
@@ -10745,8 +10799,11 @@ impl<'a> Lower<'a> {
         let (id, col) = self
             .find_input(row, ch)
             .ok_or("an input the signature lacks")?;
+        let float = self.s.inputs[id].comp == 9;
         let mode = match eval {
             Eval::Mode(mode) => mode,
+            // (Solved from the interpolated value: perspective, center.)
+            Eval::Weights { .. } if per_vertex_solved() && float => 2,
             Eval::Weights { .. } => 1,
         };
         let e = &mut self.s.inputs[id];
@@ -10779,6 +10836,9 @@ impl<'a> Lower<'a> {
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
     /// of a constant input element's channel, as a float.
     fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+        if per_vertex_solved() {
+            return self.solved_vertex_input(id, col)[usize::from(k)];
+        }
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let int = e.comp != 9;
@@ -10808,6 +10868,99 @@ impl<'a> Lower<'a> {
         } else {
             v
         }
+    }
+
+    /// The three vertex values of a channel without `attributeAtVertex`
+    /// ([`set_per_vertex_solved`]), as floats, in the entry block. At every
+    /// lane of a quad the interpolated value is `a = b0 P0 + b1 P1 + b2 P2`
+    /// with the lane's barycentrics `b`, so the value and the barycentrics
+    /// here and at the lanes across in x and in y give three equations for
+    /// the three vertex values (exact up to rounding: both sides are linear
+    /// in `b`, perspective or not). Where they cannot be solved (a
+    /// degenerate quad), and for integer inputs, all three are the value
+    /// here.
+    fn solved_vertex_input(&mut self, id: usize, col: u8) -> [V; 3] {
+        if let Some(&p) = self.solved.get(&(id, col)) {
+            return p;
+        }
+        let e = self.s.entry;
+        let f32t = self.s.t.f32;
+        let float = self.s.inputs[id].comp == 9;
+        let here = match self.load_any_input(id, col) {
+            Val::I32(x) => self.s.m.cast(e, Cast::Bitcast, x, f32t),
+            _ => self.s.m.f32(0),
+        };
+        let weights = if float {
+            match (
+                self.barycentric(Barycentric::PerspectiveCenter, 0),
+                self.barycentric(Barycentric::PerspectiveCenter, 1),
+            ) {
+                (Val::I32(i), Val::I32(j)) => Some((i, j)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let Some((i, j)) = weights else {
+            let p = [here; 3];
+            self.solved.insert((id, col), p);
+            return p;
+        };
+        self.s.flags |= flags::WAVE_OPS;
+        let m = |l: &mut Self, x, y| l.s.m.bin(e, Bin::Mul, x, y);
+        let sub = |l: &mut Self, x, y| l.s.m.bin(e, Bin::Sub, x, y);
+        let add = |l: &mut Self, x, y| l.s.m.bin(e, Bin::Add, x, y);
+        let b1 = self.s.m.cast(e, Cast::Bitcast, i, f32t);
+        let b2 = self.s.m.cast(e, Cast::Bitcast, j, f32t);
+        let one = self.s.m.f32(1f32.to_bits());
+        let b0 = sub(self, one, b1);
+        let b0 = sub(self, b0, b2);
+        // Row 0: here; rows 1 and 2: the differences to the lanes across in
+        // x and in y (QuadReadAcrossX, Y). Column 3: the value.
+        let r0 = [b0, b1, b2, here];
+        let mut rows = [r0, r0, r0];
+        for (row, kind) in [(1usize, 0u8), (2, 1)] {
+            for c in 0..4 {
+                let k = self.s.m.i8(kind);
+                let across = self.s.op(e, "quadOp.f32", Attr::NoUnwind, f32t, 123, &[r0[c], k]);
+                rows[row][c] = sub(self, across, r0[c]);
+            }
+        }
+        // Cramer's rule.
+        let det3 = |l: &mut Self, c: [[V; 3]; 3]| {
+            let minor = |l: &mut Self, a: usize, b: usize| {
+                let x = m(l, c[1][a], c[2][b]);
+                let y = m(l, c[1][b], c[2][a]);
+                sub(l, x, y)
+            };
+            let (m0, m1, m2) = (minor(l, 1, 2), minor(l, 0, 2), minor(l, 0, 1));
+            let t0 = m(l, c[0][0], m0);
+            let t1 = m(l, c[0][1], m1);
+            let t2 = m(l, c[0][2], m2);
+            let d = sub(l, t0, t1);
+            add(l, d, t2)
+        };
+        let matrix = |with: Option<usize>| {
+            let mut c = [[here; 3]; 3];
+            for (r, row) in rows.iter().enumerate() {
+                for k in 0..3 {
+                    c[r][k] = if with == Some(k) { row[3] } else { row[k] };
+                }
+            }
+            c
+        };
+        let det = det3(self, matrix(None));
+        let size = self.s.op(e, "unary.f32", Attr::ReadNone, f32t, 6, &[det]);
+        let tiny = self.s.m.f32(1e-30f32.to_bits());
+        let solvable = self.s.m.cmp(e, pred::OGT, size, tiny);
+        let mut p = [here; 3];
+        for (k, out) in p.iter_mut().enumerate() {
+            let n = det3(self, matrix(Some(k)));
+            let x = self.s.m.bin(e, Bin::SDiv, n, det);
+            *out = self.s.m.select(e, solvable, x, here);
+        }
+        self.solved.insert((id, col), p);
+        p
     }
 
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
