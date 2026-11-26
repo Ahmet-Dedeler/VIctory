@@ -2599,13 +2599,21 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make_twinned(view, self.at(index), self.twin(index));
+        let kept = self.make_twinned(index, view);
         if kept.is_none() {
             null_for(view, self.at(index));
         }
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         self.keep(index, kept.flatten());
+    }
+
+    /// Make the main view and any twin. Only a CPU-only slot can be the
+    /// source of a descriptor copy.
+    fn make_twinned(&self, index: u32, view: &View) -> Option<Kept> {
+        let staging = staged(self.sampler, 0);
+        let at = staging.unwrap_or_else(|| self.cpu(index));
+        make_twinned(view, at, self.twin(index), !self.sampler && staging.is_some())
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -2636,7 +2644,7 @@ impl HostHeap {
                     return None;
                 }
                 let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)), true)?;
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
@@ -3114,7 +3122,7 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
-                make_twinned(&view, self.at(index), self.twin(index))
+                self.make_twinned(index, &view)
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
@@ -3579,8 +3587,8 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 
 /// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that
 /// do not begin on 16 bytes, as a raw view must ([`move_raw`]), and those of
-/// these that could not be moved there (null).
-pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// these that could not be moved there (null), followed by exact raw copies.
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Moves the raw view at `at`, a slot of our heaps the card does not see,
 /// which shows `bytes` from `start` on (GPU address), `by` bytes on: for a
@@ -3641,12 +3649,23 @@ fn twin_window(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bo
     Some((from / 4, dwords, (start - from) as u32))
 }
 
+/// Copies the main raw view into its identical twin. The caller has just
+/// made it in a CPU-only slot for the same resource; both views are held
+/// by the original lifetime bookkeeping.
+fn copy_raw_twin(device: &ID3D12Device, at: D3D12_CPU_DESCRIPTOR_HANDLE, twin: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    // SAFETY: as above, with a distinct live twin slot.
+    unsafe { device.CopyDescriptorsSimple(1, twin, at, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+    #[cfg(feature = "diagnostics")]
+    TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    cpu_source: bool,
 ) -> Option<Kept> {
     let mut shadow = crate::shadow::find(address, len)?;
     let mut offset = shadow.offset(address);
@@ -3691,6 +3710,7 @@ fn buffer_srv(
         buffer.FirstElement += offset / element;
     }
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
+    let exact_raw_flags = buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW;
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
     let width = shadow.width();
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
@@ -3718,6 +3738,16 @@ fn buffer_srv(
     };
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
+        if cpu_source
+            && desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER
+            && desc.Format == DXGI_FORMAT_R32_TYPELESS
+            && stride == 0
+            && exact_raw_flags
+            && window == Some((first, count, 0))
+        {
+            copy_raw_twin(&host.device, at, twin);
+            return Some(Some(shadow.buffer.clone()));
+        }
         if let Some((first, count, by)) = window {
             desc.Format = DXGI_FORMAT_R32_TYPELESS;
             desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
@@ -3754,6 +3784,7 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    cpu_source: bool,
 ) -> Option<Kept> {
     let mut shadow = crate::shadow::find(address, len)?;
     let unit = {
@@ -3812,6 +3843,7 @@ fn buffer_uav(
     }
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
+    let exact_raw_flags = buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW;
     let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
     if window.is_some() {
         // (Left out at first: every structured unordered access view was then
@@ -3841,6 +3873,16 @@ fn buffer_uav(
     };
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
+        if cpu_source
+            && desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER
+            && desc.Format == DXGI_FORMAT_R32_TYPELESS
+            && stride == 0
+            && exact_raw_flags
+            && window == Some((first, count, 0))
+        {
+            copy_raw_twin(&host.device, at, twin);
+            return Some(Some(shadow.buffer.clone()));
+        }
         if let Some((first, count, by)) = window {
             desc.Format = DXGI_FORMAT_R32_TYPELESS;
             desc.Anonymous.Buffer = D3D12_BUFFER_UAV {
@@ -4010,7 +4052,7 @@ fn constant_bytes(size: u32) -> u32 {
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
-    make_twinned(view, at, None)
+    make_twinned(view, at, None, false)
 }
 
 /// [`make`]; `twin`: where the raw twin of a buffer view goes
@@ -4020,6 +4062,7 @@ fn make_twinned(
     view: &View,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    cpu_source: bool,
 ) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
@@ -4122,7 +4165,7 @@ fn make_twinned(
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at, twin)
+                buffer_srv(data as u64, len, srv_desc(desc), at, twin, cpu_source)
             } else {
                 None
             }
@@ -4132,7 +4175,7 @@ fn make_twinned(
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at, twin)
+                        buffer_uav(data as u64, len, uav_desc(desc), at, twin, cpu_source)
                     }
                     _ => None,
                 };
@@ -4236,9 +4279,9 @@ fn make_twinned(
                 return None;
             }
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at, twin)
+                buffer_uav(address, len, uav_desc(words), at, twin, cpu_source)
             } else {
-                buffer_srv(address, len, srv_desc(words), at, twin)
+                buffer_srv(address, len, srv_desc(words), at, twin, cpu_source)
             }
         }
     }
