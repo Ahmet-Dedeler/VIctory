@@ -974,6 +974,80 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
+/// Whether integer-to-block-compressed texture copies (the decoration
+/// bake's BC output) go through a buffer of the same bytes instead of one
+/// texture-to-texture copy (default on; `VICTORY_BAKE_BITS=0`: direct, as
+/// before). The one-copy form is a documented reinterpretation, but a host
+/// that does not implement it leaves the BC texture as it was.
+#[cfg(windows)]
+fn bake_bit_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Mac layer: on by default on Darwin, where D3DMetal leaves the clothing
+    // textures black with the direct copy (agent/next7 8327c773).
+    *ON.get_or_init(|| crate::mac::switch("VICTORY_BAKE_BITS", true, false))
+}
+
+#[cfg(windows)]
+fn copy_mip_dimensions(
+    desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    index: u32,
+) -> (u64, u64, u32) {
+    let mip = index % u32::from(desc.MipLevels).max(1);
+    let depth = if desc.Dimension == windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        (u32::from(desc.DepthOrArraySize) >> mip).max(1)
+    } else {
+        1
+    };
+    ((desc.Width >> mip).max(1), (u64::from(desc.Height) >> mip).max(1), depth)
+}
+
+#[cfg(windows)]
+fn copy_footprint(format: u32, width: u64, height: u64, depth: u32) -> Option<crate::resource::PlacedFootprint> {
+    let (element, block) = crate::resource::element(format)?;
+    let width = width.next_multiple_of(block);
+    let height = height.next_multiple_of(block);
+    let row = width / block * element;
+    Some(crate::resource::PlacedFootprint {
+        offset: 0,
+        format,
+        width: u32::try_from(width).ok()?,
+        height: u32::try_from(height).ok()?,
+        depth,
+        row_pitch: u32::try_from(row.next_multiple_of(256)).ok()?,
+    })
+}
+
+/// Footprints for a whole-subresource bit copy from an uncompressed integer
+/// texture into a block-compressed one, where one uncompressed texel holds
+/// one compressed block. The bake compression shaders write that layout.
+#[cfg(windows)]
+fn uncompressed_bc_copy(
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    dst: CopyLocation,
+    from_texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    src: CopyLocation,
+) -> Option<(crate::resource::PlacedFootprint, crate::resource::PlacedFootprint, u64)> {
+    if !bake_bit_copies() || dst.kind != 0 || src.kind != 0 {
+        return None;
+    }
+    // SAFETY: live host textures.
+    let (dd, sd) = unsafe { (to.GetDesc(), from_texture.GetDesc()) };
+    let (src_bytes, src_block) = crate::resource::element(sd.Format.0 as u32)?;
+    let (dst_bytes, dst_block) = crate::resource::element(dd.Format.0 as u32)?;
+    if src_block != 1 || dst_block != 4 || src_bytes != dst_bytes {
+        return None;
+    }
+    let (sw, sh, sz) = copy_mip_dimensions(&sd, src.footprint.offset as u32);
+    let (dw, dh, dz) = copy_mip_dimensions(&dd, dst.footprint.offset as u32);
+    if dw.next_multiple_of(4) != sw * 4 || dh.next_multiple_of(4) != sh * 4 || dz != sz {
+        return None;
+    }
+    let source = copy_footprint(sd.Format.0 as u32, sw, sh, sz)?;
+    let destination = copy_footprint(dd.Format.0 as u32, dw, dh, dz)?;
+    let (a, b) = (source.bytes()?, destination.bytes()?);
+    (a == b).then_some((source, destination, a))
+}
+
 /// Texture to texture on the GPU; buffer to texture through an upload
 /// buffer filled at submission. Texture to buffer (read back) is not done
 /// yet.
@@ -1039,6 +1113,7 @@ extern "system" fn copy_texture_region(
         let mut from = src;
         // Both sides are the same subresource of one host texture (set below).
         let mut same = false;
+        let mut source_texture = None;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -1075,6 +1150,7 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            source_texture = Some(texture.clone());
             // The same subresource of one host texture on both sides (two
             // title textures over one memory): not a copy the host allows.
             // The states and the copy are left out below; the rest is
@@ -1166,18 +1242,50 @@ extern "system" fn copy_texture_region(
         }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
-        // SAFETY: an open list; both locations in the host's layout, naming
-        // live resources; the box is the title's (same layout).
-        unsafe {
-            list.list.CopyTextureRegion(
-                (&raw const to_location).cast(),
-                x,
-                y,
-                z,
-                (&raw const from).cast(),
-                host_box,
-            )
+        // The bake's whole-subresource integer -> BC copies are bit copies.
+        // Bounce them through a device-local buffer: each copy leg uses one
+        // side's own format, so no host texture-format reinterpretation is
+        // needed. Other copies keep the direct form.
+        let bit_copy = if (x, y, z) == (0, 0, 0)
+            && source_box.is_null()
+            && let Some(texture) = source_texture.as_ref()
+            && let Some((source, destination, bytes)) = uncompressed_bc_copy(to, dst, texture, from)
+            && let Some(host) = crate::host::host()
+            && let Some(buffer) = host.uav_buffer(bytes.next_multiple_of(512))
+        {
+            Some((source, destination, buffer))
+        } else {
+            None
         };
+        if let Some((source, destination, buffer)) = bit_copy {
+            list.keep(&buffer);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!(?dst.resource, ?src.resource, "integer-to-block-compressed texture copy bounced through a buffer (VICTORY_BAKE_BITS=0: direct)");
+            });
+            let raw = windows::core::Interface::as_raw(&buffer).cast_const().cast();
+            let into_buffer = CopyLocation { resource: raw, kind: FOOTPRINT, footprint: source };
+            let from_buffer = CopyLocation { resource: raw, kind: FOOTPRINT, footprint: destination };
+            // SAFETY: as below; the buffer is alive until the list resets,
+            // and buffers need no copy-state transition from COMMON.
+            unsafe {
+                list.list.CopyTextureRegion((&raw const into_buffer).cast(), 0, 0, 0, (&raw const from).cast(), None);
+                list.list.CopyTextureRegion((&raw const to_location).cast(), x, y, z, (&raw const from_buffer).cast(), host_box);
+            }
+        } else {
+            // SAFETY: an open list; both locations in the host's layout, naming
+            // live resources; the box is the title's (same layout).
+            unsafe {
+                list.list.CopyTextureRegion(
+                    (&raw const to_location).cast(),
+                    x,
+                    y,
+                    z,
+                    (&raw const from).cast(),
+                    host_box,
+                )
+            };
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
