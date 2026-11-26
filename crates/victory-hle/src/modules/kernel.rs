@@ -434,6 +434,16 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+/// Mac layer: suspends only the title's own threads. Under Wine on Rosetta, a thread
+/// of ours suspended while Wine held its virtual memory lock left the lock
+/// held for good, and every thread that allocated or faulted waited on it
+/// (pragyaangaur/VIctory-macOS#50). Threads that start outside the title's
+/// images (VIctory's, Wine's, D3DMetal's) are reported as suspended
+/// without being stopped; the title cannot tell, as it never made them.
+pub extern "system" fn SuspendThread(thread: *mut c_void) -> u32 {
+    host::suspend_thread(thread)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -469,6 +479,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            hle_export!(SuspendThread),
         ],
     }
 }
@@ -594,6 +605,32 @@ mod host {
         victory_loader::note_title_output(line);
     }
 
+    pub(super) fn suspend_thread(thread: *mut c_void) -> u32 {
+        use super::super::files::host;
+        let mut start = 0usize;
+        host!("ntdll.dll", "NtQueryInformationThread": extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32)(
+            thread,
+            9,
+            (&raw mut start).cast(),
+            size_of::<usize>() as u32,
+            std::ptr::null_mut(),
+        );
+        // Mac layer: only under Wine on macOS; elsewhere as the title asks.
+        if victory_gpu::is_darwin() && !victory_loader::in_title_image(start) {
+            static SPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SPARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    n,
+                    start = format_args!("{start:#x}"),
+                    "the title asked to suspend a thread it did not make; left running"
+                );
+            }
+            return 0;
+        }
+        host!("kernel32.dll", "SuspendThread": extern "system" fn(*mut c_void) -> u32)(thread)
+    }
+
     /// Our caller's callers, as `module+rva`.
     pub(super) fn callers() -> String {
         let mut frames = [std::ptr::null_mut(); 12];
@@ -673,6 +710,10 @@ mod host {
     pub(super) fn report_unhandled(_: *const c_void) {}
 
     pub(super) fn note_title_output(_: &str) {}
+
+    pub(super) fn suspend_thread(_: *mut c_void) -> u32 {
+        0
+    }
 
     pub(super) fn callers() -> String {
         String::new()

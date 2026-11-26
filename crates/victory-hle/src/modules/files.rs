@@ -556,6 +556,21 @@ pub extern "system" fn ReadFile(
             tracing::warn!(n, buffer = format_args!("{buffer:p}"), len, "ReadFile: the title's buffer could not be written");
         }
     }
+    // Mac layer: under Wine on Rosetta, a kernel write into a block that
+    // another thread re-guards while an overlapped read is in flight stops
+    // the process for good (pragyaangaur/VIctory-macOS#50). Wait for it
+    // before returning; the title still sees the pending result, and its
+    // event or completion port is signalled.
+    if done == 0
+        && error == windows_sys::Win32::Foundation::ERROR_IO_PENDING
+        && !overlapped.is_null()
+        && victory_gpu::is_darwin()
+    {
+        let mut n = 0u32;
+        host!("kernel32.dll", "GetOverlappedResult": extern "system" fn(*mut c_void, *mut c_void, *mut u32, i32) -> i32)(
+            file, overlapped, &mut n, 1,
+        );
+    }
     drop(writing);
     // SAFETY: as above.
     unsafe { windows_sys::Win32::Foundation::SetLastError(error) };

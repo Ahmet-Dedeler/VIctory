@@ -64,6 +64,27 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // Masked stores + vcvtps2ph/vextract*128 redone as plain stores Rosetta
+    // can resume, so guard fault-tracking can run under Rosetta without
+    // hanging (#50). Enabled by default on Darwin; `VICTORY_PATCH_MASKED=0`
+    // turns it off.
+    let patch_masked = match std::env::var("VICTORY_PATCH_MASKED") {
+        Ok(val) => {
+            let trimmed = val.trim();
+            if trimmed.is_empty() || trimmed == "0" || trimmed.eq_ignore_ascii_case("off") {
+                None
+            } else {
+                Some(val)
+            }
+        }
+        Err(_) if victory_gpu::is_darwin() => Some("all".to_owned()),
+        Err(_) => None,
+    };
+    if let Some(which) = patch_masked {
+        let wanted = victory_loader::masked::wanted_from(Some(&which));
+        let n = victory_loader::masked::patch(image.base() as u64, &prepared.info, &original, wanted);
+        println!("masked stores  {n} patched to plain stores");
+    }
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
@@ -175,6 +196,7 @@ pub fn run(
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    victory_hle::modules::audio::mute::start();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
