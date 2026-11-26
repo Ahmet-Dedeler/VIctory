@@ -75,6 +75,8 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            // 16-bit typed buffer accesses as integers (emit::lower).
+            "VICTORY_D16_BITS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
