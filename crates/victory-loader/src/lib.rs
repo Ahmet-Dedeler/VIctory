@@ -25,6 +25,8 @@
 mod console_insn;
 mod crash;
 #[cfg(windows)]
+mod hooks;
+#[cfg(windows)]
 pub mod masked;
 pub mod prepare;
 pub(crate) mod publish;
