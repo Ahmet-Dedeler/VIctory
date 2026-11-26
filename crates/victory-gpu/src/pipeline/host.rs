@@ -671,6 +671,17 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
+        // Mac layer (experiment, `VICTORY_REFUSE_BARYCENTRICS=1`): pixel
+        // programs that read per-vertex values (`attributeAtVertex`, flagged
+        // in SFI0 as barycentrics) come out of D3DMetal 4.0b3 as no-op
+        // pipelines (offline-shader-scan lane); one bound may be what D3DMetal
+        // read a vertex slot count of 0xFFFF from (xcl-mac/lanes/new-base.md).
+        if crate::mac::refuse_barycentrics()
+            && let Some(ps) = find("pixel")
+            && ps.translated().is_some_and(|t| crate::mac::feature_bits(&t.host.dxil) & 0x2_0000 != 0)
+        {
+            return refuse("the pixel program reads per-vertex values (D3DMetal makes a no-op pipeline)", shaders);
+        }
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a

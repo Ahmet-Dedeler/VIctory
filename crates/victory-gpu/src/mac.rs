@@ -367,3 +367,25 @@ pub(crate) fn pipeline_every_draw() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| switch("VICTORY_PIPELINE_EVERY_DRAW", true, false))
 }
+
+/// Whether pipelines whose pixel program needs barycentrics are refused
+/// (`VICTORY_REFUSE_BARYCENTRICS=1`; an experiment, off by default).
+pub(crate) fn refuse_barycentrics() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| is_darwin() && std::env::var_os("VICTORY_REFUSE_BARYCENTRICS").is_some_and(|v| v == "1"))
+}
+
+/// The feature bits of a DXIL container's `SFI0` part (0 without one).
+pub(crate) fn feature_bits(dxil: &[u8]) -> u64 {
+    let u32_at = |b: &[u8], at: usize| b.get(at..at + 4).map(|v| u32::from_le_bytes(v.try_into().expect("4 bytes")) as usize);
+    (|| {
+        let parts = u32_at(dxil, 28)?;
+        (0..parts).find_map(|i| {
+            let at = u32_at(dxil, 32 + 4 * i)?;
+            (dxil.get(at..at + 4)? == b"SFI0")
+                .then(|| Some(u64::from_le_bytes(dxil.get(at + 8..at + 16)?.try_into().ok()?)))
+                .flatten()
+        })
+    })()
+    .unwrap_or(0)
+}
