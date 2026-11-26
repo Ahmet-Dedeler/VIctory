@@ -1141,6 +1141,31 @@ const KINDS: [&str; 6] = [
     "other",
 ];
 
+/// The biggest spans of each kind (four at most), with their address and how much of them views
+/// of physical pages show: where the copies that are left sit.
+fn biggest(spans: &[(u64, u64, bool)]) -> Vec<String> {
+    let mut known = Vec::new();
+    let mut by_kind: Vec<Vec<(u64, u64, bool)>> = vec![Vec::new(); KINDS.len()];
+    for &(start, len, window) in spans {
+        by_kind[kind_of(start as usize, len as usize, &mut known)].push((start, len, window));
+    }
+    let mut lines = Vec::new();
+    for (kind, mut list) in by_kind.into_iter().enumerate() {
+        list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        for (start, len, window) in list.into_iter().take(4) {
+            let shown = shown_bytes(start as usize, len as usize).unwrap_or(0);
+            lines.push(format!(
+                "biggest, {}: {} {start:#x}+{len:#x} ({} MB, {} MB of it in views)",
+                KINDS[kind],
+                if window { "window" } else { "buffer" },
+                len >> 20,
+                shown >> 20
+            ));
+        }
+    }
+    lines
+}
+
 fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
     match cover(at, len) {
         Cover::Run(..) => return 1,
@@ -1317,6 +1342,9 @@ pub(crate) fn tick() {
             let (copied, placed) = crate::shadow::copied_spans();
             tracing::info!("in place census of copies: {} in place now ({} MB); with a host copy:", placed.0, placed.1 >> 20);
             for line in census_of(&copied).into_iter().filter(|l| !l.contains("views of physical pages") && !l.contains("a section of")) {
+                tracing::info!("in place census of copies: {line}");
+            }
+            for line in biggest(&copied) {
                 tracing::info!("in place census of copies: {line}");
             }
             if which == 0 && probe_level() >= 2 {
