@@ -157,6 +157,132 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     }
 }
 
+/// Whether SSE4a `extrq` / `insertq` with immediates are replaced the first time they fault by
+/// a jump to SSE2 code doing the same. Rosetta has no SSE4a: each one is an exception, 25-33 us
+/// a trip under CrossOver (native-host `trapcost`), some 410 a second in the world (run
+/// naprof-1), and none of them was replaced. `VICTORY_PATCH_SSE4A=0` emulates each time, as
+/// before. (The forms with lengths in a register are emulated still.)
+fn patches_sse4a() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PATCH_SSE4A").is_none_or(|v| v != "0"))
+}
+
+/// The low `len` bits set (SSE4a lengths: 0 is 64).
+fn field_ones(len: u8) -> u64 {
+    match len & 63 {
+        0 => u64::MAX,
+        n => (1u64 << n) - 1,
+    }
+}
+
+/// `66 [REX] 0F op modrm` for two XMM registers or one and an opcode extension.
+fn sse2(op: u8, reg: u8, rm: u8) -> Vec<u8> {
+    let mut code = vec![0x66];
+    let rex = 0x40 | (reg & 8) >> 1 | (rm & 8) >> 3;
+    if rex != 0x40 {
+        code.push(rex);
+    }
+    code.extend([0x0F, op, 0xC0 | (reg & 7) << 3 | (rm & 7)]);
+    code
+}
+
+/// `pand xmm(reg), [rip + to - end]`, 16 aligned bytes at `to`, the instruction placed at `at`.
+fn pand_rip(reg: u8, at: usize, to: usize) -> Option<Vec<u8>> {
+    let mut code = vec![0x66];
+    if reg & 8 != 0 {
+        code.push(0x44);
+    }
+    code.extend([0x0F, 0xDB, (reg & 7) << 3 | 5]);
+    let end = at + code.len() + 4;
+    code.extend(i32::try_from(to as i64 - end as i64).ok()?.to_le_bytes());
+    Some(code)
+}
+
+/// The SSE4a instruction of `len` bytes at `at` as SSE2 code at `stub`, then a jump back past
+/// it: its 16-byte constants first, the code at `stub + 32`. The destination's high quadword is
+/// zeroed, as the emulation does. `None` for the forms with lengths in a register.
+fn sse4a_stub(what: ConsoleOnly, at: usize, len: usize, stub: usize) -> Option<(Vec<u8>, usize)> {
+    let mut code = vec![0u8; 32];
+    let entry = stub + 32;
+    let here = |code: &Vec<u8>| stub + code.len();
+    match what {
+        ConsoleOnly::Extrq { dst, src: None, len: bits, idx } => {
+            // psrlq dst, idx; pand dst, {ones(len), 0}
+            code[..8].copy_from_slice(&field_ones(bits).to_le_bytes());
+            code.extend(sse2(0x73, 2, dst));
+            code.push(idx & 63);
+            let pand = pand_rip(dst, here(&code), stub)?;
+            code.extend(pand);
+        }
+        ConsoleOnly::Insertq { dst, src, reg: false, len: bits, idx } => {
+            // A scratch register, kept on the stack (lea, not sub: the flags stay).
+            let t = (0..4u8).find(|&t| t != dst && t != src)?;
+            let ones = field_ones(bits);
+            code[..8].copy_from_slice(&ones.to_le_bytes());
+            code[16..24].copy_from_slice(&(!ones.checked_shl(u32::from(idx & 63)).unwrap_or(0)).to_le_bytes());
+            code.extend([0x48, 0x8D, 0x64, 0x24, 0xF0]); // lea rsp, [rsp - 16]
+            code.extend([0xF3, 0x0F, 0x7F, 0x04 | t << 3, 0x24]); // movdqu [rsp], xmm(t)
+            code.extend(sse2(0x6F, t, src)); // movdqa t, src
+            let pand = pand_rip(t, here(&code), stub)?; // t &= {ones, 0}
+            code.extend(pand);
+            code.extend(sse2(0x73, 6, t)); // psllq t, idx
+            code.push(idx & 63);
+            let pand = pand_rip(dst, here(&code), stub + 16)?; // dst &= {!(ones << idx), 0}
+            code.extend(pand);
+            code.extend(sse2(0xEB, dst, t)); // por dst, t
+            code.extend([0xF3, 0x0F, 0x6F, 0x04 | t << 3, 0x24]); // movdqu xmm(t), [rsp]
+            code.extend([0x48, 0x8D, 0x64, 0x24, 0x10]); // lea rsp, [rsp + 16]
+        }
+        _ => return None,
+    }
+    let back = jump(here(&code), at + len)?;
+    code.extend(back);
+    Some((code, entry))
+}
+
+/// Replaces the SSE4a instruction of `len` bytes at `at` (`code`, at least five) by a jump to
+/// [`sse4a_stub`]: whether it did. The bytes after the jump are never run (it comes back past
+/// them).
+///
+/// # Safety
+/// `at` is in the title's code, which stays mapped.
+unsafe fn patch_sse4a(what: ConsoleOnly, at: usize, len: usize, code: &[u8]) -> bool {
+    let Some(&[a, b, c, d, e]) = code.get(..5).map(|c| <&[u8; 5]>::try_from(c).ok()).flatten() else {
+        return false;
+    };
+    let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
+    if stubs.is_none() {
+        *stubs = near(at).map(|place| (place, 0));
+    }
+    let Some((place, used)) = stubs.as_mut() else {
+        return false;
+    };
+    let stub = *place + *used;
+    let Some((body, entry)) = sse4a_stub(what, at, len, stub) else {
+        return false;
+    };
+    let Some(jump) = jump(at, entry) else {
+        return false;
+    };
+    if *used + body.len() > STUBS_LEN || (at & 15) + 5 > 16 {
+        return false;
+    }
+    // SAFETY: inside the memory made for it, which nothing runs yet; then the title's code.
+    unsafe {
+        std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len());
+        *used += body.len().next_multiple_of(16);
+        patch(at, [a, b, c, d, e], jump)
+    }
+}
+
+/// Whether the code at `rip` is a jump into the stubs: another thread replaced the instruction
+/// this one faulted on before its exception got here. Running it again takes the jump.
+fn replaced_already(code: &[u8], rip: usize) -> bool {
+    let &[0xE9, a, b, c, d, ..] = code else { return false };
+    let to = (rip as i64 + 5 + i64::from(i32::from_le_bytes([a, b, c, d]))) as usize;
+    STUBS.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|(place, _)| (place..place + STUBS_LEN).contains(&to))
+}
+
 /// The aligned 16 bytes `word` around address `at` with the bytes at `at` replaced; `None`
 /// where they do not all lie in those 16. (16 and not 8: the title's busiest one lies over the
 /// end of its 8 and took 28,000 exceptions a second, run cpu-6.)
@@ -378,7 +504,11 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     };
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
-    let Some((what, len)) = decode::decode(code) else { return 0 };
+    let Some((what, len)) = decode::decode(code) else {
+        return if replaced_already(code, rip) { CONTINUE_EXECUTION } else { 0 };
+    };
+    // (The instruction's bytes: the SSE4a arms below name their field length `len`.)
+    let size = len;
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
@@ -510,6 +640,11 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             let d = &mut x[dst as usize & 15];
             d.Low = decode::extrq(d.Low, len, idx);
             d.High = 0;
+            // SAFETY: the title's code, where the instruction just faulted; the stub does the same.
+            if src.is_none() && patches_sse4a() && unsafe { patch_sse4a(what, rip, size, code) } {
+                #[cfg(feature = "diagnostics")]
+                sites::patched();
+            }
         }
         ConsoleOnly::Insertq { dst, src, reg, len, idx } => {
             // SAFETY: as above.
@@ -519,6 +654,11 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             let d = &mut x[dst as usize & 15];
             d.Low = decode::insertq(d.Low, s.Low, len, idx);
             d.High = 0;
+            // SAFETY: as for extrq.
+            if !reg && patches_sse4a() && unsafe { patch_sse4a(what, rip, size, code) } {
+                #[cfg(feature = "diagnostics")]
+                sites::patched();
+            }
         }
     }
     ctx.Rip += len as u64;
@@ -594,6 +734,83 @@ mod tests {
 
     /// `clzero` loops run as plain stores: the lines they name are zero and no other byte,
     /// and the pointer, the scratch register and the flags come out as from the loop.
+    #[test]
+    /// `extrq` / `insertq` with immediates (low and high registers): emulated at the first
+    /// fault and replaced, the replacement then run natively gives what the emulation gave.
+    fn sse4a_with_immediates_becomes_sse2() {
+        use std::arch::x86_64::__m128i;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
+        let regs = |c: &CONTEXT| unsafe { c.Anonymous.FltSave.XmmRegisters };
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let sites: [&[u8]; 4] = [
+            &[0x66, 0x0F, 0x78, 0xC2, 0, 0],       // extrq xmm2, len, idx
+            &[0x66, 0x41, 0x0F, 0x78, 0xC1, 0, 0], // extrq xmm9, len, idx
+            &[0xF2, 0x0F, 0x78, 0xC1, 0, 0],       // insertq xmm0, xmm1, len, idx
+            &[0xF2, 0x45, 0x0F, 0x78, 0xC1, 0, 0], // insertq xmm8, xmm9, len, idx
+        ];
+        for site in sites {
+            for _ in 0..64 {
+                let (bits, idx) = (next() as u8 & 63, next() as u8 & 63);
+                let mut code = site.to_vec();
+                let n = code.len();
+                code[n - 2] = bits;
+                code[n - 1] = idx;
+                code.push(0xC3); // ret
+                let ins: [u128; 4] = std::array::from_fn(|_| u128::from(next()) << 64 | u128::from(next()));
+                // SAFETY: memory of our own, written and run inside it.
+                unsafe {
+                    let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                    assert_ne!(page, 0);
+                    std::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+                    let mut context: CONTEXT = std::mem::zeroed();
+                    context.Rip = page as u64;
+                    {
+                        let x = &mut context.Anonymous.FltSave.XmmRegisters;
+                        for (k, r) in [0usize, 1, 8, 9].into_iter().enumerate() {
+                            x[r].Low = ins[k] as u64;
+                            x[r].High = (ins[k] >> 64) as i64;
+                        }
+                        x[2].Low = ins[1] as u64 ^ 0x5555;
+                        x[2].High = 7;
+                    }
+                    let before = regs(&context);
+                    assert_eq!(emulate(&mut context), CONTINUE_EXECUTION);
+                    assert_eq!(*(page as *const u8), 0xE9, "replaced");
+                    let want = regs(&context);
+                    let mut v: [__m128i; 5] = std::mem::transmute([
+                        u128::from(before[0].Low) | (before[0].High as u64 as u128) << 64,
+                        u128::from(before[1].Low) | (before[1].High as u64 as u128) << 64,
+                        u128::from(before[2].Low) | (before[2].High as u64 as u128) << 64,
+                        u128::from(before[8].Low) | (before[8].High as u64 as u128) << 64,
+                        u128::from(before[9].Low) | (before[9].High as u64 as u128) << 64,
+                    ]);
+                    let flags_before: u64;
+                    let flags_after: u64;
+                    std::arch::asm!(
+                        "cmp {a}, {a}", "pushfq", "pop {fb}",
+                        "call {f}",
+                        "pushfq", "pop {fa}",
+                        a = in(reg) 1u64, f = in(reg) page, fb = out(reg) flags_before, fa = out(reg) flags_after,
+                        inout("xmm0") v[0], inout("xmm1") v[1], inout("xmm2") v[2], inout("xmm8") v[3], inout("xmm9") v[4],
+                        out("xmm3") _,
+                    );
+                    assert_eq!(flags_before & 0x8d5, flags_after & 0x8d5, "flags kept");
+                    let got: [u128; 5] = std::mem::transmute(v);
+                    for (k, r) in [0usize, 1, 2, 8, 9].into_iter().enumerate() {
+                        let w = u128::from(want[r].Low) | (want[r].High as u64 as u128) << 64;
+                        assert_eq!(got[k], w, "xmm{r} after {site:02x?} len {bits} idx {idx}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_clzero_loop_becomes_plain_stores() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
