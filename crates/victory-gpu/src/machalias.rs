@@ -305,7 +305,8 @@ fn sections() -> std::sync::MutexGuard<'static, BTreeMap<usize, AliasedSection>>
 /// microseconds that took, view remap failures, placements in views.
 /// Then (`VICTORY_ALIAS_TILES`): placements over scattered pages, their tiles, the microseconds
 /// mapping them took (made, mapped, waited for), placements turned down.
-static POOL: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// Then (`VICTORY_ALIAS_HOLES`): those of the placements with pages not mapped, and those pages.
+static POOL: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
 /// `VICTORY_ALIAS_TILES`: 1 a title buffer over scattered pages of aliased sections is a reserved
 /// buffer whose 64 KiB tiles are mapped onto the sections' heaps page by page (needs
@@ -356,20 +357,78 @@ fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
 /// Most pages one reserved buffer covers (1 GiB).
 const MOST_TILES: usize = 16384;
 
+/// `VICTORY_ALIAS_HOLES`: 1 a title buffer or window over aliased sections' pages with pages the
+/// title has not mapped among them (reserved, nothing committed there) is a reserved buffer too,
+/// those pages' tiles mapped to nothing (they read zeros, as a copy reads them; shader writes there
+/// are dropped, as the copy-back leaves them). Mapping anything there later lets the buffer go
+/// (`crate::title_memory_remapped`). Needs `VICTORY_ALIAS_TILES=1`; 0 (the default) they are
+/// copied. (Probe: pragyaangaur/VIctory-macOS#266.)
+pub fn holes_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| tiles_enabled() && std::env::var("VICTORY_ALIAS_HOLES").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether nothing is committed in `[at, at + len)` (reserved or free, as Windows says now).
+fn nothing_committed(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory as mem;
+    let end = at + len;
+    let mut p = at;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { mem::VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0 || info.State == mem::MEM_COMMIT {
+            return false;
+        }
+        let reach = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if reach <= p {
+            return false;
+        }
+        p = reach;
+    }
+    true
+}
+
+/// A plan of tiles: the first page's address, the number of pages, the tile runs (chunk key:
+/// section and chunk offset; first tile; first heap page; tiles), and the runs of tiles over pages
+/// not mapped (first tile, tiles; only with [`holes_enabled`]).
+type TilePlan = (u64, usize, Vec<((usize, u64), u32, u32, u32)>, Vec<(u32, u32)>);
+
 /// Where `[start, start + len)`'s pages are, if every one is shown by a title view of an aliased
-/// section with a heap: the first page's address, the number of pages, and the tile runs (chunk
-/// key: section and chunk offset; first tile; first heap page; tiles).
-fn scattered_plan(start: u64, len: u64) -> Option<(u64, usize, Vec<((usize, u64), u32, u32, u32)>)> {
+/// section with a heap (with [`holes_enabled`]: or is not mapped at all, and one at least is).
+fn scattered_plan(start: u64, len: u64) -> Option<TilePlan> {
     const K64: u64 = 64 << 10;
     let page0 = start & !(K64 - 1);
     let n = (start + len.max(1) - page0).div_ceil(K64) as usize;
     if n > MOST_TILES {
         return None;
     }
-    let shown = crate::inplace::pages_shown(page0 as usize, n)?;
+    let shown: Vec<Option<(usize, u64)>> = if holes_enabled() {
+        crate::inplace::pages_shown_or_holes(page0 as usize, n)?
+    } else {
+        crate::inplace::pages_shown(page0 as usize, n)?.into_iter().map(Some).collect()
+    };
+    let mut holes: Vec<(u32, u32)> = Vec::new();
+    for (k, page) in shown.iter().enumerate() {
+        if page.is_none() {
+            match holes.last_mut() {
+                Some((first, count)) if *first + *count == k as u32 => *count += 1,
+                _ => holes.push((k as u32, 1)),
+            }
+        }
+    }
+    if !holes.is_empty() {
+        let unmapped: u32 = holes.iter().map(|h| h.1).sum();
+        if unmapped as usize == n || !holes.iter().all(|&(first, count)| nothing_committed(page0 as usize + first as usize * K64 as usize, count as usize * K64 as usize)) {
+            return None;
+        }
+    }
     let s = sections();
     let mut runs: Vec<((usize, u64), u32, u32, u32)> = Vec::new();
-    for (k, (section, offset)) in shown.into_iter().enumerate() {
+    for (k, page) in shown.into_iter().enumerate() {
+        let Some((section, offset)) = page else {
+            continue;
+        };
         let aliased = s.get(&section)?;
         let (&c_off, chunk) = aliased.chunks.range(..=offset).next_back()?;
         if chunk.heap.is_none() || offset + K64 > c_off + chunk.len {
@@ -381,7 +440,7 @@ fn scattered_plan(start: u64, len: u64) -> Option<(u64, usize, Vec<((usize, u64)
             _ => runs.push(((section, c_off), k as u32, page, 1)),
         }
     }
-    Some((page0, n, runs))
+    Some((page0, n, runs, holes))
 }
 
 /// Our queue for tile mappings, its fence and event, and the last value signalled.
@@ -404,7 +463,7 @@ fn placed_scattered(start: u64, len: u64) -> Option<(ID3D12Resource, u64, u64)> 
     if !tiles_enabled() {
         return None;
     }
-    let (page0, n, runs) = scattered_plan(start, len)?;
+    let (page0, n, runs, holes) = scattered_plan(start, len)?;
     let began = std::time::Instant::now();
     let host = crate::host::host()?;
     let device = &host.device;
@@ -476,6 +535,32 @@ fn placed_scattered(start: u64, len: u64) -> Option<(ID3D12Resource, u64, u64)> 
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
         }
+    }
+    if !holes.is_empty() {
+        // A reserved buffer's tiles start mapped to nothing; said once more, as the probe that
+        // found NULL tiles read zeros on D3DMetal did.
+        let coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = holes.iter().map(|h| D3D12_TILED_RESOURCE_COORDINATE { X: h.0, ..Default::default() }).collect();
+        let sizes: Vec<D3D12_TILE_REGION_SIZE> = holes.iter().map(|h| D3D12_TILE_REGION_SIZE { NumTiles: h.1, ..Default::default() }).collect();
+        let flags = vec![D3D12_TILE_RANGE_FLAG_NULL; holes.len()];
+        let counts: Vec<u32> = holes.iter().map(|h| h.1).collect();
+        // SAFETY: a live reserved buffer; `holes.len()` regions and ranges in arrays of that
+        // length, living through the call; NULL ranges take no heap nor heap offsets.
+        unsafe {
+            q.queue.UpdateTileMappings(
+                &reserved,
+                holes.len() as u32,
+                Some(coords.as_ptr()),
+                Some(sizes.as_ptr()),
+                None::<&ID3D12Heap>,
+                holes.len() as u32,
+                Some(flags.as_ptr()),
+                None,
+                Some(counts.as_ptr()),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+        POOL[11].fetch_add(1, Ordering::Relaxed);
+        POOL[12].fetch_add(holes.iter().map(|h| h.1 as u64).sum(), Ordering::Relaxed);
     }
     q.value += 1;
     // SAFETY: our queue, fence and event.
@@ -660,6 +745,9 @@ pub(crate) fn report() -> Option<String> {
                 p[9] as f64 / p[7].max(1) as f64,
                 p[10]
             );
+        }
+        if holes_enabled() {
+            line += &format!("; with pages not mapped (VICTORY_ALIAS_HOLES): {} placements, {} tiles to nothing", p[11], p[12]);
         }
     }
     Some(line)
@@ -1176,6 +1264,37 @@ pub mod check {
                     assert_eq!(*slot(1).add(8192), 0xc3 ^ round, "a view did not see the GPU's write through a tile, round {round}");
                 }
                 println!("pool check: scattered pages through a reserved buffer: passed ({:?})", report());
+            }
+            // Pages not mapped among them (page 13, page 3, nothing, nothing at slots 4..8): with
+            // VICTORY_ALIAS_HOLES a reserved buffer whose last two tiles read zeros.
+            if holes_enabled() {
+                assert!(!covers((base + 6 * K64) as u64, 2 * K64 as u64), "pages with nothing mapped covered");
+                let placed = crate::inplace::place_for((base + 4 * K64) as u64, 4 * K64 as u64, false).expect("pages with holes placed");
+                std::ptr::write_bytes(slot(4), 0x4d, K64);
+                std::ptr::write_bytes(slot(5), 0x5d, K64);
+                let back = committed(device, D3D12_HEAP_TYPE_READBACK, 4 * K64 as u64, D3D12_RESOURCE_STATE_COPY_DEST);
+                copy(device, &back, 0, &placed.buffer, placed.bias, 4 * K64 as u64);
+                let mut p = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut p)).unwrap();
+                let got = std::slice::from_raw_parts(p.cast::<u8>(), 4 * K64);
+                assert!(got[..K64].iter().all(|&b| b == 0x4d) && got[K64..2 * K64].iter().all(|&b| b == 0x5d), "GPU read of mapped pages beside holes wrong");
+                assert!(got[2 * K64..].iter().all(|&b| b == 0), "a tile over a page not mapped did not read zeros");
+                back.Unmap(0, None);
+                // The GPU writes page 3 (tile 1) and a hole; the views of page 3 see the first.
+                let up = committed(device, D3D12_HEAP_TYPE_UPLOAD, 2 * K64 as u64, D3D12_RESOURCE_STATE_GENERIC_READ);
+                up.Map(0, None, Some(&mut p)).unwrap();
+                std::ptr::write_bytes(p.cast::<u8>(), 0xe7, 2 * K64);
+                up.Unmap(0, None);
+                copy(device, &placed.buffer, placed.bias + K64 as u64, &up, 0, 2 * K64 as u64);
+                assert_eq!(*slot(0).add(4096), 0xe7, "a view did not see the GPU's write through a tile beside a hole");
+                assert!(device.GetDeviceRemovedReason().is_ok(), "device removed after a write into a tile mapped to nothing");
+                // Something committed in the hole: not placed.
+                let committed_hole = mem::VirtualAlloc(std::ptr::null(), 2 * K64, mem::MEM_RESERVE, mem::PAGE_NOACCESS) as usize;
+                assert!(super::nothing_committed(committed_hole, 2 * K64));
+                mem::VirtualAlloc(committed_hole as *const _, 4096, mem::MEM_COMMIT, mem::PAGE_READWRITE);
+                assert!(!super::nothing_committed(committed_hole, 2 * K64));
+                mem::VirtualFree(committed_hole as *mut _, 0, mem::MEM_RELEASE);
+                println!("pool check: pages with holes through a reserved buffer: passed ({:?})", report());
             }
             // Wine still sees a mapped, committed, read-write view; guards work.
             let mut info: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();

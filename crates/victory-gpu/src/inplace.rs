@@ -544,6 +544,26 @@ pub(crate) fn pages_shown(page: usize, n: usize) -> Option<Vec<(usize, u64)>> {
     Some(out)
 }
 
+/// As [`pages_shown`], but a page in no title view is `None` (a hole) instead of the whole answer;
+/// `None` only if a page lies in a view at an offset that is not a page's.
+pub(crate) fn pages_shown_or_holes(page: usize, n: usize) -> Option<Vec<Option<(usize, u64)>>> {
+    let v = views();
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let at = page + k * K64;
+        match v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at) {
+            Some((&base, &(_, section, offset))) => {
+                if !(at - base).is_multiple_of(K64) {
+                    return None;
+                }
+                out.push(Some((section, offset + (at - base) as u64)));
+            }
+            None => out.push(None),
+        }
+    }
+    Some(out)
+}
+
 /// How the views cover `[at, at + len)`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Cover {
