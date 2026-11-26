@@ -98,6 +98,14 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// `LowPrecisionPresent`: code makes or reads a `half` or an `i16`. Only
+    /// ever with [`NATIVE_LOW_PRECISION`] here (no minimum precision).
+    pub const LOW_PRECISION: u64 = 1 << 5;
+    /// `UseNativeLowPrecision` (SM 6.2+, DXC's `-enable-16bit-types`): those
+    /// types are true 16-bit IEEE types; `SFI0` `NativeLowPrecision`
+    /// (0x40000). DXC sets bits 4, 5 and 23 (8388656) for the clean-room
+    /// `reference-native.ll`.
+    pub const NATIVE_LOW_PRECISION: u64 = 1 << 23;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -567,6 +575,17 @@ impl Shader {
                 }
             }
         }
+        // Native 16-bit types (`VICTORY_F16_NATIVE=1`), as DXC counts them:
+        // declared exactly when code that is written makes or reads a `half`
+        // or an `i16` (the validator compares the flags with the code), and
+        // the data layout follows the flag (the validator ties the two).
+        // A shader without such code (every one with the switch unset) keeps
+        // its flags and the minimum-precision layout, byte for byte.
+        let native_16 = self.m.uses_16_bit();
+        self.m.set_native_16(native_16);
+        if native_16 {
+            self.flags |= flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION;
+        }
         // Unordered views outside pixel and compute programs (memory by
         // address), as DXC counts them: ranges declared below, not views
         // picked from the heap (VIctory a1a2077a).
@@ -908,6 +927,9 @@ impl Shader {
         }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
+        }
+        if self.flags & flags::NATIVE_LOW_PRECISION != 0 {
+            features |= 0x4_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

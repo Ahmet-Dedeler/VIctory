@@ -29,6 +29,9 @@ pub(crate) enum Tag {
 enum TypeDef {
     Void,
     Int(u32),
+    /// IEEE binary16 (`half`, `TYPE_CODE_HALF`): only with native 16-bit
+    /// types ([`Module::uses_16_bit`]).
+    Half,
     Float,
     Double,
     /// Pointee and address space.
@@ -108,6 +111,8 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    /// To a narrower float (`fptrunc`): IEEE round to nearest, ties to even.
+    FpTrunc = 7,
     Bitcast = 11,
 }
 
@@ -226,7 +231,21 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Written with the data layout of native 16-bit types (`i16:16`,
+    /// `f16:16`) instead of the minimum-precision one (`i16:32`, `f16:32`).
+    /// The DXIL validator ties the layout to the `UseNativeLowPrecision`
+    /// shader flag: [`super::shader::Shader::finish`] sets both or neither.
+    native_16: bool,
 }
+
+/// The data layout of DXIL without native 16-bit types (DXC's
+/// `kLegacyLayoutString`): every shader before the native-half switch.
+pub(crate) const LAYOUT_MIN_PRECISION: &str =
+    "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64";
+/// The data layout DXC writes with `-enable-16bit-types` (`kNewLayoutString`;
+/// the clean-room `reference-native.ll` at the top of the checkout has it).
+pub(crate) const LAYOUT_NATIVE_16: &str =
+    "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64";
 
 impl Module {
     fn ty(&mut self, def: TypeDef) -> Ty {
@@ -248,6 +267,11 @@ impl Module {
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
     }
+    /// `half`. A module whose code uses it (or `i16`) must be written with
+    /// [`Module::set_native_16`] and declare native low precision.
+    pub fn half(&mut self) -> Ty {
+        self.ty(TypeDef::Half)
+    }
     pub fn double(&mut self) -> Ty {
         self.ty(TypeDef::Double)
     }
@@ -265,6 +289,37 @@ impl Module {
     }
     pub fn func_ty(&mut self, ret: Ty, params: Vec<Ty>) -> Ty {
         self.ty(TypeDef::Func(ret, params))
+    }
+
+    /// See [`Module::native_16`].
+    pub fn set_native_16(&mut self, on: bool) {
+        self.native_16 = on;
+    }
+
+    /// Whether a type is one of the 16-bit types DXC counts as low precision
+    /// (`half`, `i16`).
+    fn is_16_bit(&self, t: Ty) -> bool {
+        matches!(self.types[t.0 as usize], TypeDef::Half | TypeDef::Int(16))
+    }
+
+    /// Whether code in a block reached from the entry makes or reads a `half`
+    /// or an `i16` (DXC's `LowPrecisionPresent`). Free for modules that never
+    /// made either type (every shader unless `VICTORY_F16_NATIVE=1`).
+    pub fn uses_16_bit(&self) -> bool {
+        if !(0..self.types.len() as u32).any(|t| self.is_16_bit(Ty(t))) {
+            return false;
+        }
+        let reached = self.reached();
+        let low = |i: u32| {
+            let inst = &self.insts[i as usize];
+            let mut low = self.is_16_bit(inst.ty);
+            for_each_operand(&inst.op, |v| low |= self.is_16_bit(self.type_of(v)));
+            low
+        };
+        let blocks = self.blocks.iter().enumerate();
+        blocks
+            .filter(|(b, _)| reached[*b])
+            .any(|(_, blk)| blk.phis.iter().chain(&blk.body).any(|&i| low(i)))
     }
 
     fn is_void(&self, t: Ty) -> bool {
@@ -581,6 +636,7 @@ impl Module {
         for t in &self.types {
             match t {
                 TypeDef::Void => w.record(2, &[]),
+                TypeDef::Half => w.record(10, &[]),
                 TypeDef::Float => w.record(3, &[]),
                 TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
@@ -609,9 +665,11 @@ impl Module {
         w.record(2, &chars("dxil-ms-dx"));
         w.record(
             3,
-            &chars(
-                "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
-            ),
+            &chars(if self.native_16 {
+                LAYOUT_NATIVE_16
+            } else {
+                LAYOUT_MIN_PRECISION
+            }),
         );
         let first_const = (self.globals.len() + self.funcs.len()) as u64;
         for g in &self.globals {

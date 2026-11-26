@@ -68,6 +68,9 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
+            // Native `fptrunc` for the nearest-even rounding above (it
+            // also changes the declared shader flags and data layout).
+            "VICTORY_F16_NATIVE",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
             "VICTORY_FIRST_HALF",

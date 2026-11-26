@@ -1193,6 +1193,35 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_F16_NATIVE=1`, and only together with `VICTORY_F16_NEAREST=1`: the
+/// nearest-even rounding of 16-bit float results is the host's own IEEE conversion
+/// ([`Lower::f16_nearest_native`]: `fptrunc float to half`, one instruction and two free
+/// casts) instead of the software rounding of [`Lower::f16_nearest`] (about a dozen
+/// instructions and three host conversions per result). A shader that uses it declares
+/// native 16-bit types (SM 6.2+ `UseNativeLowPrecision`, the `i16:16`/`f16:16` data
+/// layout: `shader::flags::NATIVE_LOW_PRECISION`); one that does not is unchanged.
+/// Only the results of [`Lower::valu16_op`]'s 16-bit float operations take it; the wave sum
+/// of halves ([`Lower::half_sum`]), exact by default, keeps the software rounding.
+/// Off by default, and experimental: positive normal results matched the software
+/// rounding on Apple's converter (D3DMetal, M-series Pro) in a synthetic test, but NaN
+/// payloads, half denormals, overflow to infinity and negative values are not yet
+/// qualified on hardware (`STATUS.md` at the top of the checkout lists what to run).
+/// Part of the shader cache key (`victory-gpu`'s `shader_cache.rs`).
+fn f16_native_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_F16_NATIVE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NATIVE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`f16_native_on`], for its thread only.
+    pub(super) static TEST_F16_NATIVE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -3884,6 +3913,35 @@ impl<'a> Lower<'a> {
         let tie = self.s.m.bin(c, Bin::And, tie, odd);
         let up = self.s.m.bin(c, Bin::Or, nearer, tie);
         self.s.m.select(c, up, hi, lo)
+    }
+
+    /// What [`Self::f16_nearest`] gives, by the host's own conversion: `f` truncated to a
+    /// true `half` (`fptrunc`, which LLVM and DXIL define as IEEE round to nearest, ties
+    /// to even), its bits (`bitcast` to `i16`) zero-extended into the low half of the i32
+    /// the translation keeps 16-bit values in, as `legacyF32ToF16` leaves them. DXC emits
+    /// the same `fptrunc float to half` for HLSL's `(half)f` with `-enable-16bit-types`
+    /// (`reference-native.ll`). The module then declares native 16-bit types
+    /// (`Shader::finish`). Used only with [`f16_native_on`].
+    ///
+    /// Where it may differ from [`Self::f16_nearest`] (to be ruled out on hardware before
+    /// it is trusted; the software result is the host's `legacyF32ToF16` corrected):
+    /// - NaN: the software keeps whatever bits the host's `legacyF32ToF16` makes of a NaN;
+    ///   `fptrunc` may keep another payload (truncated, or a canonical quiet NaN) or sign.
+    /// - Half denormals (|f| below 2^-14): SM 6.2 keeps 16-bit denormals with native
+    ///   types; the host's `legacyF32ToF16`/`legacyF16ToF32` pair the software uses may
+    ///   flush them, so the two may give different subnormal results or zeros.
+    /// - f32 denormal inputs: either may flush to a zero (of either sign) first.
+    /// - Overflow: IEEE rounds 65520 and up to infinity, as the software does; a host
+    ///   conversion that saturates to 65504 (0x7BFF) instead would differ.
+    /// - Infinities map to infinities in both; negative values were not in the measured
+    ///   sample (rounding is symmetric in IEEE, but the hardware must show it).
+    fn f16_nearest_native(&mut self, f: V) -> V {
+        let c = self.cur;
+        let half = self.s.m.half();
+        let i16t = self.s.m.int(16);
+        let h = self.s.m.cast(c, Cast::FpTrunc, f, half);
+        let bits = self.s.m.cast(c, Cast::Bitcast, h, i16t);
+        self.s.m.cast(c, Cast::ZExt, bits, self.s.t.i32)
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
@@ -9400,8 +9458,12 @@ impl<'a> Lower<'a> {
             // The console rounds to nearest; the host's conversion may round toward zero
             // (NVIDIA's does), one step of the last place lower where the two differ.
             // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1`
-            // ([`f16_nearest_on`]), which costs a dozen instructions per result.
-            let h = if f16_nearest_on() {
+            // ([`f16_nearest_on`]), which costs a dozen instructions per result,
+            // or one native `fptrunc` with `VICTORY_F16_NATIVE=1` as well
+            // ([`f16_native_on`]; experimental, not yet qualified on hardware).
+            let h = if f16_nearest_on() && f16_native_on() {
+                l.f16_nearest_native(f)
+            } else if f16_nearest_on() {
                 l.f16_nearest(f)
             } else {
                 l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])

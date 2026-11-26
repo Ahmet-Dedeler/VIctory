@@ -91,6 +91,8 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(test)]
+mod native_half_tests;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
