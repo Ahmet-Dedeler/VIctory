@@ -334,6 +334,8 @@ fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+    // macOS, `VICTORY_ALIAS_POOL`: the section is backed by the card's buffers from now on.
+    crate::machalias::title_section_made(section, bytes);
     let mut v = views_mut();
     v.sections.retain(|s| s.0 != section);
     // A handle's number given out again: the view was of the section that
@@ -345,6 +347,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    crate::machalias::title_section_gone(section);
     let whole = {
         let mut v = views_mut();
         let at = v.whole.iter().position(|w| w.0 == section);
@@ -522,6 +525,25 @@ pub(crate) fn shown_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
     runs
 }
 
+/// What each of the `n` 64 KiB pages from `page` on shows (section, byte offset in it), or `None`
+/// if one of them is not in a title view.
+pub(crate) fn pages_shown(page: usize, n: usize) -> Option<Vec<(usize, u64)>> {
+    let v = views();
+    let mut out = Vec::with_capacity(n);
+    let mut at = page;
+    while out.len() < n {
+        let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+        if at >= base + bytes || !(at - base).is_multiple_of(K64) {
+            return None;
+        }
+        while out.len() < n && at < base + bytes {
+            out.push((section, offset + (at - base) as u64));
+            at += K64;
+        }
+    }
+    Some(out)
+}
+
 /// How the views cover `[at, at + len)`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Cover {
@@ -590,6 +612,9 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
             let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize;
             if base == 0 {
                 tracing::warn!(error = %std::io::Error::last_os_error(), "no view of the title's pages beside its own");
+            } else {
+                // macOS, `VICTORY_ALIAS_POOL`: the view shows the card's buffer of the section.
+                crate::machalias::title_section_view(base, bytes as usize, section, 0);
             }
             v.whole.push((section, base));
             base
@@ -1276,10 +1301,10 @@ pub(crate) fn tick() {
         }
         Err(started) => started,
     };
+    // 30 and 150 seconds after the probe, then once a minute (a world reached late is seen too).
     let due = match DONE.load(Ordering::Relaxed) {
         0 => now >= started + 30_000,
-        1 => now >= started + 150_000,
-        _ => false,
+        n => now >= started + 150_000 + (n - 1) * 60_000,
     };
     if due {
         let which = DONE.fetch_add(1, Ordering::Relaxed);
@@ -1287,6 +1312,12 @@ pub(crate) fn tick() {
             let spans = crate::shadow::spans();
             for line in census_of(&spans) {
                 tracing::info!("in place {line}");
+            }
+            // The same for what still has a host copy (made, not in place): what copies today.
+            let (copied, placed) = crate::shadow::copied_spans();
+            tracing::info!("in place census of copies: {} in place now ({} MB); with a host copy:", placed.0, placed.1 >> 20);
+            for line in census_of(&copied).into_iter().filter(|l| !l.contains("views of physical pages") && !l.contains("a section of")) {
+                tracing::info!("in place census of copies: {line}");
             }
             if which == 0 && probe_level() >= 2 {
                 for line in real_part(&spans) {
