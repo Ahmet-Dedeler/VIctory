@@ -111,6 +111,35 @@ impl<'a> Container<'a> {
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
         self.parts.iter().find(|p| p.fourcc == fourcc)
     }
+
+    /// The entry-point function name from `PSV0` (`PSVRuntimeInfo3`, DXIL
+    /// validator 1.7+, `info_size >= 52`), if present and valid UTF-8.
+    pub fn entry_name(&self) -> Option<&'a str> {
+        let psv = self.part(FourCC::PSV0)?.data;
+        let info_size = u32_at(psv, 0).ok()? as usize;
+        // PSVRuntimeInfo3 adds `EntryFunctionName` (u32 offset into the
+        // string table) at byte 48 of the runtime info block (total >= 52).
+        if info_size < 52 {
+            return None;
+        }
+        let entry_offset = u32_at(psv, 4 + 48).ok()? as usize;
+        let mut at = 4usize.checked_add(info_size)?;
+        let res_count = u32_at(psv, at).ok()? as usize;
+        at = at.checked_add(4)?;
+        if res_count > 0 {
+            let res_size = u32_at(psv, at).ok()? as usize;
+            at = at
+                .checked_add(4)?
+                .checked_add(res_count.checked_mul(res_size)?)?;
+        }
+        let str_size = u32_at(psv, at).ok()? as usize;
+        at = at.checked_add(4)?;
+        let str_table = psv.get(at..at.checked_add(str_size)?)?;
+        let rest = str_table.get(entry_offset..)?;
+        let nul = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        let name = std::str::from_utf8(&rest[..nul]).ok()?;
+        (!name.is_empty()).then_some(name)
+    }
 }
 
 pub(crate) fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
@@ -179,5 +208,58 @@ mod tests {
         assert!(Container::parse(&bytes).is_err());
         bytes.truncate(last);
         assert!(Container::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn parses_psv0_entry_name() {
+        let make_psv = |info_size: u32, entry_offset: u32, res_count: u32, res_size: u32, str_table: &[u8]| {
+            let mut psv = Vec::new();
+            psv.extend_from_slice(&info_size.to_le_bytes());
+            let mut info = vec![0u8; info_size as usize];
+            if info_size >= 52 {
+                info[48..52].copy_from_slice(&entry_offset.to_le_bytes());
+            }
+            psv.extend_from_slice(&info);
+            psv.extend_from_slice(&res_count.to_le_bytes());
+            if res_count > 0 {
+                psv.extend_from_slice(&res_size.to_le_bytes());
+                psv.resize(psv.len() + (res_count * res_size) as usize, 0);
+            }
+            psv.extend_from_slice(&(str_table.len() as u32).to_le_bytes());
+            psv.extend_from_slice(str_table);
+            build(&[(FourCC::PSV0, &psv)])
+        };
+
+        // PSVRuntimeInfo3 with resource bindings and leading semantic string.
+        let table = b"\0TEXCOORD\0PS_BakeDecorations_0000_b1e4d949_Wrapped\0";
+        let off = "\0TEXCOORD\0".len() as u32;
+        let bytes = make_psv(52, off, 3, 24, table);
+        assert_eq!(
+            Container::parse(&bytes).unwrap().entry_name(),
+            Some("PS_BakeDecorations_0000_b1e4d949_Wrapped")
+        );
+
+        // PSVRuntimeInfo3 with zero resource bindings.
+        let bytes = make_psv(52, 1, 0, 0, b"\0PS_DecorationBlend_0000_ff00f5de_Wrapped\0");
+        assert_eq!(
+            Container::parse(&bytes).unwrap().entry_name(),
+            Some("PS_DecorationBlend_0000_ff00f5de_Wrapped")
+        );
+
+        // Empty string at offset 0 returns None.
+        let bytes = make_psv(52, 0, 0, 0, b"\0PS_BakeDecorations\0");
+        assert_eq!(Container::parse(&bytes).unwrap().entry_name(), None);
+
+        // Older PSVRuntimeInfo2 (info_size == 48) has no EntryFunctionName.
+        let bytes = make_psv(48, 0, 0, 0, b"\0PS_BakeDecorations\0");
+        assert_eq!(Container::parse(&bytes).unwrap().entry_name(), None);
+
+        // Out-of-bounds entry_offset returns None.
+        let bytes = make_psv(52, 999, 0, 0, b"\0PS_BakeDecorations\0");
+        assert_eq!(Container::parse(&bytes).unwrap().entry_name(), None);
+
+        // Container without PSV0 returns None.
+        let bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        assert_eq!(Container::parse(&bytes).unwrap().entry_name(), None);
     }
 }

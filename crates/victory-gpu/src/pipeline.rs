@@ -64,6 +64,10 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// One of the title's character decoration/clothing bake programs
+    /// (`PS_BakeDecorations*`, `PS_DecorationBlend*`; [`crate::draw::is_bake`]).
+    #[cfg(windows)]
+    pub(crate) bake: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -116,6 +120,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                bake: stage == "pixel" && crate::draw::is_bake(bytes, &full.to_hex()[..16]),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })

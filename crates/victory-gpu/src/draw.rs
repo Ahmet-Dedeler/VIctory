@@ -129,12 +129,132 @@ const BAKE_AHEAD: [u64; 2] = [12, 2];
 /// until something is new, the next bakes of the frame need no pass.
 static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
 
-/// The pixel shaders of the title's decoration bake (the title:
-/// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
-/// frame listings print it. They draw into a 256x256 corner of 2048x2048
-/// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
+/// Whether a pixel shader container is one of the title's character
+/// decoration/clothing bakes (agent/next7 696cec74: clothes and hats were
+/// solid black where only 4 of the 339 were known). By its `PSV0` entry
+/// name, else by hash (`VICTORY_BAKE_COMPLETE=0`: the base's 4 hashes only).
+pub(crate) fn is_bake(container: &[u8], hash: &str) -> bool {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ALL.get_or_init(|| std::env::var_os("VICTORY_BAKE_COMPLETE").is_none_or(|v| v != "0")) {
+        return LEGACY_BAKE_PIXEL_SHADERS.contains(&hash);
+    }
+    victory_shader::Container::parse(container)
+        .ok()
+        .and_then(|c| c.entry_name())
+        .is_some_and(is_bake_entry_name)
+        || BAKE_PIXEL_SHADERS.binary_search(&hash).is_ok()
+}
+
+/// Whether a pixel shader's `PSV0` entry-point name is one of the title's
+/// character decoration/clothing bake or composite shaders (all of which
+/// sample heap-indexed textures via `ResourceDescriptorHeap` once into
+/// persistent BC-compressed character textures).
+pub(crate) fn is_bake_entry_name(name: &str) -> bool {
+    name.starts_with("PS_BakeDecorations") || name.starts_with("PS_DecorationBlend")
+}
+
+/// The original 4 bake pixel shader hashes, kept for `VICTORY_BAKE_COMPLETE=0`.
+const LEGACY_BAKE_PIXEL_SHADERS: [&str; 4] =
     ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+
+/// All 339 character decoration/clothing bake and composite pixel shaders in
+/// `shaders.rpf` (sorted 16-hex BLAKE3 container hashes, derived via
+/// `victory_game::sgd5` + `PSV0` `EntryFunctionName`):
+/// - 322 `PS_BakeDecorations*` variants (`PS_BakeDecorations` [28] +
+///   `PS_BakeDecorations_0000`..`1101` [14 x 21])
+/// - 17 `PS_DecorationBlend*` variants (`PS_DecorationBlend` [2] +
+///   `PS_DecorationBlend_0000`..`1110` [15 x 1])
+///
+/// Runtime detection prefers structural `PSV0` entry-point name matching
+/// ([`is_bake_entry_name`]); this sorted table is a fallback for containers
+/// without `PSV0` entry names.
+pub(crate) const BAKE_PIXEL_SHADERS: [&str; 339] = [
+    "0007edff6531e906", "013cec26864cbd96", "01466e72d4ab7f14", "02e297d5288e24b0",
+    "04357bdd338e36d9", "0443e5acd6e1c154", "04d4092f9b76973c", "05f96becf9c4e341",
+    "06ce04570895759a", "081d059d50c254cf", "08c864b9d55dd4ac", "09655186803e25a8",
+    "0a1e4b0c963c7ec5", "0ad3724567c563b1", "0ba011716ffeeff1", "0be9693973407a56",
+    "0cfa17941dfdbeed", "0d1575a396dfe513", "0d2f4e89f13dde98", "0e5b35cb0d397825",
+    "0e75111a8f959a7c", "0edaccc882262826", "0ef6493d15d82dd2", "0f3a8cd8cb910aa8",
+    "1415170c15189363", "1498d3a9052d9f6a", "15481ea7851e0be5", "163fb088ec3950b2",
+    "16b025221415c149", "182d067af68b4928", "18554cac08781df2", "200e5eb0cebbf140",
+    "214696739343ad89", "225839da03c42606", "2265ac244698cd65", "2276b1ea79d0e02b",
+    "22d21ee7c2852275", "233f75ca7b6f6b5b", "2364dd00e96086fc", "23bd3182df2dc723",
+    "23eac722190a40a9", "24689a09d874e051", "2535a5f409370a05", "25ab5cdb5d6f0073",
+    "25c435c9051c4a37", "26b6e298c34ee52f", "26cb566e039cc4df", "26fa47489ed79e2c",
+    "2707647eabb76853", "27b92a8b159395e4", "280967ad158cee0b", "28c747a84e3dd3f1",
+    "298237770069039b", "2b513c8ea407f169", "2b6bd34327f3a434", "2bdc240524fa8493",
+    "2bef70ac2740af95", "2c06f5e40bf33d35", "2cdb8b7466ba0b3f", "2ce7fdac91de1171",
+    "2e2466c8c4acd038", "2e3d7c1589bdcf4a", "2f973dc467bf0cab", "30e018c4f4ac41cb",
+    "30fb0374d3957152", "31e590cf05eb00cd", "337b8fd8eff4b29e", "34e92f387d0125c2",
+    "35f4d312a2668745", "363e53e51f67acac", "370fa8f2ce076a1c", "375f73d0dc38ddcd",
+    "394d8151e563b6b0", "3964e455e27fddc9", "3b4c38e76fef4972", "3cb2649c1795e4f8",
+    "3d06b40b32f88686", "3d6734604b806f85", "3dca81c8c8a3483c", "3e1b886408f77088",
+    "3e35b515e8cd5408", "3e5f16aeabfbbfdf", "3f18deb62eef94dc", "3f47030d05e7be0c",
+    "3f9addf0fdbbe115", "4014d08370e88a36", "404448831275c489", "4353baea26dbee87",
+    "436fe89b18987776", "46ca970ecb661ef3", "47a643771c57a3b8", "4919f66647c6e0c9",
+    "4c045da33ae69bdf", "4e769155a9161a8e", "519f4440b7429d67", "539dad8defb1f6ff",
+    "53abfe626300295e", "53c37d0a43c07826", "53ca6860619a92b9", "53d855ad857b5967",
+    "54f4e5276c07b290", "559ba6f5df7c0ca3", "55af534f121a5eba", "55d0ddc8ce819716",
+    "560a9f39097c021d", "561eb40c32c83e89", "56a3db66b90c504c", "584435565974dca5",
+    "58f592549a8f5f60", "599efbbe0e185b54", "59da4aa0a65c6016", "5a0c39a6e30af7db",
+    "5ae2781037d68e40", "5ae608c99b0a7246", "5b042f251ac9e3e7", "5b56a097c91e6b97",
+    "5c472b7d17c39392", "5c6cd11b0da60777", "5e0e1ad237fa557f", "5e200fb33ade30ac",
+    "5e5c9bd4aaca2b27", "5e5fa79fae14a20f", "5e76d4c78807d24a", "5f656981af4564d4",
+    "5f89f15dd138b0f3", "6165239867942290", "631bc11a99bb105b", "632a313f614ebfe8",
+    "63af12155085fe9c", "63bd4531a9404254", "6444338756ee0749", "654080bbb2a6ede8",
+    "68698d5497688412", "6910cf3ae01b8ccf", "6af07ef558e10482", "6b7eaea0e62850a5",
+    "6c38341e6198360d", "6cd490f5da1f0ace", "6eb16034e7a467ec", "6f0d44635571f0fd",
+    "6f6a36032a2d216d", "6ff4348ed41a4aa5", "711b753a733bedd7", "71c3e97501cc2180",
+    "7240230d8de2b3c0", "735b916ea548b752", "73b3a9e731ff74ec", "750ec222bcdb0f24",
+    "75a1bc914c62002a", "770c62d9d0308bb3", "795eec57bbc4825b", "7961d01ea2b7cf0c",
+    "7a82c2fbe6210cac", "7a9a82957fff7308", "7abab5cd5719b78d", "7aff20cfd7447d55",
+    "7b0eaf5daa2c32d4", "7b62ddd26ca86869", "7bc313367baca0b1", "7e47c0719e31bfef",
+    "7e54e1eb79dfba60", "7f13a44f5b06806c", "7f5549d1d5e3d0dc", "7f7f5bc2e40de6d8",
+    "8074d76d7f0c03e9", "80fc64aa41a00b0b", "813eaa70a803b077", "819a731eb173f901",
+    "820f8ba708da93a5", "841c2a418e59e93f", "861b575ab3c3841e", "86da64e419eee49b",
+    "87f286fa50a41da0", "8864c47ffa13f837", "897b94d801cf1470", "89d63694dad16a7f",
+    "8adc4e4f36c62c60", "8b3fa2e5ab45541c", "8c8bcf0c28ac438a", "8cc145f51766de80",
+    "8d299ff0297c6a13", "8fe20007c77c43eb", "9002920c52330629", "9237c41e1058bf0e",
+    "92eeb90a04d3207b", "93512b40bc24b463", "94092fcb48a0c355", "94be29d3b18450ea",
+    "951789120fafbfc2", "959799c61dcfbb27", "95c3e03129fb7b8c", "95fda8d9395044ab",
+    "97828fba04091e13", "9800dc14a049120f", "9892bbdccbdde260", "98e6e4e528641b84",
+    "98f67e16f098c36f", "994eedc5d4fa1201", "9a59b804981f570d", "9a5a64dec9de80c3",
+    "9a74deac728a35ca", "9b19067e90874b86", "9b6da9769b446f0b", "9d933b29bdd63435",
+    "9df946bcec88cc49", "9e70bb3411592b7f", "9ef67bcc865d2686", "9f8bd3df3565f255",
+    "a03c0c4d75ac7308", "a1057b0b09ba9bd8", "a25020591abd677d", "a29da4c18e8910cd",
+    "a30d910f4941e4b6", "a35dd5d1a063d2a3", "a3d370e14c76d4ea", "a3f3cd9b623559e8",
+    "a58c5e2ba5c3b4eb", "a5f489cb3593f045", "a6ff658e4011de37", "a8f6ab6c2fa5d001",
+    "aa6ac11ce33e8e4f", "aa8083c1d263af6e", "aa816fb81e94b452", "aaa522263eaab356",
+    "ac188e0d1dc8dc87", "ac5c3bcb9b62863b", "ad3e95d39aa02725", "ad458f18f15b6bd7",
+    "ad7e990895e1c9d1", "add022699b8c853a", "afed6faa3e15eec3", "afff67508a4b874d",
+    "b0609f9485b8996f", "b08e62adfd31235f", "b119c105f69791c3", "b134f8927df6b56b",
+    "b136528e22e4f460", "b15a4424d11de266", "b1e7ae83b0bce717", "b2a55cd634f736bb",
+    "b308215845845182", "b36e539d91f46ff6", "b5edbec4872f3ef6", "b6bce23d6b519396",
+    "b7244059a9399255", "b7cfd8dda91ebb6b", "b948b9d8a45811ee", "ba214c154d082151",
+    "ba326704d62b7e7a", "bb53ece26a2cbc3f", "bcc8d92a0bd59d1c", "be209e06d71fab56",
+    "be24e3e0bcb44e7e", "bf2618a6f1e0a2e7", "c002598f37534141", "c0a7fe77b1862e10",
+    "c0fc11917ed06810", "c1f4a4e4ff9d2fd5", "c24b07c16c51a41d", "c54f5e52e11c90d3",
+    "cb258ce7a1c5c6dd", "cb4ff74d9289b601", "cbbec7c3f6627e38", "cbd45ff65036c55a",
+    "cbd838e0e8fa46c9", "cddcd2cfffeb6f33", "ce55802e3a5b0f1f", "ce6b667b1471eca9",
+    "cefba3a7a7612408", "d04d86fe173eec57", "d126bcae5d5d8d26", "d28eee57dfa80614",
+    "d46abb11dae47a4d", "d46e9ebcbcf8be08", "d51022cb4b1ecdd0", "d65c819209c56168",
+    "d6948765cba0004d", "d694f524a93a6301", "d6e34b82b70b7bb6", "d70c62a894f4abdc",
+    "d73e05d48bf90514", "d751333b40e0e8f2", "d9990162e524c14c", "d9a493fd659c5bf7",
+    "daf6eed61b8807fa", "dcbe12d7b4b2f555", "dced17e5f4fc7816", "dd7fc37bb5425bba",
+    "dda0d680e7b1df40", "df32fffa195816ed", "e0325f8621199653", "e2c33d47a5e7b3db",
+    "e2de7251455fb12c", "e3bf8c503775689b", "e4d33dbbb7118639", "e52208f26d8ad32f",
+    "e57d240d1baab608", "e5c0d21f0e7c45fb", "e5e0f0e5e4d42603", "e5f8085d3f8dd15f",
+    "e7bc406d0b09e796", "e7f47e8e6a050839", "e8c9c9aef45b7dbf", "e9c0e0dcbdf8a2c6",
+    "eab9c25d933a28eb", "eb392e7ad4e1ba80", "ebb46885f9c0677a", "ebe20c06e8f9bb8d",
+    "ed2c3ec8892c3a1f", "ed4d27023dd45735", "edf04faa62e20758", "eeca340eabccfa6c",
+    "ef0225cdd161b623", "f0114a81600edbfc", "f02418839edb2650", "f03c69b31d0c8add",
+    "f03cf52cde607d39", "f0b2e429a21aebd6", "f1894a5d7d977ce7", "f19b5e07337a77c5",
+    "f1c0460f4131e3a8", "f1cfec08f7f365be", "f2aacabaff629be6", "f2d8fc4ba30b5a84",
+    "f384a7192f0b4a78", "f4b4190e3c1a1ee8", "f657695476238bc5", "f6b6c39ce5f232f2",
+    "f705a240077a8c98", "f72790ef9e47efdf", "f747359d0ab50dd0", "f814b9db95405860",
+    "f8cf70ea572dc789", "f91c6e6c0744a665", "fa455c8a3c32577b", "fce91b89d6133a69",
+    "fcee612943c008e0", "fe8d222f183ba933", "ff8d53c0d65a62e1",
+];
 
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
@@ -1995,7 +2115,7 @@ impl State {
             return;
         }
         let bake = bake_ms > 0
-            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+            && p.stages.iter().any(|s| s.shader.bake);
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
