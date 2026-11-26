@@ -1148,8 +1148,9 @@ impl State {
         if crate::mac::pipeline_every_draw()
             && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
         {
-            // SAFETY: an open list and a live pipeline (the list keeps it).
+            // SAFETY: an open list and a live pipeline, which the list keeps.
             unsafe { list.list.SetPipelineState(&p.pso) };
+            list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
     }
 
@@ -1509,6 +1510,8 @@ impl State {
             // (runs nb-av-d to -g). Set again on every draw and dispatch.
             // SAFETY: as above.
             unsafe { l.SetPipelineState(&p.pso) };
+            // Kept by this list too (once per list: a set).
+            list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
         for stage in &p.stages {
             let t = stage.translated();
