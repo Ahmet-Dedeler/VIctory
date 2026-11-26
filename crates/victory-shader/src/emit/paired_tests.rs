@@ -574,3 +574,158 @@ fn a_program_no_form_takes_gets_the_paired_form_last() {
         assert!(bytes(&on) == Ok(pairs.dxil.as_slice()), "{mode:?}: {:?}", bytes(&on).err());
     }
 }
+
+/// What one dispatch of a synthetic program should leave on the console: the root constants
+/// s0..s3, the raw UAV's dword count (zeroed before), and every dword after.
+#[derive(Clone)]
+struct Expected {
+    constants: [u32; 4],
+    dwords: usize,
+    want: Vec<u32>,
+}
+
+/// The console's results for the programs the old branch checked on the GPU (its
+/// `wave64_tests`), one entry per dispatch: what a run on the host GPU must reproduce.
+fn console_results() -> Vec<(&'static str, NativeProgram, Vec<Expected>)> {
+    let one = |constants, dwords, want| Expected { constants, dwords, want };
+    // lane n's dword is 7n + 100 (even n) or 7n + 200, and lane n reads 63 - n's
+    let lds = {
+        let dword = |n: u32| 7 * n + if n.is_multiple_of(2) { 100 } else { 200 };
+        let read: Vec<u32> = (0..64).map(|n| dword(63 - n)).collect();
+        let big = (0..64).filter(|&n| read[n] > 250).fold(0u64, |m, n| m | 1 << n);
+        let want = (0..64)
+            .flat_map(|n| [read[n], read[5] + read[40], big.count_ones(), (big & ((1 << n) - 1)).count_ones()])
+            .collect();
+        vec![one([0; 4], 256, want)]
+    };
+    let loops = {
+        let rounds = |wave: u32, lane: u32| (lane & 3) + 1 + wave;
+        let total = |wave: u32| (0..64).map(|lane| rounds(wave, lane)).sum::<u32>();
+        let first = |wave: u32, lane: u32| lane * rounds(wave, lane);
+        let want = (0..128)
+            .flat_map(|t| {
+                let (wave, lane) = (t / 64, t % 64);
+                [first(wave, lane), total(wave), first(wave, 20) << 16 | first(wave, 40), total(1 - wave)]
+            })
+            .collect();
+        vec![one([0; 4], 512, want)]
+    };
+    let permute = {
+        let s0 = 0xABCD_1234;
+        let x = |n: u32| 3 * n + 1;
+        let want = (0..64)
+            .flat_map(|n| {
+                let shifted = if matches!(n >> 4, 1 | 2) && n & 15 != 0 { x(n - 1) } else { 1000 };
+                [x(63 - n), shifted, x(n & 32 | (n & 31) ^ 16), if n == 45 { s0 } else { n }]
+            })
+            .collect();
+        vec![one([s0, 0, 0, 0], 256, want)]
+    };
+    let or = || {
+        [(64u32, u32::MAX), (40, 0x000F_FFFF), (33, 0x0001_FFFF), (10, 0x1F), (1, 1), (0, 0)]
+            .map(|(below, or)| one([below, 0, 0, 0], 1, vec![or]))
+            .to_vec()
+    };
+    let past = [64u32, 40, 33, 32, 10, 1, 0]
+        .map(|s0| {
+            let or = (0..64u32).filter(|&t| t < s0).fold(0u32, |m, t| m | 1 << (t >> 1));
+            let s7 = if s0 == 0 { 0x77 } else { or };
+            one([s0, 0, 0, 0], 256, (0..64u32).flat_map(|t| [s7, 1 << (t >> 1), t >> 1, t]).collect())
+        })
+        .to_vec();
+    // the console's balanced tree of 16-bit additions, each rounded to nearest (ties to even)
+    let tree = {
+        let wide = |h: u16| f32::from_bits((u32::from(h >> 10) + 112) << 23 | u32::from(h & 0x3FF) << 13);
+        let narrow = |f: f32| {
+            let b = f.to_bits();
+            let h = ((b >> 23) - 112) << 10 | (b >> 13 & 0x3FF);
+            let rest = b & 0x1FFF;
+            (h + u32::from(rest > 0x1000 || rest == 0x1000 && h & 1 == 1)) as u16
+        };
+        let mut sums: Vec<u16> = (0..64u16).map(|t| 0x3C00 + 37 * t).collect();
+        while sums.len() > 1 {
+            sums = sums.chunks(2).map(|c| narrow(wide(c[0]) + wide(c[1]))).collect();
+        }
+        u32::from(sums[0])
+    };
+    vec![
+        ("lds_and_lanes_across_halves", lds_and_lanes_across_halves(), lds),
+        ("loops_apart_meeting_at_the_barrier", loops_apart_meeting_at_the_barrier(), loops),
+        ("permute_shift_and_write_lanes", permute_shift_and_write_lanes(), permute),
+        ("wave_or_in_a_lane_branch_execz", wave_or_in_a_lane_branch(0xBF88_0000, 64), or()),
+        ("wave_or_in_a_lane_branch_scc0", wave_or_in_a_lane_branch(0xBF84_0000, 64), or()),
+        ("wave_value_past_a_lane_branch", wave_value_past_a_lane_branch(), past),
+        ("sum_of_halves", sum_of_halves(), vec![one([0; 4], 1, vec![tree])]),
+    ]
+}
+
+/// For a run on the host GPU (the Pro): writes each synthetic program's paired-form container
+/// (`<name>.dxil`, one group; `<name>.bindings`: its `HostShader::user_data`, where the root
+/// constants s0..s3 and the raw UAV's table go) and what the console leaves
+/// (`<name>.expected`: per dispatch a line `constants <s0> <s1> <s2> <s3> dwords <n>`, then
+/// the dwords in hex, eight a line) into the directory `PAIRED_DUMP_DIR` names.
+/// `PAIRED_DUMP_DIR=<dir> cargo test --locked -p victory-shader --lib dump_for_the_host_gpu -- --ignored`
+#[test]
+#[ignore = "writes files for a GPU run elsewhere; needs PAIRED_DUMP_DIR"]
+fn dump_for_the_host_gpu() {
+    use std::fmt::Write as _;
+    let dir = std::env::var_os("PAIRED_DUMP_DIR").expect("PAIRED_DUMP_DIR");
+    let dir = std::path::Path::new(&dir);
+    std::fs::create_dir_all(dir).expect("the directory");
+    for (name, native, runs) in console_results() {
+        let (shader, _) = paired(&native).unwrap_or_else(|e| panic!("{name}: {e}"));
+        std::fs::write(dir.join(format!("{name}.dxil")), &shader.dxil).expect("write");
+        let bindings: String = shader.user_data.iter().map(|u| format!("{u:?}\n")).collect();
+        std::fs::write(dir.join(format!("{name}.bindings")), bindings).expect("write");
+        let mut text = String::new();
+        for run in runs {
+            let [a, b, c, d] = run.constants;
+            assert_eq!(run.want.len(), run.dwords, "{name}");
+            writeln!(text, "constants {a:#x} {b:#x} {c:#x} {d:#x} dwords {}", run.dwords).unwrap();
+            for row in run.want.chunks(8) {
+                let row: Vec<String> = row.iter().map(|w| format!("{w:08x}")).collect();
+                writeln!(text, "{}", row.join(" ")).unwrap();
+            }
+        }
+        std::fs::write(dir.join(format!("{name}.expected")), text).expect("write");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a Wave32 D3D12 hardware device and the DXIL validator"]
+fn paired_dispatches_match_the_console() {
+    use super::host::{Dispatch, Host, Root, View};
+    use super::validator::Validator;
+
+    let host = Host::new(false).expect("Wave32 hardware");
+    let mut validator = Validator::load(Validator::default_path().as_deref())
+        .expect("DXIL validator");
+    let mut values = 0;
+    for (name, native, cases) in console_results() {
+        let (mut shader, _) = paired(&native).unwrap_or_else(|error| panic!("{name}: {error}"));
+        validator.validate(&mut shader.dxil).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let (root, pipeline) = host.compute_pipeline(&shader).unwrap_or_else(|error| panic!("{name}: {error}"));
+        for case in cases {
+            let mut constants = vec![0; shader.user_data_dwords().max(1) as usize];
+            for slot in &shader.user_data {
+                if let (RootType::Constants, 0, index @ 0..=3) = (slot.root, slot.slot, slot.dword) {
+                    constants[slot.index as usize] = case.constants[index as usize];
+                }
+            }
+            let buffers = [View::RawUav(case.dwords as u32)];
+            let request = Dispatch {
+                roots: vec![(0, Root::Constants(constants))], views: &buffers, samplers: &[], groups: [1, 1, 1],
+            };
+            let got = host.dispatch(&root, &pipeline, &request).unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(got.len(), 1, "{name}: expected exactly one UAV");
+            assert_eq!(got[0].len(), case.want.len(), "{name}: buffer length");
+            if let Some(index) = got[0].iter().zip(&case.want).position(|(got, want)| got != want) {
+                panic!("{name} {:?}: dword {index}, got {:#x}, expected {:#x}", case.constants, got[0][index], case.want[index]);
+            }
+            values += case.want.len();
+        }
+        eprintln!("{name}: validator and hardware readback passed");
+    }
+    eprintln!("Verified {values} dwords on the hardware device");
+}
