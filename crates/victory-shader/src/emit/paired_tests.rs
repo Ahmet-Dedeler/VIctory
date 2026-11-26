@@ -428,6 +428,7 @@ fn the_switch_is_off_unless_it_names_a_mode() {
     assert_eq!(parse_pairs(Some("0")), Pairs::Off);
     assert_eq!(parse_pairs(Some("")), Pairs::Off);
     assert_eq!(parse_pairs(Some("yes")), Pairs::Off);
+    assert_eq!(parse_pairs(Some("last")), Pairs::Last);
     assert_eq!(parse_pairs(Some("1")), Pairs::BeforeApproximate);
     assert_eq!(parse_pairs(Some(" 1 ")), Pairs::BeforeApproximate);
     assert_eq!(parse_pairs(Some("first")), Pairs::First);
@@ -524,6 +525,7 @@ fn a_program_the_paired_form_refuses_gets_the_form_it_got_before() {
 /// Where `VICTORY_WAVE_PAIRS` puts the paired form, program by program: `true` where
 /// [`super::emit`] gives the paired form, `false` where it gives exactly what it gives with
 /// the switch off.
+/// * `last` preserves every already usable form. Only the refused permute changes here.
 /// * `1` keeps every exact form new-base has and takes the paired form before the approximate
 ///   ones and as the last resort: the `scc0` wave OR and the wave value past a branch went to
 ///   an approximate form (each half-wave its own OR), the permute was refused.
@@ -533,20 +535,20 @@ fn a_program_the_paired_form_refuses_gets_the_form_it_got_before() {
 ///   waves of 32 that exchange through LDS (the LDS, loop and 16-bit sum programs).
 #[test]
 fn the_switch_decides_where_emit_takes_the_paired_form() {
-    let table: [(&str, NativeProgram, [bool; 3]); 7] = [
-        ("LDS and lanes across halves", lds_and_lanes_across_halves(), [false, false, true]),
-        ("loops apart", loops_apart_meeting_at_the_barrier(), [false, false, true]),
-        ("permute, shift, write lanes", permute_shift_and_write_lanes(), [true, true, true]),
-        ("wave OR (execz)", wave_or_in_a_lane_branch(0xBF88_0000, 64), [false, true, true]),
-        ("wave OR (scc0)", wave_or_in_a_lane_branch(0xBF84_0000, 64), [true, true, true]),
-        ("wave value past a lane branch", wave_value_past_a_lane_branch(), [true, true, true]),
-        ("sum of halves", sum_of_halves(), [false, false, true]),
+    let table: [(&str, NativeProgram, [bool; 4]); 7] = [
+        ("LDS and lanes across halves", lds_and_lanes_across_halves(), [false, false, false, true]),
+        ("loops apart", loops_apart_meeting_at_the_barrier(), [false, false, false, true]),
+        ("permute, shift, write lanes", permute_shift_and_write_lanes(), [true, true, true, true]),
+        ("wave OR (execz)", wave_or_in_a_lane_branch(0xBF88_0000, 64), [false, false, true, true]),
+        ("wave OR (scc0)", wave_or_in_a_lane_branch(0xBF84_0000, 64), [false, true, true, true]),
+        ("wave value past a lane branch", wave_value_past_a_lane_branch(), [false, true, true, true]),
+        ("sum of halves", sum_of_halves(), [false, false, false, true]),
     ];
     for (name, native, want) in table {
         let (pairs, _) = paired(&native).expect("paired");
         let off = emitted(&native, Pairs::Off);
         assert!(bytes(&off) != Ok(pairs.dxil.as_slice()), "{name}: off, the paired form");
-        for (mode, paired_here) in [Pairs::BeforeApproximate, Pairs::First, Pairs::All].into_iter().zip(want) {
+        for (mode, paired_here) in [Pairs::Last, Pairs::BeforeApproximate, Pairs::First, Pairs::All].into_iter().zip(want) {
             let on = emitted(&native, mode);
             if paired_here {
                 assert!(bytes(&on) == Ok(pairs.dxil.as_slice()), "{name}, {mode:?}: not the paired form");
@@ -567,9 +569,8 @@ fn a_program_no_form_takes_gets_the_paired_form_last() {
     let off = emitted(&native, Pairs::Off);
     assert!(matches!(&off, Err(ShaderError::Unsupported { .. })), "{:?}", bytes(&off));
     let (pairs, _) = paired(&native).expect("paired");
-    for mode in [Pairs::BeforeApproximate, Pairs::First, Pairs::All] {
+    for mode in [Pairs::Last, Pairs::BeforeApproximate, Pairs::First, Pairs::All] {
         let on = emitted(&native, mode);
         assert!(bytes(&on) == Ok(pairs.dxil.as_slice()), "{mode:?}: {:?}", bytes(&on).err());
     }
 }
-

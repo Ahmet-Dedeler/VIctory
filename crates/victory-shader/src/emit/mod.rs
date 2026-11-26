@@ -481,7 +481,7 @@ pub fn emit(
         Ok(shader) => required_wave(shader) == Some(64),
         Err(e) => matches!(e, ShaderError::Unsupported { .. }),
     };
-    if refused && matches!(mode, Pairs::BeforeApproximate | Pairs::First) {
+    if refused && matches!(mode, Pairs::Last | Pairs::BeforeApproximate | Pairs::First) {
         let again = paired(c, native, p, io, res);
         report_pairs("paired lanes, last resort", &again);
         if let Ok((shader, _)) = again {
@@ -790,6 +790,8 @@ fn widen(
 enum Pairs {
     /// Unset, `0` or anything not below: never.
     Off,
+    /// `last`: try pairing only if the ordinary forms fail or still require 64 lanes.
+    Last,
     /// `1`: for a program [`emit`]'s first form leaves needing 64-lane waves (or stopped where
     /// not every lane runs), after the exact forms and before the approximate ones.
     BeforeApproximate,
@@ -803,6 +805,7 @@ enum Pairs {
 /// `VICTORY_WAVE_PAIRS` as [`Pairs`]. Pure, for testing.
 fn parse_pairs(value: Option<&str>) -> Pairs {
     match value.map(str::trim) {
+        Some("last") => Pairs::Last,
         Some("1") => Pairs::BeforeApproximate,
         Some("first") => Pairs::First,
         Some("all") => Pairs::All,
