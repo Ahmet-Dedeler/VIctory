@@ -1486,6 +1486,15 @@ impl State {
             self.host_pipeline = p.pso.as_raw() as usize;
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
+        } else if crate::mac::pipeline_every_draw() {
+            // Mac layer: D3DMetal keeps one current pipeline for draws and
+            // dispatches alike, so a pipeline of ours set in between (a
+            // compute step, a pass) is still the current one, and a draw
+            // read it as a graphics pipeline: a vertex slot count of 32,000
+            // to 65,000 in `SetRenderVertexBuffers`, read past the list's end
+            // (runs nb-av-d to -g). Set again on every draw and dispatch.
+            // SAFETY: as above.
+            unsafe { l.SetPipelineState(&p.pso) };
         }
         for stage in &p.stages {
             let t = stage.translated();

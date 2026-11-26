@@ -359,3 +359,11 @@ pub(crate) fn mapped_buffer_bytes(size: u64) -> u64 {
     }
     size + size.min(256 << 10).next_multiple_of(4096)
 }
+
+/// Whether every draw and dispatch sets its pipeline again, even when the last
+/// one it set is the same (see `draw.rs`): on by default on Darwin
+/// (`VICTORY_PIPELINE_EVERY_DRAW=0`: only when it changes, as the base does).
+pub(crate) fn pipeline_every_draw() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| switch("VICTORY_PIPELINE_EVERY_DRAW", true, false))
+}
