@@ -26,10 +26,17 @@ A local world capture covered 87 distinct mesh/pixel pairs with
 DXIL validator and Apple's Metal IR Converter. The remaining 33 pairs
 exceeded mesh output or shared-memory limits (28), exceeded signature
 limits (4), or had a loop-limit exit (1). The four affected vertex/pixel
-pairs are outside the prototype. The captured draw data was used offline.
-Ordinary translation emitted byte-identical DXIL for all 155 source
-shaders shared across those pairs compared with `35db0038`. Title draw
-correctness and frame cost remain unmeasured.
+pairs are outside the prototype. Ordinary translation emitted byte-identical
+DXIL for all 155 source shaders shared across the 87 pairs compared with
+`35db0038`.
+
+The same 54 pairs were also submitted to headless D3D12 pipeline creation.
+Every call returned success. D3DMetal logged a fragment compilation error
+and marked every ordinary pipeline as a no-op. It logged no fragment
+compilation errors for the linked pipelines and marked eight as no-ops
+during render pipeline creation. The other 46 account for 884 captured
+mesh commands. The probe inferred root and render target state and issued
+no draws. Title draw correctness and frame cost remain unmeasured.
 
 Two natively f16 channels consume six f32 primitive components in this
 prototype. A lossless packed representation could fit the originals in
