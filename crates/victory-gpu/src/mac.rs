@@ -416,12 +416,14 @@ pub(crate) fn refuse_barycentrics() -> bool {
 }
 
 /// Whether pixel programs read per-vertex inputs without `attributeAtVertex`
-/// (`victory_shader::emit::set_per_vertex_solved`): on by default on Darwin
-/// (`VICTORY_PER_VERTEX_SOLVED=0`: the op, and its pipelines refused), so
-/// hair, doors and the rest of those draws are drawn.
+/// (`victory_shader::emit::set_per_vertex_solved`), so hair, doors and the
+/// rest of those draws are drawn. Off for now (`VICTORY_PER_VERTEX_SOLVED=1`:
+/// on, Darwin only): Ahmet's release build of b867f881 died silently ~1 s
+/// into pipeline preload with it on (2026-11-26), though all 12,055 such
+/// pixel programs pass Apple's converter offline.
 pub(crate) fn per_vertex_solved() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| switch("VICTORY_PER_VERTEX_SOLVED", true, false))
+    *ON.get_or_init(|| crate::mac::is_darwin() && std::env::var_os("VICTORY_PER_VERTEX_SOLVED").is_some_and(|v| v == "1"))
 }
 
 /// The feature bits of a DXIL container's `SFI0` part (0 without one).
