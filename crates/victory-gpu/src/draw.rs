@@ -2426,14 +2426,19 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+            if let Some((at, len, print, looks, uploaded, kind)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                    if kind & crate::descriptor::host::VIEW_TEXTURE_SMALL_LINEAR != 0 {
+                        crate::descriptor::host::VIEW_TEXTURES[1].fetch_add(1, Ordering::Relaxed);
+                        host.texture_slot_recheck(index, write, frame + 1, (at, len), print, looks, uploaded, kind);
+                    } else {
+                        match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                            Some(wait) => {
+                                host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded, kind)
+                            }
+                            None => host.texture_slot_done(index, write, None),
                         }
-                        None => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
@@ -2606,7 +2611,13 @@ impl State {
                 match memory {
                     Some((at, len)) => {
                         let print = crate::texture::fingerprint(at, len);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                        let kind = heap
+                            .handle(index)
+                            .and_then(crate::descriptor::view)
+                            .filter(|_| crate::descriptor::host::view_textures())
+                            .filter(crate::descriptor::host::small_linear_placed)
+                            .map_or(0, |_| crate::descriptor::host::VIEW_TEXTURE_SMALL_LINEAR);
+                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame, kind);
                     }
                     None => host.texture_slot_done(index, write, again),
                 }
@@ -2717,7 +2728,12 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                    let kind = view
+                        .as_ref()
+                        .filter(|_| crate::descriptor::host::view_textures())
+                        .filter(|v| crate::descriptor::host::small_linear_placed(v))
+                        .map_or(0, |_| crate::descriptor::host::VIEW_TEXTURE_SMALL_LINEAR);
+                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame, kind);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -3613,7 +3629,16 @@ impl State {
                             && crate::descriptor::host::is_texture_view(&view)
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() {
+                            let small = crate::descriptor::host::view_textures()
+                                && crate::descriptor::host::small_linear_placed(&view);
+                            if small && kind.is_none() {
+                                // A table entry the shader does not name can still be the
+                                // heap slot it reads by a computed index (the character
+                                // palette tables). Small linear ones are cheap to upload,
+                                // and their title slot is made in place as a named one's is.
+                                readable(list, ResourceType::Srv, &view);
+                            }
+                            if kind.is_some() || small {
                                 host.mirror_after(list, title + k, table + u64::from(k) * 32);
                             }
                         }

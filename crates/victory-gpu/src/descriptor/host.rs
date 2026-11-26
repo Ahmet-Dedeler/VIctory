@@ -889,8 +889,9 @@ struct Waiting {
     /// For a slot uploaded whole and looked at again
     /// ([`TextureQueue::recheck`]): where its memory is (address, bytes),
     /// the fingerprint it had at the upload, how many looks found it
-    /// unchanged, and the frame of the upload. A fingerprint of 0: none.
-    checked: (u64, u64, u64, u8, u64),
+    /// unchanged, the frame of the upload, and what kind of view texture
+    /// it is ([`VIEW_TEXTURE_SMALL_LINEAR`]). A fingerprint of 0: none.
+    checked: (u64, u64, u64, u8, u64, u64),
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -917,7 +918,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0, 0) });
     }
 
     fn remove(&mut self, index: u32) {
@@ -1024,16 +1025,26 @@ impl TextureQueue {
     /// title that fills a texture's memory after it wrote the view (the
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+    fn recheck(
+        &mut self,
+        index: u32,
+        write: u64,
+        due: u64,
+        at: (u64, u64),
+        print: u64,
+        looks: u8,
+        uploaded: u64,
+        kind: u64,
+    ) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
-            w.checked = (at.0, at.1, print, looks, uploaded);
+            w.checked = (at.0, at.1, print, looks, uploaded, kind);
         }
     }
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
     /// waiting for such a look.
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, u64)> {
         self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
     }
 
@@ -1045,7 +1056,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0, 0) });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1072,6 +1083,49 @@ impl TextureQueue {
         }
         c
     }
+}
+
+/// Bit in a rechecked slot's kind: a small placed texture in linear memory
+/// whose view shaders pick by index. Such textures are the per-character
+/// palette tables the title rewrites in place; they are cheap enough to
+/// fingerprint again for as long as their slot lives.
+pub(crate) const VIEW_TEXTURE_SMALL_LINEAR: u64 = 1;
+
+/// Whether resource-less texture views found by the heap sweep are put back
+/// into the indexed-texture queue even when that queue is long, and small
+/// linear ones are looked at again after every frame once uploaded. On by
+/// default; `VICTORY_VIEW_TEXTURES=0` leaves both to the old sweep and
+/// bounded recheck behaviour.
+pub(crate) fn view_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Small linear view textures put back into the queue by the sweep, and
+/// rechecks of them that found their memory unchanged, since the start.
+pub(crate) static VIEW_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The bytes of title memory a small linear view texture may take. The
+/// character palettes of the dumps are 1 to 4 KiB; 16 KiB still keeps the
+/// whole-memory fingerprint small.
+const SMALL_LINEAR_VIEW: u64 = 16 << 10;
+
+/// Whether `view` is a shader view of a small texture the title placed in
+/// linear memory. The resource description's layout bits decide this: the
+/// layout library's linear mode, not a tiled swizzle mode.
+pub(crate) fn small_linear_placed(view: &View) -> bool {
+    let View::Placed(false, resource, _) = view else {
+        return false;
+    };
+    if resource[0] == 1 || crate::resource::placed_bytes(resource).is_none_or(|bytes| bytes > SMALL_LINEAR_VIEW) {
+        return false;
+    }
+    // SAFETY: 56 bytes in the resource description's layout.
+    let desc = unsafe { resource.as_ptr().cast::<crate::resource::ResourceDesc>().read_unaligned() };
+    crate::resource::texture_layout(&desc).is_some_and(|texture| {
+        texture.planes[0].layout.desc.swizzle.block_log2() == Some(0)
+    })
 }
 
 /// Whether `view` is of a texture the title may fill itself: a texture it
@@ -1776,13 +1830,14 @@ impl HostHeap {
         print: u64,
         looks: u8,
         uploaded: u64,
+        kind: u64,
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.recheck(index, write, due, at, print, looks, uploaded, kind);
     }
 
     /// See [`TextureQueue::checked`].
-    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, u64)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
     }
 

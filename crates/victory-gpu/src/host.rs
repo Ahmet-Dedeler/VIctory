@@ -8971,6 +8971,14 @@ impl Meter {
                         / crate::resource::SWEPT_US[0].load(Ordering::Relaxed).max(1) as f64,
                     crate::resource::SWEPT_US[2].load(Ordering::Relaxed) as f64 / 1e3
                 );
+                let [small_back, small_unchanged] =
+                    [0, 1].map(|i| crate::descriptor::host::VIEW_TEXTURES[i].load(Ordering::Relaxed));
+                if small_back != 0 || small_unchanged != 0 {
+                    tracing::info!(
+                        "small linear view textures (VICTORY_VIEW_TEXTURES=0: off): {small_back} put back into the queue, \
+                         {small_unchanged} unchanged frame rechecks since the start"
+                    );
+                }
             }
             {
                 let mode = crate::watch::page_writes();
