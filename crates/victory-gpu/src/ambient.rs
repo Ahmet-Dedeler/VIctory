@@ -511,6 +511,24 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
 /// to begin with.
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// A dispatch of the title's program of `role` ran: whether the stand-in was
+/// on and whether it recorded its pass. Said the first three times for each
+/// role, then at every power of two: the stand-in's own line below is said
+/// four times in all, and Radiance and Reflect used those up in the first
+/// two frames, so a Resolve that never recorded (black ground in the shade
+/// at Key Lento Kahuna, 2026-11-27) left nothing in the log.
+pub(crate) fn seen(role: Role, on: bool, recorded: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static RECORDED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    let i = role as usize;
+    let n = SEEN[i].fetch_add(1, Ordering::Relaxed) + 1;
+    let done = RECORDED[i].fetch_add(u64::from(recorded), Ordering::Relaxed) + u64::from(recorded);
+    if n <= 3 || n.is_power_of_two() {
+        tracing::info!(?role, on, recorded, runs = n, recorded_runs = done, kept = KEPT.load(Ordering::Relaxed), "the stand-in's program ran");
+    }
+}
+
 /// What the passes read and write, as views in the heap the list has set.
 pub(crate) struct Views {
     /// The image the title's program just wrote.

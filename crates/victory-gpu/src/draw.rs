@@ -3227,12 +3227,14 @@ impl State {
     /// What follows a dispatch of `p`, direct or indirect: the stand-in for
     /// the indirect light and traced reflections (`crate::ambient`).
     fn after_dispatch(&mut self, list: &HostList, p: &HostPipeline) {
-        if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
-            && crate::ambient::on()
-            && self.ambient(list, p, role)
-        {
-            self.host_pipeline = 0;
-            self.host_roots[1] = 0;
+        if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient) {
+            let on = crate::ambient::on();
+            let recorded = on && self.ambient(list, p, role);
+            crate::ambient::seen(role, on, recorded);
+            if recorded {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         }
     }
 
@@ -3245,6 +3247,7 @@ impl State {
         };
         let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
         else {
+            once!(?role, "no stand-in for the indirect light: no view heap");
             return false;
         };
         let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
