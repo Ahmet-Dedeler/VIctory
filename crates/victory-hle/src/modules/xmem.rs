@@ -167,6 +167,12 @@ pub extern "system" fn XMemVirtualAlloc(
                 "XMemVirtualAlloc refused"
             );
         }
+    } else {
+        // New memory where the title may have freed memory the GPU side's
+        // copies still hold (with the host's `VirtualFree`, which they do not
+        // see): what they took of it is gone, and so are their guards.
+        let end = base.max(at) as usize + size;
+        victory_gpu::title_memory_remapped(at as usize, end - at as usize);
     }
     if base.is_null() {
         tracing::debug!(
@@ -357,6 +363,12 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
 }
 
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
+///
+/// The GPU side's copies are told first that the memory is gone
+/// ([`victory_gpu::title_memory_remapped`]): what reuses it next may not
+/// report itself (the host heap hands out freed blocks again unseen), and a
+/// copy-back still pending for the freed memory would otherwise land in the
+/// new memory. (Marvisak/VIctory cd603513.)
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
         return;
@@ -365,16 +377,66 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            // Held across the report and the free: a copy-back checks under
+            // it, so it writes before the report or skips the memory.
+            let _remap = victory_gpu::title_memory_remapping();
+            freed(address as usize, reservation_len(address));
             victory_gpu::title_memory_alias_freed(address as usize, 0, true);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        // Only the host pages the block fills: its first and last may hold
+        // other blocks of the heap, still in use.
+        let (first, last) = (
+            (user as usize).next_multiple_of(HOST_PAGE),
+            (user as usize - align + size) & !(HOST_PAGE - 1),
+        );
+        let _remap = (first < last).then(|| {
+            // As above.
+            let remap = victory_gpu::title_memory_remapping();
+            freed(first, last - first);
+            remap
+        });
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
         );
+    }
+}
+
+/// The host's page, the GPU side's unit of change tracking.
+const HOST_PAGE: usize = 4 << 10;
+
+/// Tells the GPU side's copies that title memory `[at, at + len)` was
+/// freed: what it shows next is new.
+fn freed(at: usize, len: usize) {
+    if len > 0 {
+        victory_gpu::title_memory_remapped(at, len);
+    }
+}
+
+/// The bytes of the reservation at `base` (one `VirtualAlloc`'s): its
+/// regions, which guards and protection changes split, up to the first that
+/// belongs to no allocation or another.
+fn reservation_len(base: *mut c_void) -> usize {
+    let mut len = 0;
+    loop {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query into our own structure, of its size.
+        let got = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                base.cast::<u8>().wrapping_add(len).cast(),
+                &mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if got == 0 || info.AllocationBase != base || info.RegionSize == 0 {
+            return len;
+        }
+        len += info.RegionSize;
     }
 }
 
