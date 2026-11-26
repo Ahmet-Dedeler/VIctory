@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::CreateEventW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -296,7 +296,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         a.queue.Signal(&a.fence, a.value)?;
         if a.fence.GetCompletedValue() < a.value {
             a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
+            crate::mac::wait_fence(&a.fence, a.value, a.event);
         }
     }
     let us = started.elapsed().as_micros() as u64;
@@ -693,7 +693,7 @@ fn card_clock_watch(clock: &'static CardClock) {
         // SAFETY: the clock's fence and this thread's event.
         unsafe {
             if clock.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
+                crate::mac::wait_fence(&clock.fence, target, event);
             }
         }
         seen = target;
@@ -921,6 +921,7 @@ fn create() -> windows::core::Result<Host> {
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            crate::mac::set_host_max_wave(o1.WaveLaneCountMax);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
@@ -1343,6 +1344,14 @@ pub(crate) fn compile(
 ) -> windows::core::Result<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    // Mac layer: Wine's D3DCompile drops [RootSignature]; dxcompiler.dll instead.
+    // SAFETY: the caller's NUL-terminated names.
+    let (entry_s, target_s) = unsafe { (entry.to_string().unwrap_or_default(), target.to_string().unwrap_or_default()) };
+    if crate::mac::dxc_first(source)
+        && let Ok(bytes) = crate::mac::dxc_compile(source, &entry_s, &target_s)
+    {
+        return Ok(bytes);
+    }
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -1362,6 +1371,11 @@ pub(crate) fn compile(
         )
     };
     if let Err(e) = compiled {
+        if crate::mac::wine_host().is_some()
+            && let Ok(bytes) = crate::mac::dxc_compile(source, &entry_s, &target_s)
+        {
+            return Ok(bytes);
+        }
         if let Some(errors) = errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
@@ -3244,7 +3258,7 @@ fn late_helper() {
             if host.fence.SetEventOnCompletion(target, event).is_ok() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
-                WaitForSingleObject(event, INFINITE);
+                crate::mac::wait_fence(&host.fence, target, event);
             }
         }
         {
@@ -3406,7 +3420,7 @@ fn relay_worker() {
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
                     host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
+                        crate::mac::wait_fence(&host.fence, target, event);
                     })
                 };
                 if waited.is_err() {
@@ -4120,27 +4134,8 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        // Mac layer: through `compile`, which falls back to DXC under Wine.
+        let bytes = compile(CARD_COMPARE, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -4150,7 +4145,7 @@ impl Host {
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let bytes = &bytes[..];
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
@@ -4685,7 +4680,7 @@ impl Host {
                     fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
-                    WaitForSingleObject(event, INFINITE);
+                    crate::mac::wait_fence(&fence, sent, event);
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
@@ -4700,7 +4695,7 @@ impl Host {
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
-                WaitForSingleObject(event, INFINITE);
+                crate::mac::wait_fence(&fence, sent, event);
                 Ok(after)
             })()
         };
@@ -4988,7 +4983,7 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    crate::mac::wait_fence(&self.fence, *submitted, self.event);
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -5257,7 +5252,7 @@ impl Host {
                             working(false);
                             #[cfg(feature = "diagnostics")]
                             let _card = crate::timeline::card_wait(Some(*submitted));
-                            WaitForSingleObject(self.event, INFINITE);
+                            crate::mac::wait_fence(&self.fence, *submitted, self.event);
                             stood(waiting);
                             working(true);
                         }
@@ -5707,7 +5702,7 @@ impl Host {
                         working(false);
                         #[cfg(feature = "diagnostics")]
                         let _card = crate::timeline::card_wait(Some(*submitted));
-                        WaitForSingleObject(self.event, INFINITE);
+                        crate::mac::wait_fence(&self.fence, *submitted, self.event);
                         stood(started);
                         working(true);
                     }
@@ -8771,8 +8766,10 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        // Mac layer: the caption says which build, folder and keyboard (xcl-mac/AGENTS.md).
+        let (prefix, suffix) = crate::mac::caption(fps, ms, draws);
+        let mut text: Vec<u16> =
+            prefix.encode_utf16().chain(caption.iter().copied()).chain(suffix.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
@@ -9492,20 +9489,28 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-        CreateWindowExW(
+        // Mac layer: a background run's window is off the desktop, never activated.
+        let bg = crate::mac::background();
+        let (x, y) = crate::mac::background_window().unwrap_or((CW_USEDEFAULT, CW_USEDEFAULT));
+        let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            if bg { w!("[background test run] VIctory") } else { w!("VIctory") },
+            if bg { WS_OVERLAPPEDWINDOW } else { WS_OVERLAPPEDWINDOW | WS_VISIBLE },
+            x,
+            y,
             rect.right - rect.left,
             rect.bottom - rect.top,
             None,
             None,
             Some(instance.into()),
             None,
-        )
+        )?;
+        if bg {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            crate::mac::background_behind(hwnd.0);
+        }
+        Ok(hwnd)
     }
 }
 

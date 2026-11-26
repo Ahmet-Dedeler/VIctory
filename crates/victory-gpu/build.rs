@@ -42,4 +42,31 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-env=VICTORY_TRANSLATOR={}", hash.finalize().to_hex());
+    build_stamp();
+}
+
+fn git(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git").args(args).output().ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let text = text.trim();
+    (out.status.success() && !text.is_empty()).then(|| text.to_owned())
+}
+
+/// Mac layer: the branch and commit this was built from, for the window
+/// caption (`VICTORY_BUILD`, `src/mac.rs`): several builds run side by side
+/// on one machine, and a window has to say which one it is.
+fn build_stamp() {
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    let commit = git(&["rev-parse", "--short", "HEAD"]);
+    let build = match (branch, commit) {
+        (Some(branch), Some(commit)) if branch != "HEAD" => format!("{branch} {commit}"),
+        (_, Some(commit)) => commit,
+        _ => "unknown build".to_owned(),
+    };
+    println!("cargo:rustc-env=VICTORY_BUILD={build}");
+    for path in ["HEAD", "logs/HEAD"] {
+        if let Some(path) = git(&["rev-parse", "--path-format=absolute", "--git-path", path]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
 }

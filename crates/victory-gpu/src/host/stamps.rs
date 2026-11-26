@@ -173,7 +173,7 @@ mod tests {
                 host.queue.ExecuteCommandLists(&[Some(ahead), Some(behind)]);
                 host.queue.Signal(&host.fence, *submitted).unwrap();
                 host.fence.SetEventOnCompletion(*submitted, host.event).unwrap();
-                WaitForSingleObject(host.event, INFINITE);
+                crate::mac::wait_fence(&host.fence, *submitted, host.event);
             }
         }
         let done = crate::timeline::ticks();

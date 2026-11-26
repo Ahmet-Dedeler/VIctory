@@ -50,7 +50,16 @@ impl Cache {
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
         let path = self.path_for(&key);
-        if path.is_file() {
+        // Mac layer: on Windows/Wine, open without `is_file()` / `metadata()`,
+        // so Wine does not call into the mount manager
+        // (`NtQueryVolumeInformationFile`), which deadlocks under Rosetta
+        // while the title suspends threads. `File::open` fails on directories
+        // there; on Unix it does not, so `is_file()` stays.
+        #[cfg(windows)]
+        let exists = std::fs::File::open(&path).is_ok();
+        #[cfg(not(windows))]
+        let exists = path.is_file();
+        if exists {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
         }
@@ -58,9 +67,16 @@ impl Cache {
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
-        std::fs::create_dir_all(dir)?;
-        // Write-then-rename so readers never see partial output.
-        let (tmp, mut file) = tempfile_in(dir)?;
+        // Write-then-rename so readers never see partial output. The bucket
+        // directory is made only when the temp file cannot be (Mac layer: no
+        // metadata calls on the hit-or-miss path, as above).
+        let (tmp, mut file) = match tempfile_in(dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(dir)?;
+                tempfile_in(dir)?
+            }
+            made => made?,
+        };
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));

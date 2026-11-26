@@ -502,7 +502,7 @@ fn run(host: &Host, f: impl FnOnce(&ID3D12GraphicsCommandList)) -> Option<()> {
         host.queue.ExecuteCommandLists(&[Some(list.cast().ok()?)]);
         let done = host.queue.Signal(&fence, 1).and_then(|()| fence.SetEventOnCompletion(1, event));
         if done.is_ok() {
-            WaitForSingleObject(event, INFINITE);
+            crate::mac::wait_fence(&fence, 1, event);
         }
         let _ = CloseHandle(event);
         done.ok()

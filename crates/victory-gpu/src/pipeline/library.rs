@@ -81,9 +81,12 @@ pub(crate) static SAVED: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the library's file is mapped ([`Blob`]) and saved through a
 /// mapping. On by default; `VICTORY_LIBRARY_MAP=0` uses buffers, as before.
+/// Mac layer: off by default on Darwin, where `File::metadata()`
+/// (`NtQueryVolumeInformationFile`) can deadlock and renames of mapped files
+/// misbehave.
 fn mapped() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_MAP").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| crate::mac::switch("VICTORY_LIBRARY_MAP", false, true))
 }
 
 /// Whether the mapped library file's handle is kept open while it is
@@ -219,7 +222,7 @@ impl Blob {
         {
             return Blob::Mapped(file);
         }
-        match std::fs::read(&path) {
+        match crate::mac::read_file(&path) {
             Ok(bytes) if !bytes.is_empty() => Blob::Held(bytes),
             _ => Blob::None,
         }
@@ -461,9 +464,17 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        // Mac layer: the `windows` binding passes a dangling non-null pointer
+        // for an empty slice, which D3DMetal rejects as a blob even at length
+        // 0; an empty library gets a true null.
+        let data = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast::<std::ffi::c_void>() };
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: `device` is live, the bytes outlive the library (kept
+        // beside it), and null with size 0 is how an empty one is made.
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            (device.vtable().CreatePipelineLibrary)(device.as_raw(), data, bytes.len(), &ID3D12PipelineLibrary::IID, &mut raw)
+                .ok()?;
+            ID3D12PipelineLibrary::from_raw(raw).cast()
         }
     };
     if !blob.bytes().is_empty() {
@@ -708,7 +719,7 @@ static SLOW: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(
 fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, u64>>> {
     let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
     if slow.is_none() {
-        let listed = DIR.get().and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok()).unwrap_or_default();
+        let listed = DIR.get().and_then(|d| crate::mac::read_file(&d.join(SLOW_FILE)).ok().and_then(|b| String::from_utf8(b).ok())).unwrap_or_default();
         *slow = Some(
             listed
                 .lines()
@@ -749,7 +760,8 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     if used.is_none() {
         let listed = DIR
             .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
+            .and_then(|d| crate::mac::read_file(&d.join(EARLY_FILE)).ok())
+            .and_then(|b| String::from_utf8(b).ok())
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");

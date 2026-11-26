@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::Interface;
 
 /// About 2 ms at full clocks: 500 sends a second.
@@ -197,7 +197,7 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
             result = queue.Signal(&fence, value);
         }
         if result.is_ok() && fence.GetCompletedValue() < value && fence.SetEventOnCompletion(value, event).is_ok() {
-            WaitForSingleObject(event, INFINITE);
+            crate::mac::wait_fence(&fence, value, event);
         }
         let _ = CloseHandle(event);
         result

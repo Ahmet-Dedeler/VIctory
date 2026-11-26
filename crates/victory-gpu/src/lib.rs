@@ -69,6 +69,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod mac;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod tiles;
@@ -92,6 +94,8 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use mac::{background, background_behind, background_window, is_darwin};
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

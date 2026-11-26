@@ -608,6 +608,13 @@ impl HostPipeline {
             )
         };
         if compute.is_some() {
+            // Mac layer: D3DMetal accepts a WaveSize(64) program on a 32-lane
+            // GPU and then hangs or does nothing; refuse it instead.
+            if let Some(need) = crate::mac::wave_lanes(&code_bytes(&code(0)))
+                && need > crate::mac::host_max_wave()
+            {
+                return refuse("the compute program needs wider waves than the host GPU runs", shaders);
+            }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
