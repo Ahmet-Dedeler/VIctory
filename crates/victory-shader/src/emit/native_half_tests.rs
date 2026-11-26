@@ -628,22 +628,25 @@ fn a_module_declares_native_halves_only_where_code_uses_them() {
 
 /// Lanes per sweep dispatch (one group, two console waves of 32).
 const SWEEP_LANES: u32 = 64;
+const CONVERT_SWEEP: &[u32] = &[0x7E06_1501]; // v_cvt_f16_f32 v3, v1
 
 /// A sweep program: lane `t` converts the f32 with bits `s0 + (t << s1)` (two root
-/// constants) with `v_cvt_f16_f32` and stores the half to dword `t` of the UAV and the
-/// f32's bits to dword 64 + `t` (so the oracle works from what the GPU converted).
-fn sweep_program() -> NativeProgram {
+/// constants) with `operation`, which writes the result to v3. The kernel stores that
+/// result and the original input bits so the host can verify the data it used.
+fn sweep_program(operation: &[u32]) -> NativeProgram {
     const STORE_OFFEN: u32 = 0x38 << 26 | 0x1C << 18 | 1 << 12; // buffer_store_dword .. offen
-    let words = [
+    let mut words = vec![
         0x3404_0082, // v_lshlrev_b32 v2, 2, v0          (byte offset of lane t)
         0x3402_0001, // v_lshlrev_b32 v1, s1, v0
-        0x4A02_0200, // v_add_nc_u32 v1, s0, v1          (the f32's bits)
-        0x7E06_1501, // v_cvt_f16_f32 v3, v1
+        0x4A02_0200, // v_add_nc_u32 v1, s0, v1          (input bits)
+    ];
+    words.extend_from_slice(operation);
+    words.extend([
         STORE_OFFEN,
         0x80 << 24 | 2 << 16 | 3 << 8 | 2, // buffer_store_dword v3, v2, s[8:11], 0 offen
         STORE_OFFEN | (4 * SWEEP_LANES),
         0x80 << 24 | 2 << 16 | 1 << 8 | 2, // buffer_store_dword v1, v2, s[8:11], 0 offen offset:256
-    ];
+    ]);
     let mut native = program(&words, false, SWEEP_LANES);
     // (`program` appends a store of v0 to dword 0: dropped, the sweep stores its own)
     let n = native.code.len();
@@ -796,7 +799,7 @@ fn class(f: u32) -> &'static str {
 
 #[test]
 fn the_sweep_program_lowers_to_one_rounding_either_way() {
-    let native = sweep_program();
+    let native = sweep_program(CONVERT_SWEEP);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let names: Vec<&str> = p
         .blocks
@@ -839,7 +842,7 @@ fn the_sweep_program_lowers_to_one_rounding_either_way() {
 #[test]
 fn on_the_card_native_rounding_matches_the_software_rounding() {
     use super::host::{Dispatch, Host, Root, View};
-    let native = sweep_program();
+    let native = sweep_program(CONVERT_SWEEP);
     let soft = translate(&native, true, false, 32);
     let fast = translate(&native, true, true, 32);
     if let Ok(mut v) =
@@ -859,9 +862,9 @@ fn on_the_card_native_rounding_matches_the_software_rounding() {
         eprintln!("the device does not take the programs (native 16-bit types?); not run");
         return;
     };
-    let run = |(root, pso): &(_, _), base: u32, shift: u32| -> (Vec<u32>, Vec<u16>) {
-        let mut ud = vec![0u32; soft.user_data_dwords().max(2) as usize];
-        (ud[0], ud[1]) = (base, shift);
+    let run = |(root, pso): &(_, _), constants: [u32; 4]| -> (Vec<u32>, Vec<u16>) {
+        let mut ud = vec![0u32; soft.user_data_dwords().max(4) as usize];
+        ud[..4].copy_from_slice(&constants);
         let out = host
             .dispatch(
                 root,
@@ -883,8 +886,9 @@ fn on_the_card_native_rounding_matches_the_software_rounding() {
     let mut failures = Vec::new();
     let mut report = std::collections::BTreeMap::<&str, (u32, u32, u32, u32, Vec<String>)>::new();
     for &(base, shift, what) in SWEEPS {
-        let (inputs, soft_h) = run(&soft_pso, base, shift);
-        let (inputs_again, fast_h) = run(&fast_pso, base, shift);
+        let constants = [base, shift, 0, 0];
+        let (inputs, soft_h) = run(&soft_pso, constants);
+        let (inputs_again, fast_h) = run(&fast_pso, constants);
         assert_eq!(inputs, inputs_again);
         for t in 0..SWEEP_LANES as usize {
             let expected = base.wrapping_add((t as u32).checked_shl(shift).unwrap_or(0));
@@ -929,4 +933,37 @@ fn on_the_card_native_rounding_matches_the_software_rounding() {
         failures.len(),
         failures.join("\n")
     );
+
+    // AMD GFX10 encodings from llvm-mc. v7 and v8 take half-bit operands from s2 and s3.
+    let operations: [(&str, &[u32]); 3] = [
+        ("v_add_f16", &[0x7E0E_0202, 0x6406_0F01]),
+        ("v_mul_f16", &[0x7E0E_0202, 0x6A06_0F01]),
+        ("v_fma_f16", &[0x7E0E_0202, 0x7E10_0203, 0xD74B_0003, 0x0422_0F01]),
+    ];
+    let arithmetic_inputs = [
+        [0x3C00, 0, 0x4123, 0xB855], // positive normals with a negative addend
+        [0xBC00, 0, 0x4123, 0x3855], // negative normals
+        [0x0000, 0, 0x3800, 0x1001], // positive subnormal inputs
+        [0x8000, 0, 0x3800, 0x9001], // negative subnormal inputs
+        [0x7BC0, 0, 0x4200, 0x3C00], // overflow when multiplied
+        [0x47DE, 0, 0x3C01, 0x7401], // fused multiply-add rounding near a half boundary
+    ];
+    for (name, opcodes) in operations {
+        let native = sweep_program(opcodes);
+        let soft = translate(&native, true, false, 32);
+        let fast = translate(&native, true, true, 32);
+        let soft_pso = host.compute_pipeline(&soft).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let fast_pso = host.compute_pipeline(&fast).unwrap_or_else(|error| panic!("{name}: {error}"));
+        for constants in arithmetic_inputs {
+            let (soft_input, soft_output) = run(&soft_pso, constants);
+            let (fast_input, fast_output) = run(&fast_pso, constants);
+            assert!(soft_input.iter().enumerate().all(|(lane, &bits)| bits == constants[0] + lane as u32));
+            assert_eq!(fast_input, soft_input, "{name} inputs");
+            if let Some(lane) = fast_output.iter().zip(&soft_output).position(|(fast, soft)| fast != soft) {
+                panic!("{name} inputs {constants:x?}, lane {lane}: native {:#06x}, software {:#06x}",
+                    fast_output[lane], soft_output[lane]);
+            }
+        }
+        eprintln!("{name}: {} native and software values match on the hardware device", arithmetic_inputs.len() * SWEEP_LANES as usize);
+    }
 }
