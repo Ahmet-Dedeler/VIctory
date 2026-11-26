@@ -129,12 +129,12 @@ const BAKE_AHEAD: [u64; 2] = [12, 2];
 /// until something is new, the next bakes of the frame need no pass.
 static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
 
-/// The pixel shaders of the title's decoration bake (the title:
-/// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
-/// frame listings print it. They draw into a 256x256 corner of 2048x2048
-/// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
-    ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+/// Recognize more decoration bake shaders by their pixel entry names
+/// (`VICTORY_BAKE_ENTRY_NAMES=1`), with the same early texture pass budget.
+fn bake_entry_names() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_ENTRY_NAMES").is_some_and(|v| v == "1"))
+}
 
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
@@ -1955,7 +1955,7 @@ impl State {
             return;
         }
         let bake = bake_ms > 0
-            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+            && p.stages.iter().any(|s| s.shader.is_decoration_bake(bake_entry_names()));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
