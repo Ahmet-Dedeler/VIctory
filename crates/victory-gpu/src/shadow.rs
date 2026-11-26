@@ -1488,7 +1488,12 @@ fn spin(there: impl Fn() -> bool) {
 
 /// How many threads are kept for [`wide`].
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    // Mac layer: `VICTORY_WIDE_THREADS`; on Darwin a third of the cores (6 of
+    // the M5 Max's 18, the count the base was tuned at on 24 PC threads): a
+    // Mac core is a whole core, not half of a hyper-threaded pair.
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let asked = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+    asked.map_or_else(|| (if crate::mac::is_darwin() { cores / 3 } else { cores / 4 }).clamp(2, 6), |n| n.clamp(1, 16))
 }
 
 fn workers() -> &'static Workers {
