@@ -1411,10 +1411,55 @@ fn d16_bits_on() -> bool {
 /// as data ([`Lower::interp`]).
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
 
+/// Semantic key `(UPPERCASE_NAME, index)` -> 4-bit absolute channel mask of
+/// arbitrary (`kind == 0`) inputs read by a paired pixel shader
+/// (`Marvisak/VIctory#2398`, `pragyaangaur/VIctory-macOS#161`).
+pub(super) type KeptOutputs = HashMap<(String, u32), u8>;
+
+/// Keeps only arbitrary (`kind == 0`) signature elements whose semantic has at
+/// least one channel read in `keep`, trimming unread leading and trailing
+/// channels. System values (`kind != 0`) stay untouched.
+fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
+    elements.retain_mut(|e| {
+        if e.kind != 0 {
+            return true;
+        }
+        if e.row.is_none() {
+            return false;
+        }
+        let key = (e.name.to_ascii_uppercase(), e.index);
+        let used = keep.get(&key).copied().unwrap_or(0);
+        let rel = (used >> e.col) & ((1u8 << e.cols) - 1);
+        if rel == 0 {
+            return false;
+        }
+        let first = rel.trailing_zeros() as u8;
+        let last = 7 - rel.leading_zeros() as u8;
+        e.col += first;
+        e.cols = last - first + 1;
+        true
+    });
+}
+
 thread_local! {
     /// Whether first halves of interpolations are evaluated as the pair
     /// they start ([`with_first_half_pairs`]).
     static FIRST_HALF_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether non-provoking per-vertex pixel inputs are lowered as flat
+    /// `VICTORY_P10`/`VICTORY_P20` inputs fed by [`super::vertex_delta_gs`]
+    /// instead of `dx.op.attributeAtVertex` ([`with_vertex_deltas`]).
+    static VERTEX_DELTAS_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When set, arbitrary mesh outputs / pixel inputs not in this map are
+    /// pruned so >32 KiB character mesh shaders fit Metal's 32 KiB limit.
+    static KEPT_MESH_OUTPUTS: std::cell::RefCell<Option<KeptOutputs>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `translate` with arbitrary mesh outputs / pixel inputs pruned to `keep`.
+pub(super) fn with_kept_mesh_outputs<R>(keep: KeptOutputs, translate: impl FnOnce() -> R) -> R {
+    let before = KEPT_MESH_OUTPUTS.replace(Some(keep));
+    let result = translate();
+    KEPT_MESH_OUTPUTS.set(before);
+    result
 }
 
 /// Runs `translate` with first halves of interpolations evaluated as the
@@ -1425,6 +1470,20 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     let result = translate();
     FIRST_HALF_PAIRS.set(before);
     result
+}
+
+/// Runs `translate` with non-provoking per-vertex reads lowered as flat
+/// `VICTORY_P10`/`VICTORY_P20` inputs for [`super::vertex_delta_gs`] instead
+/// of `attributeAtVertex` (vertex+pixel pipelines on D3DMetal).
+pub(super) fn with_vertex_deltas<R>(translate: impl FnOnce() -> R) -> R {
+    let before = VERTEX_DELTAS_MODE.replace(true);
+    let result = translate();
+    VERTEX_DELTAS_MODE.set(before);
+    result
+}
+
+fn vertex_deltas_mode() -> bool {
+    VERTEX_DELTAS_MODE.get()
 }
 
 pub(super) fn host_max_wave() -> u32 {
@@ -1648,6 +1707,15 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        KEPT_MESH_OUTPUTS.with_borrow(|keep| {
+            if let Some(keep) = keep.as_ref() {
+                if x.native.stage == HwStage::Ps {
+                    prune_signature(&mut s.inputs, keep);
+                } else if x.native.stage == HwStage::Ms {
+                    prune_signature(&mut s.outputs, keep);
+                }
+            }
+        });
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1851,11 +1919,24 @@ impl<'a> Lower<'a> {
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
+            KEPT_MESH_OUTPUTS.with_borrow(|keep| {
+                if let Some(keep) = keep.as_ref() {
+                    prune_signature(&mut s.prims, keep);
+                }
+            });
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
+            let mut max_vertices = ms.max_vertices;
+            let mut max_primitives = ms.max_primitives;
+            if super::container::mesh_output_bytes(&s.outputs, &s.prims, max_vertices, max_primitives)
+                > super::container::MESH_OUTPUT_LIMIT
+            {
+                max_vertices = max_vertices.min(ms.threads);
+                max_primitives = max_primitives.min(ms.threads);
+            }
             s.mesh = Some(super::shader::Mesh {
-                max_vertices: ms.max_vertices,
-                max_primitives: ms.max_primitives,
+                max_vertices,
+                max_primitives,
                 topology: ms.topology,
             });
             // Barriers order the lanes' LDS accesses; the console's
@@ -10010,33 +10091,42 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit result outside a VGPR");
         };
         let mut high = v.opsel >> 3 & 1 != 0;
-        // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
+        // SDWA: the word written, the other one kept (preserve), bit 15
+        // copied upward (sext: dst_unused 1 with WORD_0), or zero (pad; a sign
+        // extension above the high word or a whole dword adds nothing). The
+        // reserved dst_unused 3 is refused (upstream VIctory #3124).
         let mut keep = true;
+        let mut sext = false;
         if let Some(sd) = v.sdwa {
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+                (4, 1) => (keep, sext) = (false, true),
+                (4, 0) | (6, 0..=2) => keep = false,
+                (5, 0 | 1) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
         }
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) if keep => o,
-            _ => self.s.m.i32(0),
-        };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
-        let x = self.s.m.bin(c, Bin::And, x, low);
-        let r = if high {
-            let o = self.s.m.bin(c, Bin::And, old, low);
-            let x = self.s.m.bin(c, Bin::Shl, x, k16);
-            self.s.m.bin(c, Bin::Or, o, x)
+        let r = if sext {
+            let t = self.s.m.bin(c, Bin::Shl, x, k16);
+            self.s.m.bin(c, Bin::AShr, t, k16)
         } else {
-            let keep = self.s.m.i32(0xFFFF_0000);
-            let o = self.s.m.bin(c, Bin::And, old, keep);
-            self.s.m.bin(c, Bin::Or, o, x)
+            let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                Some(Ok(o)) if keep => o,
+                _ => self.s.m.i32(0),
+            };
+            let x = self.s.m.bin(c, Bin::And, x, low);
+            if high {
+                let o = self.s.m.bin(c, Bin::And, old, low);
+                let x = self.s.m.bin(c, Bin::Shl, x, k16);
+                self.s.m.bin(c, Bin::Or, o, x)
+            } else {
+                let keep = self.s.m.i32(0xFFFF_0000);
+                let o = self.s.m.bin(c, Bin::And, old, keep);
+                self.s.m.bin(c, Bin::Or, o, x)
+            }
         };
         self.write_placed(inst, Reg::V(reg), r, guard);
         Ok(())
@@ -11276,7 +11366,9 @@ impl<'a> Lower<'a> {
             // P10 and P20: what the first and second halves weigh, P1 - P0
             // and P2 - P0, which is what the hardware holds for an
             // attribute the program also interpolates.
-            Interp::Vertex { attribute, vertex } if self.interpolated(attribute.row) => {
+            Interp::Vertex { attribute, vertex }
+                if self.interpolated(attribute.row) || vertex_deltas_mode() =>
+            {
                 let one = Some(self.s.m.f32(1f32.to_bits()));
                 let (i, j) = if vertex == 0 {
                     (one, None)
@@ -11351,7 +11443,7 @@ impl<'a> Lower<'a> {
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
-                        packed_half(&l.s.inputs, &packs, attribute.row, h)
+                        packed_half(&l.x.inputs, &packs, attribute.row, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
@@ -11451,6 +11543,30 @@ impl<'a> Lower<'a> {
                 _ => Err("an input"),
             };
         };
+        if vertex_deltas_mode() {
+            if !float {
+                return Err("a non-provoking vertex value of an integer input");
+            }
+            let c = self.cur;
+            let mut acc = if p0 {
+                let Val::I32(v0_bits) = self.load_any_input(id, col) else {
+                    return Err("an input");
+                };
+                Some(self.as_float(v0_bits))
+            } else {
+                None
+            };
+            for (vertex, w) in [(0u8, i), (1u8, j)] {
+                let Some(w) = w else { continue };
+                let d = self.vertex_delta_input(id, col, vertex)?;
+                acc = Some(match acc {
+                    Some(a) => self.fmad(w, d, a),
+                    None => self.s.m.bin(c, Bin::Mul, w, d),
+                });
+            }
+            let acc = acc.ok_or("an interpolation")?;
+            return Ok(self.as_int(acc));
+        }
         let v0 = self.vertex_input(id, col, 0)?;
         let c = self.cur;
         let mut acc = p0.then_some(v0);
@@ -11465,6 +11581,66 @@ impl<'a> Lower<'a> {
         }
         let acc = acc.ok_or("an interpolation")?;
         Ok(self.as_int(acc))
+    }
+
+    /// Loads `P10 = v1 - v0` (`vertex == 0`) or `P20 = v2 - v0` (`vertex == 1`)
+    /// of input element `id` (relative column `col`) from a flat `VICTORY_P10` /
+    /// `VICTORY_P20` signature input allocated from [`super::VERTEX_DELTA_TOP`]
+    /// downward, filled by [`super::vertex_delta_gs`].
+    fn vertex_delta_input(&mut self, id: usize, col: u8, vertex: u8) -> Result<V, Why> {
+        let e = &self.s.inputs[id];
+        let (name, index, base_col, cols) = (
+            super::VERTEX_DELTAS[usize::from(vertex)],
+            e.row.ok_or("a non-provoking vertex value without a row")?,
+            e.col,
+            e.cols,
+        );
+        let delta_id = match self
+            .s
+            .inputs
+            .iter()
+            .position(|e| e.name == name && e.index == index)
+        {
+            Some(found) => found,
+            None => {
+                let taken = |e: &SigElement| super::VERTEX_DELTAS.contains(&e.name.as_str());
+                let row = self
+                    .s
+                    .inputs
+                    .iter()
+                    .filter(|e| taken(e))
+                    .filter_map(|e| e.row)
+                    .min()
+                    .map_or(Some(super::VERTEX_DELTA_TOP), |r| r.checked_sub(1));
+                let highest = self
+                    .s
+                    .inputs
+                    .iter()
+                    .filter(|e| !taken(e))
+                    .filter_map(|e| e.row)
+                    .max();
+                let row = row
+                    .filter(|&r| highest.is_none_or(|h| r > h))
+                    .ok_or("no input row left for a non-provoking vertex value")?;
+                self.s.inputs.push(SigElement {
+                    name: name.into(),
+                    index,
+                    kind: 0,
+                    comp: 9,
+                    interp: 1,
+                    row: Some(row),
+                    col: base_col,
+                    cols,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        let Val::I32(bits) = self.load_any_input(delta_id, col) else {
+            return Err("an input");
+        };
+        Ok(self.as_float(bits))
     }
 
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
@@ -13127,7 +13303,7 @@ impl<'a> Lower<'a> {
                 for high in [false, true] {
                     let h = 2 * ch + u8::from(high);
                     let src = if pack2 {
-                        packed_half(outputs, &packs, row, h)
+                        packed_half(&self.x.outputs, &packs, row, h)
                     } else {
                         (!high).then_some((row, ch))
                     };
@@ -13389,7 +13565,7 @@ impl<'a> Lower<'a> {
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
         let free: std::collections::BTreeSet<u32> = self
-            .s
+            .x
             .outputs
             .iter()
             .filter(|o| o.kind == 0)

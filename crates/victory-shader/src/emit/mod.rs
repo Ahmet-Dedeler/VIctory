@@ -85,6 +85,7 @@
 
 mod bitcode;
 mod container;
+mod deltas;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
 #[cfg(all(test, windows))]
@@ -123,6 +124,8 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
+pub use container::MESH_OUTPUT_LIMIT;
+pub use deltas::{VERTEX_DELTA_TOP, VERTEX_DELTAS, needs_vertex_deltas, vertex_delta_gs};
 pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_per_vertex_solved};
 pub use primitive_varyings::link_mesh_primitive_varyings;
@@ -421,6 +424,99 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         }
         other => other,
     }
+}
+
+/// Translates a pixel shader container with non-provoking per-vertex reads
+/// lowered as flat `VICTORY_P10`/`VICTORY_P20` inputs fed by
+/// [`vertex_delta_gs`] (no `attributeAtVertex`, pragyaangaur/VIctory-macOS#300).
+pub fn translate_vertex_deltas(container: &[u8]) -> Result<HostShader, ShaderError> {
+    lower::with_vertex_deltas(|| translate(container))
+}
+
+/// Combined vertex + primitive output byte size of an emitted mesh shader
+/// DXIL container (`None` for non-mesh containers or malformed headers).
+pub fn mesh_output_bytes(dxil: &[u8]) -> Option<u64> {
+    let c = Container::parse(dxil).ok()?;
+    let psv = c.part(FourCC::PSV0)?.data;
+    if crate::dxbc::u32_at(psv, 0).ok()? < 48 || *psv.get(4 + 24)? != 13 {
+        return None;
+    }
+    let u16_at = |off: usize| -> Option<u32> {
+        let b: [u8; 2] = psv.get(off..off + 2)?.try_into().ok()?;
+        Some(u32::from(u16::from_le_bytes(b)))
+    };
+    let max_vertices = u16_at(4 + 12)?;
+    let max_primitives = u16_at(4 + 14)?;
+    let outputs = c
+        .part(FourCC::OSG1)
+        .and_then(|p| signature(p.data).ok())
+        .unwrap_or_default();
+    let prims = c
+        .part(FourCC::PSG1)
+        .and_then(|p| signature(p.data).ok())
+        .unwrap_or_default();
+    Some(container::mesh_output_bytes(
+        &outputs,
+        &prims,
+        max_vertices,
+        max_primitives,
+    ))
+}
+
+/// Arbitrary (`kind == 0`) input channels read by an emitted pixel shader,
+/// keyed by `(UPPERCASE_NAME, semantic_index)` -> 4-bit absolute channel mask.
+fn pixel_input_reads(dxil: &[u8]) -> Result<lower::KeptOutputs, ShaderError> {
+    let c = Container::parse(dxil)?;
+    let Some(part) = c.part(FourCC::ISG1) else {
+        return Ok(lower::KeptOutputs::new());
+    };
+    let mut reads = lower::KeptOutputs::new();
+    let count = crate::dxbc::u32_at(part.data, 0)? as usize;
+    let base = crate::dxbc::u32_at(part.data, 4)? as usize;
+    for i in 0..count {
+        let at = base + 32 * i;
+        if crate::dxbc::u32_at(part.data, at + 12)? != 0 {
+            continue;
+        }
+        let name_at = crate::dxbc::u32_at(part.data, at + 4)? as usize;
+        let name = part
+            .data
+            .get(name_at..)
+            .and_then(|s| s.split(|&b| b == 0).next())
+            .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
+        let index = crate::dxbc::u32_at(part.data, at + 8)?;
+        let rw = *part
+            .data
+            .get(at + 25)
+            .ok_or(ShaderError::Malformed("truncated"))?;
+        if rw != 0 {
+            let key = (String::from_utf8_lossy(name).to_ascii_uppercase(), index);
+            *reads.entry(key).or_insert(0) |= rw;
+        }
+    }
+    Ok(reads)
+}
+
+/// Re-translates an over-budget mesh shader together with its paired pixel
+/// shader (or `None` for depth-only draws), pruning unread arbitrary mesh
+/// outputs so the pair fits within Metal/D3D12's 32 KiB limit
+/// (`Marvisak/VIctory#2398`, `pragyaangaur/VIctory-macOS#161`).
+pub fn translate_linked_mesh(
+    mesh_container: &[u8],
+    pixel: Option<(&[u8], &[u8])>,
+) -> Result<(HostShader, Option<HostShader>), ShaderError> {
+    let reads = match pixel {
+        Some((_, pixel_dxil)) => pixel_input_reads(pixel_dxil)?,
+        None => lower::KeptOutputs::new(),
+    };
+    let linked_ms = lower::with_kept_mesh_outputs(reads.clone(), || translate(mesh_container))?;
+    let linked_ps = match pixel {
+        Some((pixel_container, _)) => {
+            Some(lower::with_kept_mesh_outputs(reads, || translate(pixel_container))?)
+        }
+        None => None,
+    };
+    Ok((linked_ms, linked_ps))
 }
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
