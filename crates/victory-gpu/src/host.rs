@@ -8497,9 +8497,32 @@ float4 scale(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 
 type ScalePipeline = (ID3D12RootSignature, ID3D12PipelineState);
 
-/// Scale pipelines by output format (`None`: the host refused one).
+/// Scale pipelines by output format and blending (`None`: the host refused
+/// one).
 struct ScalePipelines {
-    made: Mutex<Vec<(i32, Option<ScalePipeline>)>>,
+    made: Mutex<Vec<((i32, Blend), Option<ScalePipeline>)>>,
+}
+
+/// How the scale pass writes the back buffer: replacing it (the game plane),
+/// or blended over it by the source's alpha (a present's interface plane,
+/// [`Host::present`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Blend {
+    Replace,
+    /// Colour already multiplied by alpha: `src + dst * (1 - src.a)`.
+    Premultiplied,
+    /// Plain alpha: `src * src.a + dst * (1 - src.a)`.
+    Straight,
+}
+
+/// How a present's second plane is blended over the first:
+/// `VICTORY_PLANE_ALPHA=straight` for plain alpha, premultiplied otherwise.
+fn plane_blend() -> Blend {
+    static BLEND: OnceLock<Blend> = OnceLock::new();
+    *BLEND.get_or_init(|| match std::env::var("VICTORY_PLANE_ALPHA").as_deref().map(str::trim) {
+        Ok("straight") => Blend::Straight,
+        _ => Blend::Premultiplied,
+    })
 }
 
 // SAFETY: the immutable D3D12 objects are free-threaded; the vector is mutexed.
@@ -8512,24 +8535,24 @@ fn scale_pipelines() -> &'static ScalePipelines {
     PIPELINES.get_or_init(|| ScalePipelines { made: Mutex::new(Vec::new()) })
 }
 
-/// The bilinear upscale pipeline for output `format`.
-fn scale_pipeline(format: DXGI_FORMAT) -> Option<ScalePipeline> {
+/// The bilinear scale pipeline for output `format`, writing as `blend` says.
+fn scale_pipeline(format: DXGI_FORMAT, blend: Blend) -> Option<ScalePipeline> {
     let pipelines = scale_pipelines();
     let mut made = pipelines.made.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, pipeline)) = made.iter().find(|(f, _)| *f == format.0) {
+    if let Some((_, pipeline)) = made.iter().find(|(k, _)| *k == (format.0, blend)) {
         return pipeline.clone();
     }
-    let pipeline = make_scale_pipeline(format)
+    let pipeline = make_scale_pipeline(format, blend)
         .map_err(|e| {
-            tracing::warn!(error = %e, format = format.0, "no present scale pipeline");
+            tracing::warn!(error = %e, format = format.0, ?blend, "no present scale pipeline");
             e
         })
         .ok();
-    made.push((format.0, pipeline.clone()));
+    made.push(((format.0, blend), pipeline.clone()));
     pipeline
 }
 
-fn make_scale_pipeline(format: DXGI_FORMAT) -> windows::core::Result<ScalePipeline> {
+fn make_scale_pipeline(format: DXGI_FORMAT, blending: Blend) -> windows::core::Result<ScalePipeline> {
     use windows::core::s;
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let vs = compile(SCALE_CORNERS, s!("corner"), s!("vs_5_1"))?;
@@ -8545,7 +8568,18 @@ fn make_scale_pipeline(format: DXGI_FORMAT) -> windows::core::Result<ScalePipeli
         let mut targets = [DXGI_FORMAT_UNKNOWN; 8];
         targets[0] = format;
         let mut blend = D3D12_BLEND_DESC::default();
-        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+        let target = &mut blend.RenderTarget[0];
+        target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+        if blending != Blend::Replace {
+            target.BlendEnable = true.into();
+            target.SrcBlend = if blending == Blend::Straight { D3D12_BLEND_SRC_ALPHA } else { D3D12_BLEND_ONE };
+            target.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            target.BlendOp = D3D12_BLEND_OP_ADD;
+            target.SrcBlendAlpha = D3D12_BLEND_ONE;
+            target.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            target.LogicOp = D3D12_LOGIC_OP_NOOP;
+        }
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             VS: code(&vs[..]),
@@ -8646,8 +8680,9 @@ fn present_output_size(hwnd: HWND, width: u32, height: u32) -> (u32, u32) {
 }
 
 /// Records the scale of `texture` into `back` through the pass above, both
-/// already in shader-resource and render-target states. One descriptor heap
-/// per present is simple and enough here; it is kept by the command list.
+/// already in shader-resource and render-target states, written as `blend`
+/// says. One descriptor heap per present is simple and enough here; it is
+/// kept by the command list.
 fn record_present_scale(
     host: &Host,
     copy: &HostList,
@@ -8657,8 +8692,9 @@ fn record_present_scale(
     input_format: DXGI_FORMAT,
     width: u32,
     height: u32,
+    blend: Blend,
 ) -> Option<()> {
-    let (root, pipeline) = scale_pipeline(format)?;
+    let (root, pipeline) = scale_pipeline(format, blend)?;
     let list = &copy.list;
     // SAFETY: plain object creation and view creation on live textures.
     unsafe {
@@ -9064,9 +9100,27 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// as frame `frame` (saved if captures are on), with `over` (a second
+    /// plane and its host state, which it stays in) drawn over it. `None` if
+    /// nothing was shown; else, in diagnostics builds, whether the frame was
+    /// black.
+    ///
+    /// The console's display composes a present's planes. The title in its
+    /// Series S mode presents its interface as a second plane over its game
+    /// image (transparent where nothing is drawn): shown alone, the game
+    /// plane is black through the menus and loading screens. The second
+    /// plane is stretched over the whole back buffer and blended by its
+    /// alpha ([`plane_blend`]).
+    ///
+    /// shortcut: the placement, source rectangles and colour space a plane's
+    /// parameters can ask for are not read, nor planes after the second.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        over: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -9145,7 +9199,12 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            let scaled = (width, height) != (p.width, p.height);
+            // The second plane, if its format can be read as one the swap
+            // chain takes.
+            let over = over.and_then(|(t, s)| Some((t, s, swap_format(t.GetDesc().Format)?)));
+            // A frame with a plane over it is drawn into the back buffer,
+            // the same size or not.
+            let scaled = (width, height) != (p.width, p.height) || over.is_some();
             let source_state = if scaled {
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
             } else {
@@ -9170,6 +9229,7 @@ impl Host {
                     format,
                     p.width,
                     p.height,
+                    Blend::Replace,
                 )
                 .is_none()
                 {
@@ -9177,6 +9237,33 @@ impl Host {
                     TOLD.call_once(|| {
                         tracing::warn!(width, height, "present scale not recorded: the frame stays empty")
                     });
+                }
+                if let Some((plane, plane_state, plane_format)) = over {
+                    let plane_state = D3D12_RESOURCE_STATES(plane_state as i32);
+                    let readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    let moved = plane_state != readable;
+                    if moved {
+                        list.ResourceBarrier(&[transition(plane, plane_state, readable)]);
+                    }
+                    if record_present_scale(
+                        self,
+                        copy,
+                        plane,
+                        &back,
+                        format,
+                        plane_format,
+                        p.width,
+                        p.height,
+                        plane_blend(),
+                    )
+                    .is_none()
+                    {
+                        static TOLD: std::sync::Once = std::sync::Once::new();
+                        TOLD.call_once(|| tracing::warn!("a present's second plane was not drawn"));
+                    }
+                    if moved {
+                        list.ResourceBarrier(&[transition(plane, readable, plane_state)]);
+                    }
                 }
                 // The lines below expect the back buffer in the copy state,
                 // as in the unscaled path.
