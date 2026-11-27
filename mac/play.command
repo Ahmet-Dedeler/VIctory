@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Plays GTA VI on an Apple Silicon Mac with this branch's victory.exe under CrossOver 26.3 + D3DMetal.
-# The settings below are the ones that give ~8-10 fps in the world on an M5 Max (see mac/README.md).
+# The settings below are the ones that give ~6-8 fps in the world on an M5 Max (up to ~10) (see mac/README.md).
 #
 # Set these three for your machine (or export them before running):
 GAME_DIR=${GAME_DIR:-$HOME/Games/GTA6}                 # folder with game_scarlett_master.exe (your own copy)

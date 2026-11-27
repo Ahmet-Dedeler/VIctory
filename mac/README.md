@@ -1,8 +1,8 @@
-# GTA VI on an Apple Silicon Mac: how this branch gets 8-10 fps in the world
+# GTA VI on an Apple Silicon Mac: how this branch gets 6-8 fps in the world
 
 This branch is avatarmanz/VIctory-7900XTX `main` (25 Nov, `0a435665`) plus a Mac layer. On an M5 Max
 (64 GB, macOS 27.3, CrossOver 26.3, D3DMetal 4.0 beta 3) it plays the prologue and the open world at about
-8-10 fps once shaders are translated, with clothes, hair, cars, tires and TV pictures drawn. Other Mac
+6-8 fps once shaders are translated (median 5.7-7.7 over five sessions, up to ~10 in light scenes), with clothes, hair, cars, tires and TV pictures drawn. Other Mac
 builds I know of were at 1-5 fps in the world on 27 Nov. It is still slow, not "playable" in a normal sense,
 but it is the setup below, so anyone can reproduce it. No game files are here; you need your own copy.
 
